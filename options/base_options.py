@@ -16,6 +16,11 @@ class BaseOptions:
         parser.add_argument("--fake_list_path", default=r"E:\data\1_fake")
         parser.add_argument("--data_label", default="train", help="label to decide whether train or validation dataset",)
 
+        # --- 【新增】为验证集添加独立的路径参数 ---
+        parser.add_argument("--val_real_list_path", type=str, default=r"/3240608030/val/0_real",  help="path to the real images for validation")
+        parser.add_argument("--val_fake_list_path", type=str, default=r"/3240608030/val/1_fake",  help="path to the fake images for validation")
+
+
         parser.add_argument( "--batch_size", type=int, default=10, help="input batch size")
         parser.add_argument("--gpu_ids", type=str, default="0", help="gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU",)
         parser.add_argument("--name", type=str, default="experiment_name", help="name of the experiment. It decides where to store samples and models",)

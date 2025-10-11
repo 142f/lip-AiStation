@@ -18,6 +18,8 @@ class AVLip(Dataset):
             self.label_dict[i] = 1
         self.total_list = self.real_list + self.fake_list
 
+        self.targets = [self.label_dict[path] for path in self.total_list]
+
     def __len__(self):
         return len(self.total_list)
 

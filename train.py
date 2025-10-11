@@ -8,8 +8,12 @@ def get_val_opt():
     val_opt = TrainOptions().parse(print_options=False)
     val_opt.isTrain = False
     val_opt.data_label = "val"
-    val_opt.real_list_path = r"/3240608030/val/0_real"
-    val_opt.fake_list_path = r"/3240608030/val/1_fake"
+    # val_opt.real_list_path = r"/3240608030/val/0_real"
+    # val_opt.fake_list_path = r"/3240608030/val/1_fake"
+
+    # 使用命令行参数控制验证集路径，如果没有提供则使用默认路径
+    val_opt.real_list_path = opt.val_real_list_path
+    val_opt.fake_list_path = opt.val_fake_list_path
     return val_opt
 
 
