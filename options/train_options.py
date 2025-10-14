@@ -4,7 +4,7 @@ from .base_options import BaseOptions
 class TrainOptions(BaseOptions):
     def initialize(self, parser):
         parser = BaseOptions.initialize(self, parser)
-        parser.add_argument('--optim', type=str, default='adam', help='optim to use [sgd, adam]')
+        parser.add_argument('--optim', type=str, default='adamw', help='optim to use [sgd, adam]')
         parser.add_argument('--loss_freq', type=int, default=100, help='frequency of showing loss on tensorboard')
         parser.add_argument('--save_epoch_freq', type=int, default=1,
                             help='frequency of saving checkpoints at the end of epochs')

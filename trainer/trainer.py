@@ -44,7 +44,7 @@ class Trainer(nn.Module):
             params = self.model.parameters()
 
 
-        if opt.optim == "adam":
+        if opt.optim == "adamw":
             self.optimizer = torch.optim.AdamW(
                 params,
                 lr=opt.lr,
@@ -56,7 +56,7 @@ class Trainer(nn.Module):
                 params, lr=opt.lr, momentum=0.0, weight_decay=opt.weight_decay
             )
         else:
-            raise ValueError("optim should be [adam, sgd]")
+            raise ValueError("optim should be [adamw, sgd]")
 
         self.criterion = get_loss().to(self.device)
         self.criterion1 = nn.CrossEntropyLoss()
