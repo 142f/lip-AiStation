@@ -43,15 +43,13 @@ if __name__ == "__main__":
             model.optimize_parameters()
 
             if model.total_steps % opt.loss_freq == 0:
-                print(
-                    "Train loss: {}\tstep: {}".format(
-                        model.get_loss(), model.total_steps
-                    )
-                )
-            if model.total_steps % 100 == 0:
                 end_time = time.time()
                 elapsed_time = end_time - start_time
-                print(f"100 steps processed in {elapsed_time:.2f} seconds.")
+                print(
+                    "Train loss: {}\tstep: {}\t100 steps time: {:.2f}s".format(
+                        model.get_loss(), model.total_steps, elapsed_time
+                    )
+                )
                 start_time = time.time()
 
         if epoch % opt.save_epoch_freq == 0:

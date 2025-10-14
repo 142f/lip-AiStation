@@ -9,7 +9,7 @@ class TrainOptions(BaseOptions):
 
     def initialize(self, parser):
         # First, initialize the parent class options (data, model, environment, etc.)
-        parser = Base-Options.initialize(self, parser)
+        parser = BaseOptions.initialize(self, parser)
 
         # ===================================================================
         # 1. 训练周期与数据划分 (Epochs and Data Splits)
