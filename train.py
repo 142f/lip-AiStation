@@ -1,3 +1,4 @@
+import time
 from validate import validate
 from data import create_dataloader
 from trainer.trainer import Trainer
@@ -28,6 +29,7 @@ if __name__ == "__main__":
     print("Length of data loader: %d" % (len(data_loader)))
     print("Length of val  loader: %d" % (len(val_loader)))
 
+    start_time = time.time()
     for epoch in range(opt.epoch):
         model.train()
         print("epoch: ", epoch + model.step_bias)
@@ -46,6 +48,11 @@ if __name__ == "__main__":
                         model.get_loss(), model.total_steps
                     )
                 )
+            if model.total_steps % 100 == 0:
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                print(f"100 steps processed in {elapsed_time:.2f} seconds.")
+                start_time = time.time()
 
         if epoch % opt.save_epoch_freq == 0:
             print("saving the model at the end of epoch %d" % (epoch + model.step_bias))

@@ -51,12 +51,19 @@ class Trainer(nn.Module):
                 betas=(opt.beta1, 0.999),
                 weight_decay=opt.weight_decay,
             )
+        elif opt.optim == "adam":
+            self.optimizer = torch.optim.Adam(
+                params,
+                lr=opt.lr,
+                betas=(opt.beta1, 0.999),
+                weight_decay=opt.weight_decay,
+            )
         elif opt.optim == "sgd":
             self.optimizer = torch.optim.SGD(
-                params, lr=opt.lr, momentum=0.0, weight_decay=opt.weight_decay
+                params, lr=opt.lr, momentum=0.9, weight_decay=opt.weight_decay
             )
         else:
-            raise ValueError("optim should be [adamw, sgd]")
+            raise ValueError("optim should be [sgd, adam, adamw]")
 
         self.criterion = get_loss().to(self.device)
         self.criterion1 = nn.CrossEntropyLoss()
