@@ -7,26 +7,37 @@ class BaseOptions:
     def __init__(self):
         self.initialized = False
 
-    def initialize(self, parser):
-        parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14", help="see models/__init__.py")
-        parser.add_argument("--fix_backbone", default=False)
-        parser.add_argument("--fix_encoder", default=True)
+    def initialize(self, parser):      
+        # ===================================================================
+        # 1. 数据与路径参数 (Data and Path Arguments)
+        # ===================================================================
+        parser.add_argument("--real_list_path", type=str, default=r"E:\data\0_real", help="Path to the list of real images for training.")
+        parser.add_argument("--fake_list_path", type=str, default=r"E:\data\1_fake", help="Path to the list of fake images for training.")
+        parser.add_argument("--val_real_list_path", type=str, default=r"/3240608030/val/0_real", help="Path to the list of real images for validation.")
+        parser.add_argument("--val_fake_list_path", type=str, default=r"/3240608030/val/1_fake", help="Path to the list of fake images for validation.")
+        parser.add_argument("--data_label", type=str, default="train", help="Label to decide whether it's a train or validation dataset.")
 
-        parser.add_argument("--real_list_path", default=r"E:\data\0_real")
-        parser.add_argument("--fake_list_path", default=r"E:\data\1_fake")
-        parser.add_argument("--data_label", default="train", help="label to decide whether train or validation dataset",)
+        # ===================================================================
+        # 2. 模型与训练策略参数 (Model and Training Strategy Arguments)
+        # ===================================================================
+        parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14", help="Model architecture. See models/__init__.py for options.")
+        parser.add_argument("--batch_size", type=int, default=10, help="Input batch size for training.")
+        parser.add_argument("--fix_backbone", action="store_true", help="If specified, freezes the backbone weights during training.")
+        parser.add_argument("--fix_encoder", action="store_true", default=True, help="If specified, freezes the encoder weights during training.")
+        parser.add_argument("--serial_batches", action="store_true", help="If true, takes images in order to make batches, otherwise takes them randomly.")
+        
+        # ===================================================================
+        # 3. 模型加载与保存参数 (Model Loading and Saving Arguments)
+        # ===================================================================
+        parser.add_argument("--name", type=str, default="experiment_name", help="Name of the experiment. Determines where to store samples and models.")
+        parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="Directory where models are saved.")
 
-        # --- 【新增】为验证集添加独立的路径参数 ---
-        parser.add_argument("--val_real_list_path", type=str, default=r"/3240608030/val/0_real",  help="path to the real images for validation")
-        parser.add_argument("--val_fake_list_path", type=str, default=r"/3240608030/val/1_fake",  help="path to the fake images for validation")
-
-
-        parser.add_argument( "--batch_size", type=int, default=10, help="input batch size")
-        parser.add_argument("--gpu_ids", type=str, default="0", help="gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU",)
-        parser.add_argument("--name", type=str, default="experiment_name", help="name of the experiment. It decides where to store samples and models",)
-        parser.add_argument("--num_threads", default=0, type=int, help="# threads for loading data")
-        parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="models are saved here",)
-        parser.add_argument("--serial_batches",action="store_true",help="if true, takes images in order to make batches, otherwise takes them randomly",)
+        # ===================================================================
+        # 4. 硬件与环境参数 (Hardware and Environment Arguments)
+        # ===================================================================
+        parser.add_argument("--gpu_ids", type=str, default="0", help="GPU IDs to use. E.g., '0', '0,1,2', or '-1' for CPU.")
+        parser.add_argument("--num_threads", type=int, default=0, help="Number of threads for data loading.")
+     
         # 新增参数 --错误点
         parser.add_argument("--suffix", type=str, default="", help="customized suffix: opt.name = opt.name + suffix: e.g., {model}_{netG}_size{load_size}")
         parser.add_argument('--rz_interp', type=str, default='bilinear', help='interpolation method for resizing')
