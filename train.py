@@ -29,6 +29,11 @@ if __name__ == "__main__":
     print("Length of data loader: %d" % (len(data_loader)))
     print("Length of val  loader: %d" % (len(val_loader)))
 
+    # 初始化最佳性能跟踪变量
+    best_acc = 0.0
+    best_ap = 0.0
+    best_epoch = 0
+
     start_time = time.time()
     for epoch in range(opt.epoch):
         model.train()
@@ -43,20 +48,14 @@ if __name__ == "__main__":
             model.optimize_parameters()
 
             if model.total_steps % opt.loss_freq == 0:
-                print(
-                    "Train loss: {}\tstep: {}".format(
-                        model.get_loss(), model.total_steps
-                    )
-                )
-            if model.total_steps % 100 == 0:
                 end_time = time.time()
                 elapsed_time = end_time - start_time
-                print(f"100 steps processed in {elapsed_time:.2f} seconds.")
+                print(
+                    "Train loss: {}\tstep: {}\t{} steps time: {:.2f}s".format(
+                        model.get_loss(), model.total_steps, opt.loss_freq, elapsed_time
+                    )
+                )
                 start_time = time.time()
-
-        if epoch % opt.save_epoch_freq == 0:
-            print("saving the model at the end of epoch %d" % (epoch + model.step_bias))
-            model.save_networks("model_epoch_%s.pth" % (epoch + model.step_bias))
 
         model.eval()
         ap, fpr, fnr, acc = validate(model.model, val_loader, opt.gpu_ids)
@@ -65,3 +64,28 @@ if __name__ == "__main__":
                 epoch + model.step_bias, acc, ap, fpr, fnr
             )
         )
+
+        # 只在验证性能超过历史最佳时才保存模型
+        current_epoch = epoch + model.step_bias
+        if acc > best_acc or (acc == best_acc and ap > best_ap):
+            # 更新最佳性能指标
+            best_acc = acc
+            best_ap = ap
+            best_epoch = current_epoch
+            
+            print(f" 发现新的最佳模型 (epoch {current_epoch}): acc={acc:.4f}, ap={ap:.4f}")
+            model.save_networks("best_model.pth")
+            print(f" 最佳模型已保存为 best_model.pth")
+            
+            # 可选：同时保存带epoch编号的模型用于记录
+            model.save_networks(f"model_epoch_{current_epoch}.pth")
+            print(f" 同时保存为 model_epoch_{current_epoch}.pth")
+        else:
+            print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f} @ epoch {best_epoch})")
+
+    # 训练结束后打印最终的最佳性能
+    print(f"\n 训练完成！最佳模型性能:")
+    print(f"   准确率 (acc): {best_acc:.4f}")
+    print(f"   AP值 (ap): {best_ap:.4f}")
+    print(f"   所在轮次: {best_epoch}")
+    print(f"   最佳模型文件: best_model.pth")
