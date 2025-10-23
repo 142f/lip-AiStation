@@ -4,7 +4,7 @@ import numpy as np
 from data import AVLip
 import torch.utils.data
 from models import build_model
-from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score
+from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve
 from tqdm import tqdm  # 导入 tqdm 库
 
 def validate(model, loader, gpu_id):
@@ -21,15 +21,28 @@ def validate(model, loader, gpu_id):
             y_pred.extend(model(crops_tens, features)[0].sigmoid().flatten().tolist())
             y_true.extend(label.flatten().tolist())
     y_true = np.array(y_true)
-    y_pred = np.where(np.array(y_pred) >= 0.5, 1, 0)
+    y_pred_prob = np.array(y_pred)  # 保存原始概率值用于AP计算
+    y_pred_binary = np.where(y_pred_prob >= 0.5, 1, 0)  # 二值化用于其他指标
 
-    # Get AP
-    ap = average_precision_score(y_true, y_pred)
-    cm = confusion_matrix(y_true, y_pred)
-    tp, fn, fp, tn = cm.ravel()
+    # Get AP (使用概率值)
+    ap = average_precision_score(y_true, y_pred_prob)
+
+    # 混淆矩阵计算（使用二值化结果）
+    cm = confusion_matrix(y_true, y_pred_binary)
+    print("混淆矩阵展开后的顺序:", cm.ravel())
+
+    tn, fp, fn, tp = cm.ravel()
     fnr = fn / (fn + tp)
     fpr = fp / (fp + tn)
-    acc = accuracy_score(y_true, y_pred)
+    acc = accuracy_score(y_true, y_pred_binary)
+
+    # tn_correct, fp_correct, fn_correct, tp_correct = cm.ravel()
+    # print(f"tn_correct={tn_correct}, fp_correct={fp_correct}, fn_correct={fn_correct}, tp_correct={tp_correct}")
+    # fnr_correct = fn_correct / (fn_correct + tp_correct)
+    # fpr_correct = fp_correct / (fp_correct + tn_correct)
+    # acc_correct = accuracy_score(y_true, y_pred_binary)
+    # print(f"正确计算: FNR_correct={fnr_correct:.4f}, FPR_correct={fpr_correct:.4f}, ACC_correct={acc_correct:.4f}")
+
     return ap, fpr, fnr, acc
 
 
