@@ -38,6 +38,13 @@ if __name__ == "__main__":
     for epoch in range(opt.epoch):
         model.train()
         print("epoch: ", epoch + model.step_bias)
+        
+        # 应用余弦退火学习率（如果启用）
+        if opt.cosine_annealing:
+            current_lr = model.cosine_annealing_lr(epoch, opt.epoch)
+            if epoch % 1 == 0:  # 每1个epoch打印一次学习率
+                print(f"当前学习率: {current_lr:.2e}")
+        
         for i, (img, crops, label) in enumerate(data_loader):
             model.total_steps += 1
 
@@ -75,11 +82,8 @@ if __name__ == "__main__":
             
             print(f" 发现新的最佳模型 (epoch {current_epoch}): acc={acc:.4f}, ap={ap:.4f}")
             model.save_networks("best_model.pth")
-            print(f" 最佳模型已保存为 best_model.pth")
-            
             # 可选：同时保存带epoch编号的模型用于记录
             model.save_networks(f"model_epoch_{current_epoch}.pth")
-            print(f" 同时保存为 model_epoch_{current_epoch}.pth")
         else:
             print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f} @ epoch {best_epoch})")
 

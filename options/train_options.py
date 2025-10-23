@@ -24,6 +24,7 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--optim', type=str, default='adamw', help='Optimizer to use [sgd, adam, adamw].')
         parser.add_argument('--lr', type=float, default=2e-9, help='Initial learning rate.')
         parser.add_argument('--beta1', type=float, default=0.9, help='Momentum term for the Adam optimizer.')
+        parser.add_argument('--cosine_annealing', action='store_true', help='Use cosine annealing learning rate scheduler.')
 
         # ===================================================================
         # 3. 检查点与日志 (Checkpoints and Logging)
