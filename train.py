@@ -1,8 +1,29 @@
 import time
+import sys
+import os
 from validate import validate
 from data import create_dataloader
 from trainer.trainer import Trainer
 from options.train_options import TrainOptions
+
+
+# 添加日志类，用于同时输出到控制台和文件
+class Logger(object):
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log = open(log_file, "w", encoding="utf-8")
+        
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
 
 
 def get_val_opt():
@@ -22,6 +43,15 @@ if __name__ == "__main__":
     opt = TrainOptions().parse()
     val_opt = get_val_opt()
     model = Trainer(opt)
+
+    # 创建日志目录和文件
+    log_dir = os.path.join(opt.checkpoints_dir, opt.name, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"train_log_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    
+    # 重定向标准输出到日志文件和控制台
+    logger = Logger(log_file)
+    sys.stdout = logger
 
     data_loader = create_dataloader(opt)
     val_loader = create_dataloader(val_opt)
@@ -93,3 +123,7 @@ if __name__ == "__main__":
     print(f"   AP值 (ap): {best_ap:.4f}")
     print(f"   所在轮次: {best_epoch}")
     print(f"   最佳模型文件: best_model.pth")
+    
+    # 关闭日志文件
+    logger.close()
+    sys.stdout = logger.terminal  # 恢复标准输出

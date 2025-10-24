@@ -8,7 +8,7 @@ from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_
 from tqdm import tqdm  # 导入 tqdm 库
 
 def validate(model, loader, gpu_id):
-    print("validating...")
+
     device = torch.device(f"cuda:{gpu_id[0]}" if torch.cuda.is_available() else "cpu")
     with torch.no_grad():
         y_true, y_pred = [], []
