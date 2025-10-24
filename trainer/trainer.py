@@ -106,13 +106,22 @@ class Trainer(nn.Module):
             self.crops, self.features
         )
         self.output = self.output.view(-1)
-        self.loss = self.criterion(
-            self.weights_max, self.weights_org
-        ) + self.criterion1(self.output, self.label)
+        # 分别保存两个损失值
+        self.loss_ral = self.criterion(self.weights_max, self.weights_org)
+        self.loss_ce = self.criterion1(self.output, self.label)
+        self.loss = self.loss_ral + self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()
         return loss[0] if isinstance(loss, type(list())) else loss
+
+    # 添加获取单独损失值的方法
+    def get_individual_losses(self):
+        loss_ral = self.loss_ral.data.tolist()
+        loss_ral = loss_ral[0] if isinstance(loss_ral, type(list())) else loss_ral
+        loss_ce = self.loss_ce.data.tolist()
+        loss_ce = loss_ce[0] if isinstance(loss_ce, type(list())) else loss_ce
+        return loss_ral, loss_ce
 
     def optimize_parameters(self):
         self.optimizer.zero_grad()

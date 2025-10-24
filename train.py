@@ -87,9 +87,12 @@ if __name__ == "__main__":
             if model.total_steps % opt.loss_freq == 0:
                 end_time = time.time()
                 elapsed_time = end_time - start_time
+                # 获取并打印单独的损失值和总和
+                loss_ral, loss_ce = model.get_individual_losses()
+                total_loss = model.get_loss()
                 print(
-                    "Train loss: {}\tstep: {}\t{} steps time: {:.2f}s".format(
-                        model.get_loss(), model.total_steps, opt.loss_freq, elapsed_time
+                    "Train loss RAL: {:.4f}	Train loss CE: {:.4f}	Total loss: {:.4f}\tstep: {}\t{} steps time: {:.2f}s".format(
+                        loss_ral, loss_ce, total_loss, model.total_steps, opt.loss_freq, elapsed_time
                     )
                 )
                 start_time = time.time()
