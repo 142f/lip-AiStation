@@ -29,14 +29,16 @@ class RALoss(nn.Module):
         super(RALoss, self).__init__()
 
     def forward(self, alphas_max, alphas_org):
-        loss = 0.0
-        batch_size = alphas_org[0].shape[0]
+        total_loss = 0.0
         for i in range(len(alphas_org)):
-            loss_wt = 0.0
-            for j in range(batch_size):
-                loss_wt += torch.Tensor([10]).to(alphas_max[i][j].device) / torch.exp(
-                    alphas_max[i][j] - alphas_org[i][j]
-                )
-            loss += loss_wt / batch_size
-        return loss
- 
+            # 正确的张量运算方式
+            diff = alphas_max[i] - alphas_org[i]  # shape: (batch_size, 1)
+            # 添加数值稳定性保护
+            diff = torch.clamp(diff, min=0.0, max=5.0)
+            # 对整个batch进行向量化计算
+            loss_wt = 10 / torch.exp(diff)  # shape: (batch_size, 1)
+            # 对batch取平均
+            total_loss += loss_wt.mean()
+
+        # 对所有区域组取平均
+        return total_loss / len(alphas_org)

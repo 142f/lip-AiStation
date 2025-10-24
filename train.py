@@ -91,8 +91,8 @@ if __name__ == "__main__":
                 loss_ral, loss_ce = model.get_individual_losses()
                 total_loss = model.get_loss()
                 print(
-                    "Train loss RAL: {:.4f}	Train loss CE: {:.4f}	Total loss: {:.4f}\tstep: {}\t{} steps time: {:.2f}s".format(
-                        loss_ral, loss_ce, total_loss, model.total_steps, opt.loss_freq, elapsed_time
+                    "Step {:6d} | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
+                        model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
                     )
                 )
                 start_time = time.time()
