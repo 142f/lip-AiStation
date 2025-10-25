@@ -38,20 +38,41 @@ def get_val_opt():
     val_opt.fake_list_path = opt.val_fake_list_path
     return val_opt
 
+def format_options(opt, parser):
+    """格式化选项信息，与BaseOptions.print_options方法保持一致"""
+    message = ""
+    message += "----------------- Options ---------------\n"
+    for k, v in sorted(vars(opt).items()):
+        comment = ""
+        try:
+            default = parser.get_default(k)
+            if v != default:
+                comment = "\t[default: %s]" % str(default)
+        except Exception:
+            pass
+        message += "{:>25}: {:<30}{}\n".format(str(k), str(v), comment)
+    message += "----------------- End -------------------"
+    return message
 
 if __name__ == "__main__":
-    opt = TrainOptions().parse()
+    train_options = TrainOptions()
+    opt = train_options.parse(print_options=False)  # 禁用自动打印选项
     val_opt = get_val_opt()
     model = Trainer(opt)
 
-    # 创建日志目录和文件
-    log_dir = os.path.join(opt.checkpoints_dir, opt.name, "logs")
+    # 创建日志目录和文件（优化：放在项目根路径下的logs文件夹）
+    log_dir = os.path.join("./logs", opt.name)
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"train_log_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    # 优化日志文件名格式为{实验名称}_{年月日}_{时分秒}.log
+    log_file = os.path.join(log_dir, f"{opt.name}_{time.strftime('%Y%m%d_%H%M%S')}.log")
     
     # 重定向标准输出到日志文件和控制台
     logger = Logger(log_file)
     sys.stdout = logger
+
+    # 将训练选项写入日志文件
+    print(format_options(opt, train_options.parser))
+    print("\n")
 
     data_loader = create_dataloader(opt)
     val_loader = create_dataloader(val_opt)

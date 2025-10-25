@@ -34,7 +34,7 @@ class RALoss(nn.Module):
             # 正确的张量运算方式
             diff = alphas_max[i] - alphas_org[i]  # shape: (batch_size, 1)
             # 添加数值稳定性保护
-            diff = torch.clamp(diff, min=0.0, max=5.0)
+            diff = torch.clamp(diff, min=0.0, max=100.0)
             # 对整个batch进行向量化计算
             loss_wt = 10 / torch.exp(diff)  # shape: (batch_size, 1)
             # 对batch取平均
