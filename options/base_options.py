@@ -86,7 +86,7 @@ class BaseOptions:
             opt_file.write(message)
             opt_file.write("\n")
 
-    def parse(self, print_options=True):
+    def parse(self, print_options=False):
         opt = self.gather_options()
         opt.isTrain = self.isTrain  # train or test
 

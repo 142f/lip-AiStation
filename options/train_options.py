@@ -33,7 +33,12 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--save_epoch_freq', type=int, default=1, help='Frequency of saving checkpoints (in epochs).')
         
         # ===================================================================
-        # 4. 微调与预训练 (Finetuning and Pretraining)
+        # 4. 梯度累积参数 (Gradient Accumulation Parameters)
+        # ===================================================================
+        parser.add_argument('--accumulation_steps', type=int, default=1, help='Number of gradient accumulation steps. Simulates larger batch sizes.')
+        
+        # ===================================================================
+        # 5. 微调与预训练 (Finetuning and Pretraining)
         # ===================================================================
         parser.add_argument('--fine-tune', action='store_true', help='If specified, enables finetuning from a pretrained model.')
         parser.add_argument('--pretrained_model', type=str, default='./checkpoints/experiment_name/model_epoch_29.pth', help='Path to the pretrained model for finetuning.')
