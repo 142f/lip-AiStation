@@ -92,9 +92,9 @@ if __name__ == "__main__":
         
         # 应用余弦退火学习率（如果启用）
         if opt.cosine_annealing:
-            current_lr = model.cosine_annealing_lr(epoch, opt.epoch)
-            if epoch % 1 == 0:  # 每1个epoch打印一次学习率
-                print(f"当前学习率: {current_lr:.2e}")
+            # 注意：PyTorch的CosineAnnealingWarmRestarts调度器会在optimizer.step()中自动更新学习率
+            current_lr = model.optimizer.param_groups[0]['lr']
+            print(f"当前学习率: {current_lr:.2e}")
         
         for i, (img, crops, label) in enumerate(data_loader):
             model.total_steps += 1
@@ -105,15 +105,62 @@ if __name__ == "__main__":
 
             model.optimize_parameters()
 
-            if model.total_steps % opt.loss_freq == 0:
+            # 修改损失打印条件，使其与参数更新同步
+            # 如果不使用梯度累积，则每次迭代都打印
+            # 如果使用梯度累积，则只在完成一次参数更新后打印
+            should_print_loss = False
+            if opt.accumulation_steps <= 1:
+                # 不使用梯度累积，按照原来的频率打印
+                should_print_loss = (model.total_steps % opt.loss_freq == 0)
+            else:
+                # 使用梯度累积，按照参数更新频率打印
+                # 只有当完成一次完整的梯度累积周期时才打印
+                should_print_loss = (model.update_steps > 0 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0 and model.accumulation_count == 0)
+
+            if should_print_loss:
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 # 获取并打印单独的损失值和总和
                 loss_ral, loss_ce = model.get_individual_losses()
                 total_loss = model.get_loss()
+                if opt.accumulation_steps <= 1:
+                    print(
+                        "Step {:6d} | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
+                            model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
+                        )
+                    )
+                else:
+                    print(
+                        "Update Step {:6d} (Total Step {:6d}) | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
+                            model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
+                        )
+                    )
+                start_time = time.time()
+
+        # 在每个epoch结束时确保梯度更新
+        # 如果使用梯度累积且当前累积计数不为0，则执行一次梯度更新
+        if hasattr(model, 'accumulation_count') and model.accumulation_count > 0:
+            model.optimizer.step()
+            model.optimizer.zero_grad()
+            model.accumulation_count = 0
+            model.update_steps += 1  # 更新步骤数增加
+            
+            # 更新学习率调度器（如果启用）
+            if model.scheduler is not None:
+                model.scheduler.step()
+        # 确保每个epoch结束后调用scheduler.step()来更新学习率
+        elif model.scheduler is not None and model.accumulation_steps == 1:
+            model.scheduler.step()
+            
+            # 如果在epoch结束时强制更新了参数，也需要检查是否需要打印损失
+            if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                loss_ral, loss_ce = model.get_individual_losses()
+                total_loss = model.get_loss()
                 print(
-                    "Step {:6d} | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
-                        model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
+                    "Update Step {:6d} (Total Step {:6d}) | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
+                        model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
                     )
                 )
                 start_time = time.time()

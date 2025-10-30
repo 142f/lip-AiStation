@@ -66,34 +66,26 @@ class Trainer(nn.Module):
         else:
             raise ValueError("optim should be [sgd, adam, adamw]")
 
+        # 初始化学习率调度器（如果启用）
+        if opt.cosine_annealing:
+            # 根据项目信息，使用CosineAnnealingWarmRestarts调度器
+            # 重启周期设置为20个epoch，最小学习率设置为1e-7
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer, T_0=20, T_mult=1, eta_min=1e-7
+            )
+        else:
+            self.scheduler = None
+
         self.criterion = get_loss().to(self.device)
         self.criterion1 = nn.CrossEntropyLoss()
 
         self.model.to(opt.gpu_ids[0] if torch.cuda.is_available() else "cpu")
-
-    def adjust_learning_rate(self, min_lr=1e-8):
-        for param_group in self.optimizer.param_groups:
-            if param_group["lr"] < min_lr:
-                return False
-            param_group["lr"] /= 10.0
-        return True
-
-    def cosine_annealing_lr(self, epoch, total_epochs, min_lr=1e-10):
-        """
-        简单的余弦退火学习率调度
-        lr = min_lr + 0.5 * (initial_lr - min_lr) * (1 + cos(π * epoch / total_epochs))
-        """
-        if not hasattr(self, 'initial_lr'):
-            self.initial_lr = self.optimizer.param_groups[0]['lr']
         
-        # 余弦退火公式
-        lr = min_lr + 0.5 * (self.initial_lr - min_lr) * (1 + math.cos(math.pi * epoch / total_epochs))
-        
-        # 更新所有参数组的学习率
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        return lr
+        # 梯度累积相关参数
+        self.accumulation_steps = opt.accumulation_steps
+        self.accumulation_count = 0
+        # 用于跟踪实际的参数更新步骤
+        self.update_steps = 0
 
     def set_input(self, input):
         self.input = input[0].to(self.device)
@@ -109,7 +101,8 @@ class Trainer(nn.Module):
         # 分别保存两个损失值
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
-        self.loss = self.loss_ral + self.loss_ce
+        # 根据项目规范，CE损失项应乘以0.5的权重系数
+        self.loss = self.loss_ral + 0.5 * self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()
@@ -124,9 +117,37 @@ class Trainer(nn.Module):
         return loss_ral, loss_ce
 
     def optimize_parameters(self):
-        self.optimizer.zero_grad()
-        self.loss.backward()
-        self.optimizer.step()
+        # 梯度累积实现
+        # 除以accumulation_steps以获得平均梯度
+        loss_scaled = self.loss / self.accumulation_steps
+        
+        # 反向传播
+        loss_scaled.backward()
+        
+        # 根据项目规范，添加梯度裁剪来防止梯度爆炸
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        
+        self.accumulation_count += 1
+        
+        # 当达到累积步数时，更新参数并清零梯度
+        if self.accumulation_count == self.accumulation_steps:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.accumulation_count = 0
+            self.update_steps += 1  # 记录实际的参数更新次数
+            
+            # 更新学习率调度器（如果启用）
+            if self.scheduler is not None:
+                self.scheduler.step()
+        # 如果不使用梯度累积（accumulation_steps=1），也要确保调度器更新
+        elif self.accumulation_steps == 1:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.update_steps += 1
+            
+            # 更新学习率调度器（如果启用）
+            if self.scheduler is not None:
+                self.scheduler.step()
 
     def get_features(self):
         self.features = self.model.get_features(self.input).to(
@@ -148,6 +169,7 @@ class Trainer(nn.Module):
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "total_steps": self.total_steps,
+            "update_steps": self.update_steps,  # 保存实际更新步骤数
         }
 
         torch.save(state_dict, save_path)
