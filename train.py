@@ -64,7 +64,7 @@ if __name__ == "__main__":
     log_dir = os.path.join("./logs", opt.name)
     os.makedirs(log_dir, exist_ok=True)
     # 优化日志文件名格式为{实验名称}_{年月日}_{时分秒}.log
-    log_file = os.path.join(log_dir, f"{opt.name}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    log_file = os.path.join(log_dir, f"model_{time.strftime('%Y%m%d_%H%M%S')}.log")
     
     # 重定向标准输出到日志文件和控制台
     logger = Logger(log_file)
@@ -93,6 +93,9 @@ if __name__ == "__main__":
         # 应用余弦退火学习率（如果启用）
         if opt.cosine_annealing:
             # 注意：PyTorch的CosineAnnealingWarmRestarts调度器会在optimizer.step()中自动更新学习率
+            # 增加epoch计数器并更新学习率调度器
+            model.scheduler_epoch += 1
+            model.scheduler.step(model.scheduler_epoch)
             current_lr = model.optimizer.param_groups[0]['lr']
             print(f"当前学习率: {current_lr:.2e}")
         
@@ -144,13 +147,6 @@ if __name__ == "__main__":
             model.optimizer.zero_grad()
             model.accumulation_count = 0
             model.update_steps += 1  # 更新步骤数增加
-            
-            # 更新学习率调度器（如果启用）
-            if model.scheduler is not None:
-                model.scheduler.step()
-        # 确保每个epoch结束后调用scheduler.step()来更新学习率
-        elif model.scheduler is not None and model.accumulation_steps == 1:
-            model.scheduler.step()
             
             # 如果在epoch结束时强制更新了参数，也需要检查是否需要打印损失
             if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
