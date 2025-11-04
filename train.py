@@ -74,6 +74,13 @@ if __name__ == "__main__":
     print(format_options(opt, train_options.parser))
     print("\n")
 
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.model.parameters())
+    trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    print(f"模型总参数量: {total_params:,}")
+    print(f"可训练参数量: {trainable_params:,}")
+    print("\n")
+
     data_loader = create_dataloader(opt)
     val_loader = create_dataloader(val_opt)
 
@@ -83,6 +90,7 @@ if __name__ == "__main__":
     # 初始化最佳性能跟踪变量
     best_acc = 0.0
     best_ap = 0.0
+    best_auc = 0.0
     best_epoch = 0
 
     start_time = time.time()
@@ -99,10 +107,10 @@ if __name__ == "__main__":
             current_lr = model.optimizer.param_groups[0]['lr']
             print(f"当前学习率: {current_lr:.2e}")
         
-        for i, (img, crops, label) in enumerate(data_loader):
+        for i, (img, crops, diff_img, label) in enumerate(data_loader):
             model.total_steps += 1
 
-            model.set_input((img, crops, label))
+            model.set_input((img, crops, diff_img, label))
             model.forward()
             loss = model.get_loss()
 
@@ -162,10 +170,10 @@ if __name__ == "__main__":
                 start_time = time.time()
 
         model.eval()
-        ap, fpr, fnr, acc = validate(model.model, val_loader, opt.gpu_ids)
+        ap, fpr, fnr, acc, auc = validate(model.model, val_loader, opt.gpu_ids)
         print(
-            "(Val @ epoch {}) acc: {} ap: {} fpr: {} fnr: {}".format(
-                epoch + model.step_bias, acc, ap, fpr, fnr
+            "(Val @ epoch {}) acc: {} ap: {} fpr: {} fnr: {} auc: {}".format(
+                epoch + model.step_bias, acc, ap, fpr, fnr, auc
             )
         )
 
@@ -175,19 +183,21 @@ if __name__ == "__main__":
             # 更新最佳性能指标
             best_acc = acc
             best_ap = ap
+            best_auc = auc
             best_epoch = current_epoch
             
-            print(f" 发现新的最佳模型 (epoch {current_epoch}): acc={acc:.4f}, ap={ap:.4f}")
+            print(f" 发现新的最佳模型 (epoch {current_epoch}): acc={acc:.4f}, ap={ap:.4f}, auc={auc:.4f}")
             model.save_networks("best_model.pth")
             # 可选：同时保存带epoch编号的模型用于记录
             model.save_networks(f"model_epoch_{current_epoch}.pth")
         else:
-            print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f} @ epoch {best_epoch})")
+            print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f}, auc={best_auc:.4f} @ epoch {best_epoch})")
 
     # 训练结束后打印最终的最佳性能
     print(f"\n 训练完成！最佳模型性能:")
     print(f"   准确率 (acc): {best_acc:.4f}")
-    print(f"   AP值 (ap): {best_ap:.4f}")
+    print(f"   AP(ap): {best_ap:.4f}")
+    print(f"   AUC(auc): {best_auc:.4f}")
     print(f"   所在轮次: {best_epoch}")
     print(f"   最佳模型文件: best_model.pth")
     
