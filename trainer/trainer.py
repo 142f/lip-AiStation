@@ -26,7 +26,7 @@ class Trainer(nn.Module):
         )
         if opt.fine_tune:
             state_dict = torch.load(opt.pretrained_model, map_location="cpu")
-            self.model.load_state_dict(state_dict["model"])
+            self.model.load_state_dict(state_dict["model"], strict=False)
             self.total_steps = state_dict["total_steps"]
             print(f"Model loaded @ {opt.pretrained_model.split('/')[-1]}")
 

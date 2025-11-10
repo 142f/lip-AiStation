@@ -107,10 +107,10 @@ if __name__ == "__main__":
             current_lr = model.optimizer.param_groups[0]['lr']
             print(f"当前学习率: {current_lr:.2e}")
         
-        for i, (img, crops, diff_img, label) in enumerate(data_loader):
+        for i, (img, crops , label) in enumerate(data_loader):
             model.total_steps += 1
 
-            model.set_input((img, crops, diff_img, label))
+            model.set_input((img, crops , label))
             model.forward()
             loss = model.get_loss()
 

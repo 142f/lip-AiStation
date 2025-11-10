@@ -134,6 +134,31 @@ class Bottleneck(nn.Module):
         return out
 
 
+# ---------------------------
+# 新增：针对展平特征的通道注意力（向量版 SE）
+# 说明：
+#  - 原始 SE 是对 4D feature map 做全局池化再两个 FC；这里我们对 (N, C) 向量做同样思想的通道重标定，
+#    便于在不修改 backbone 的情况下把 SE 思想加到 feat_cat（拼接后向量）上。
+# ---------------------------
+class SELayerVec(nn.Module):
+    def __init__(self, channel: int, reduction: int = 16):
+        super(SELayerVec, self).__init__()
+        hidden = max(1, channel // reduction)
+        # 中文注释：通道压缩 -> ReLU -> 通道恢复 -> Sigmoid，输出每个通道的缩放系数（每个样本独立）
+        self.fc = nn.Sequential(
+            nn.Linear(channel, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (N, C)
+        # 输出与 x 相同形状，按通道放缩
+        scale = self.fc(x)  # (N, C)
+        return x * scale
+
+
 class ResNet(nn.Module):
 
     def __init__(
@@ -183,6 +208,23 @@ class ResNet(nn.Module):
         )
         self.fc = nn.Linear(512 * block.expansion + 768, 1)
 
+        # ---------------------------
+        # 新增：位置编码与 SE 向量模块的初始化
+        # 说明：
+        #  - 默认假设 num_scales = 3, num_regions = 5（与数据预处理一致）
+        #  - positional_encoding 的维度与 feat_cat 的维度一致（512*expansion + 768）
+        #  - se_layer 在 feat_flat 上做通道重标定
+        # ---------------------------
+        self.num_scales = 3
+        self.num_regions = 5
+        feat_dim = 512 * block.expansion + 768
+        # 可学习的位置编码，形状为 (S*R, feat_dim)
+        self.positional_encoding = nn.Parameter(
+            torch.randn(self.num_scales * self.num_regions, feat_dim)
+        )
+        # 向量版 SE
+        self.se_layer = SELayerVec(feat_dim, reduction=16)
+
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -224,43 +266,137 @@ class ResNet(nn.Module):
                                 norm_layer=norm_layer))
 
         return nn.Sequential(*layers)
+    def _forward_impl(self, x, feature, chunk_size: int = 65536):
+        """
+        高效版前向传播（可直接替换原 _forward_impl）：
+          - 一次性批量处理所有尺度与区域，充分利用 GPU 并行；
+          - 通过 expand 减少全局特征重复内存；
+          - 支持分块计算 get_weight，防止显存溢出；
+          - 返回值与原函数保持一致 (pred_score, weights_max, weights_org)。
 
-    def _forward_impl(self, x, feature):
-        # The comment resolution is based on input size is 224*224 imagenet
-        # f.shape: (batch_size, 3, 224, 224), feature.shape: (batch_size, 768)
-        features, weights, parts, weights_org, weights_max = [list() for i in range(5)]
-        for i in range(len(x[0])):
-            features.clear()
-            weights.clear()
-            for j in range(len(x)):
-                f = x[j][i]
-                f = self.conv1(f)
-                f = self.bn1(f)
-                f = self.relu(f)
-                f = self.maxpool(f)
-                f = self.layer1(f)
-                f = self.layer2(f)
-                f = self.layer3(f)
-                f = self.layer4(f)
-                f = self.avgpool(f)
-                f = torch.flatten(f, 1)
+        参数:
+            x: List[List[Tensor]]，形状为 [num_scales][num_regions][B, 3, H, W]
+            feature: Tensor，全局特征 (B, feat_g)
+            chunk_size: int，可选参数，用于限制一次 get_weight 处理的样本数量，防止 OOM。
 
-                # features.append(f)
-                features.append(torch.cat([f, feature], dim=1))  # concat regional feature with global feature
-                weights.append(self.get_weight(features[-1]))
+        返回:
+            pred_score: Tensor，分类得分 (B, num_classes)
+            weights_max: Tensor，每个区域在所有尺度下的最大权重
+            weights_org: Tensor，每个区域在第一个尺度下的权重
+        """
 
-            features_stack = torch.stack(features, dim=2)
-            weights_stack = torch.stack(weights, dim=2)
-            weights_stack = softmax(weights_stack, dim=2)
+        # ---------------------------
+        # 基础维度信息
+        # ---------------------------
+        num_scales = len(x)           # 尺度数量
+        num_regions = len(x[0])       # 每尺度区域数
+        batch_size = x[0][0].shape[0] # 每批样本数
 
-            weights_max.append(weights_stack[:, :, :len(x)].max(dim=2)[0])
-            weights_org.append(weights_stack[:, :, 0])
-            parts.append(features_stack.mul(weights_stack).sum(2).div(weights_stack.sum(2)))
-        parts_stack = torch.stack(parts, dim=0)
-        out = parts_stack.sum(0).div(parts_stack.shape[0])
+        # ---------------------------
+        # Step 1: 拼接所有区域为一个大批次
+        # ---------------------------
+        all_images = [x[s][r] for s in range(num_scales) for r in range(num_regions)]
+        all_images = torch.cat(all_images, dim=0)  # (num_scales*num_regions*B, 3, H, W)
 
-        pred_score = self.fc(out)
+        # ---------------------------
+        # Step 2: 一次性通过 backbone 提取局部特征
+        # ---------------------------
+        f = self.conv1(all_images)
+        f = self.bn1(f)
+        f = self.relu(f)
+        f = self.maxpool(f)
+        f = self.layer1(f)
+        f = self.layer2(f)
+        f = self.layer3(f)
+        f = self.layer4(f)
+        f = self.avgpool(f)
+        f = torch.flatten(f, 1)  # (num_scales*num_regions*B, feat_local)
 
+        # ---------------------------
+        # Step 3: reshape 回原结构，方便后续处理
+        # ---------------------------
+        f = f.view(num_scales, num_regions, batch_size, -1)  # (S, R, B, feat_local)
+
+        # ---------------------------
+        # Step 4: 拼接全局特征（使用 expand 减少显存复制）
+        # ---------------------------
+        feat_g = feature.unsqueeze(0).unsqueeze(0).expand(num_scales, num_regions, batch_size, feature.shape[1])
+        feat_cat = torch.cat([f, feat_g], dim=3)  # (S, R, B, feat_cat)
+
+        # ---------------------------
+        # 新增：Step 4.5 — 添加位置编码（可学习）
+        # 中文注释：为每个尺度-区域位置添加可学习的偏置，增强位置信息感知
+        # ---------------------------
+        # positional_encoding 存储为 (S*R, feat_dim)，需要 reshape 并 broadcast 到 (S, R, B, feat_dim)
+        feat_dim = feat_cat.shape[-1]
+        # 注意：如果实际训练时 num_scales 或 num_regions 与初始化不一致，需要调整 self.positional_encoding 的 shape
+        pos_enc = self.positional_encoding[:num_scales * num_regions]  # (S*R, feat_dim)
+        pos_enc = pos_enc.view(num_scales, num_regions, 1, feat_dim).expand(-1, -1, batch_size, -1)
+        feat_cat = feat_cat + pos_enc  # (S, R, B, feat_dim)
+
+        # ---------------------------
+        # 新增：Step 4.6 — 使用向量版 SE 对展平后的通道进行重标定
+        # 中文注释：先将 (S,R,B,C) 展平为 (N, C)，对每个样本的通道做自适应缩放，再恢复形状
+        # ---------------------------
+        feat_cat_flat = feat_cat.contiguous().view(-1, feat_dim)  # (S*R*B, feat_dim)
+        feat_cat_flat = self.se_layer(feat_cat_flat)              # (S*R*B, feat_dim)
+        feat_cat = feat_cat_flat.view(num_scales, num_regions, batch_size, feat_dim)
+
+        # ---------------------------
+        # Step 5: 批量计算权重（支持分块防止显存溢出）
+        # ---------------------------
+        feat_cat_flat = feat_cat.contiguous().view(-1, feat_cat.shape[-1])  # (S*R*B, feat_cat)
+        weights_list = []
+        if chunk_size and feat_cat_flat.shape[0] > chunk_size:
+            # 分块计算
+            for chunk in torch.split(feat_cat_flat, chunk_size, dim=0):
+                w_chunk = self.get_weight(chunk)
+                weights_list.append(w_chunk)
+            weights_all = torch.cat(weights_list, dim=0)
+        else:
+            # 一次性计算
+            weights_all = self.get_weight(feat_cat_flat)
+
+        # ---------------------------
+        # Step 6: reshape 权重回原结构
+        # ---------------------------
+        weights = weights_all.view(num_scales, num_regions, batch_size, -1)  # (S, R, B, weight_dim)
+        # 假设 get_weight 输出 (N,1)，则压缩最后一维
+        weights_scalar = weights.squeeze(-1)  # (S, R, B)
+
+        # ---------------------------
+        # Step 7: 对每个区域在尺度维做 softmax（用于尺度注意力）
+        # ---------------------------
+        weights_soft = torch.softmax(weights_scalar, dim=0)  # 在尺度维 S 上归一化
+
+        # ---------------------------
+        # Step 8: 加权融合局部与全局特征
+        # ---------------------------
+        # 广播相乘并在尺度维求和
+        fused_parts = (feat_cat * weights_soft.unsqueeze(-1)).sum(dim=0)  # (R, B, C)
+        # 防止数值问题，可再除以权重和
+        weights_sum = weights_soft.sum(dim=0) + 1e-8  # (R, B)
+        fused_parts = fused_parts / weights_sum.unsqueeze(-1)  # (R, B, C)
+
+        # ---------------------------
+        # Step 9: 区域聚合（平均所有区域特征）
+        # ---------------------------
+        out = fused_parts.sum(dim=0).div(fused_parts.shape[0])  # (B, C)
+
+        # ---------------------------
+        # Step 10: 分类层
+        # ---------------------------
+        pred_score = self.fc(out)  # (B, num_classes)
+
+        # ---------------------------
+        # Step 11: 计算附加权重输出（保持接口一致）
+        # ---------------------------
+        weights_max = weights_soft.max(dim=0)[0]  # (R, B)，每区域在不同尺度下的最大权重
+        weights_org = weights_soft[0]             # (R, B)，第一个尺度的权重
+
+        # ---------------------------
+        # Step 12: 返回三元组（保持兼容）
+        # ---------------------------
         return pred_score, weights_max, weights_org
 
     def forward(self, x, feature):
