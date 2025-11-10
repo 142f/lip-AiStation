@@ -26,7 +26,7 @@ class Trainer(nn.Module):
         )
         if opt.fine_tune:
             state_dict = torch.load(opt.pretrained_model, map_location="cpu")
-            self.model.load_state_dict(state_dict["model"])
+            self.model.load_state_dict(state_dict["model"], strict=False)
             self.total_steps = state_dict["total_steps"]
             print(f"Model loaded @ {opt.pretrained_model.split('/')[-1]}")
 
@@ -71,8 +71,10 @@ class Trainer(nn.Module):
             # 根据项目信息，使用CosineAnnealingWarmRestarts调度器
             # 重启周期设置为20个epoch，最小学习率设置为1e-7
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self.optimizer, T_0=20, T_mult=1, eta_min=1e-7
+                self.optimizer, T_0=20, T_mult=1, eta_min=1e-8
             )
+            # 添加一个计数器来跟踪epoch
+            self.scheduler_epoch = 0
         else:
             self.scheduler = None
 
@@ -163,6 +165,9 @@ class Trainer(nn.Module):
 
     def save_networks(self, save_filename):
         save_path = os.path.join(self.save_dir, save_filename)
+
+        # 确保保存目录存在
+        os.makedirs(self.save_dir, exist_ok=True)
 
         # serialize model and optimizer to dict
         state_dict = {

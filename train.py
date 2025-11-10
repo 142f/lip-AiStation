@@ -64,7 +64,7 @@ if __name__ == "__main__":
     log_dir = os.path.join("./logs", opt.name)
     os.makedirs(log_dir, exist_ok=True)
     # 优化日志文件名格式为{实验名称}_{年月日}_{时分秒}.log
-    log_file = os.path.join(log_dir, f"{opt.name}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    log_file = os.path.join(log_dir, f"model_{time.strftime('%Y%m%d_%H%M%S')}.log")
     
     # 重定向标准输出到日志文件和控制台
     logger = Logger(log_file)
@@ -72,6 +72,13 @@ if __name__ == "__main__":
 
     # 将训练选项写入日志文件
     print(format_options(opt, train_options.parser))
+    print("\n")
+
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.model.parameters())
+    trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    print(f"模型总参数量: {total_params:,}")
+    print(f"可训练参数量: {trainable_params:,}")
     print("\n")
 
     data_loader = create_dataloader(opt)
@@ -83,6 +90,7 @@ if __name__ == "__main__":
     # 初始化最佳性能跟踪变量
     best_acc = 0.0
     best_ap = 0.0
+    best_auc = 0.0
     best_epoch = 0
 
     start_time = time.time()
@@ -93,13 +101,16 @@ if __name__ == "__main__":
         # 应用余弦退火学习率（如果启用）
         if opt.cosine_annealing:
             # 注意：PyTorch的CosineAnnealingWarmRestarts调度器会在optimizer.step()中自动更新学习率
+            # 增加epoch计数器并更新学习率调度器
+            model.scheduler_epoch += 1
+            model.scheduler.step(model.scheduler_epoch)
             current_lr = model.optimizer.param_groups[0]['lr']
             print(f"当前学习率: {current_lr:.2e}")
         
-        for i, (img, crops, label) in enumerate(data_loader):
+        for i, (img, crops , label) in enumerate(data_loader):
             model.total_steps += 1
 
-            model.set_input((img, crops, label))
+            model.set_input((img, crops , label))
             model.forward()
             loss = model.get_loss()
 
@@ -145,13 +156,6 @@ if __name__ == "__main__":
             model.accumulation_count = 0
             model.update_steps += 1  # 更新步骤数增加
             
-            # 更新学习率调度器（如果启用）
-            if model.scheduler is not None:
-                model.scheduler.step()
-        # 确保每个epoch结束后调用scheduler.step()来更新学习率
-        elif model.scheduler is not None and model.accumulation_steps == 1:
-            model.scheduler.step()
-            
             # 如果在epoch结束时强制更新了参数，也需要检查是否需要打印损失
             if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
                 end_time = time.time()
@@ -166,10 +170,10 @@ if __name__ == "__main__":
                 start_time = time.time()
 
         model.eval()
-        ap, fpr, fnr, acc = validate(model.model, val_loader, opt.gpu_ids)
+        ap, fpr, fnr, acc, auc = validate(model.model, val_loader, opt.gpu_ids)
         print(
-            "(Val @ epoch {}) acc: {} ap: {} fpr: {} fnr: {}".format(
-                epoch + model.step_bias, acc, ap, fpr, fnr
+            "(Val @ epoch {}) acc: {} ap: {} fpr: {} fnr: {} auc: {}".format(
+                epoch + model.step_bias, acc, ap, fpr, fnr, auc
             )
         )
 
@@ -179,19 +183,21 @@ if __name__ == "__main__":
             # 更新最佳性能指标
             best_acc = acc
             best_ap = ap
+            best_auc = auc
             best_epoch = current_epoch
             
-            print(f" 发现新的最佳模型 (epoch {current_epoch}): acc={acc:.4f}, ap={ap:.4f}")
+            print(f" 发现新的最佳模型 (epoch {current_epoch}): acc={acc:.4f}, ap={ap:.4f}, auc={auc:.4f}")
             model.save_networks("best_model.pth")
             # 可选：同时保存带epoch编号的模型用于记录
             model.save_networks(f"model_epoch_{current_epoch}.pth")
         else:
-            print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f} @ epoch {best_epoch})")
+            print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f}, auc={best_auc:.4f} @ epoch {best_epoch})")
 
     # 训练结束后打印最终的最佳性能
     print(f"\n 训练完成！最佳模型性能:")
     print(f"   准确率 (acc): {best_acc:.4f}")
-    print(f"   AP值 (ap): {best_ap:.4f}")
+    print(f"   AP(ap): {best_ap:.4f}")
+    print(f"   AUC(auc): {best_auc:.4f}")
     print(f"   所在轮次: {best_epoch}")
     print(f"   最佳模型文件: best_model.pth")
     
