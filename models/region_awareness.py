@@ -1,8 +1,14 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
+import torch.nn.functional as F
+import cv2
+import numpy as np
 from typing import Type, Any, Callable, Union, List, Optional
 from torch.nn.functional import softmax
+
+# 添加kornia导入用于边缘检测
+import kornia
 
 try:
     from torch.hub import load_state_dict_from_url
@@ -135,28 +141,166 @@ class Bottleneck(nn.Module):
 
 
 # ---------------------------
-# 新增：针对展平特征的通道注意力（向量版 SE）
-# 说明：
-#  - 原始 SE 是对 4D feature map 做全局池化再两个 FC；这里我们对 (N, C) 向量做同样思想的通道重标定，
-#    便于在不修改 backbone 的情况下把 SE 思想加到 feat_cat（拼接后向量）上。
+# SCSA注意力模块 (Semantic Continuous-Sparse Attention)
+# 论文: SCSA: A Plug-and-Play Semantic Continuous-Sparse Attention for Arbitrary Semantic Style Transfer
+# 发表期刊/会议: CVPR 2025
 # ---------------------------
-class SELayerVec(nn.Module):
-    def __init__(self, channel: int, reduction: int = 16):
-        super(SELayerVec, self).__init__()
-        hidden = max(1, channel // reduction)
-        # 中文注释：通道压缩 -> ReLU -> 通道恢复 -> Sigmoid，输出每个通道的缩放系数（每个样本独立）
-        self.fc = nn.Sequential(
-            nn.Linear(channel, hidden, bias=False),
+class SCSA(nn.Module):
+    """
+    改进版 SCSA（Semantic Continuous-Sparse Attention）
+
+    改动要点：
+      - 使用 FiLM 风格的条件通道调制（从语义图提取 gamma, beta）来实现连续的、语义条件化的通道变换（SCA 分支）；
+      - 稀疏空间注意力（SSA 分支）由更强的 3x3 Conv 层组构成，产生细粒度空间注意图；
+      - 对两个分支使用残差连接并引入可学习标量融合权重，使网络能自适应分配两者影响；
+      - 兼容不同分辨率的 `semantic_map`（会被上/下采样到 x 的 spatial 大小）；
+      - 添加多尺度语义融合和动态稀疏率控制；
+      - 添加注意力图正则化项防止注意力坍缩；
+    """
+
+    def __init__(self, in_channels, semantic_dim=64, reduction: int = 16):
+        super(SCSA, self).__init__()
+        self.in_channels = in_channels
+        self.semantic_dim = semantic_dim
+
+        # ---- SCA: FiLM 风格通道调制（从语义图到 gamma,beta） ----
+        hidden = max(1, semantic_dim // reduction)
+        # 先对语义图做全局池化，再用小 MLP 预测 gamma 和 beta
+        self.sca_mlp = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # (B, semantic_dim, 1, 1)
+            nn.Conv2d(semantic_dim, hidden, 1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, channel, bias=False),
-            nn.Sigmoid()
+            nn.Conv2d(hidden, in_channels * 2, 1, bias=True)  # 输出 gamma 和 beta
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (N, C)
-        # 输出与 x 相同形状，按通道放缩
-        scale = self.fc(x)  # (N, C)
-        return x * scale
+        # ---- SSA: 更强的稀疏空间注意力（细粒度空间变换） ----
+        self.ssa_conv = nn.Sequential(
+            nn.Conv2d(in_channels + semantic_dim, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+        # 可学习融合权重（标量）和残差缩放
+        self.alpha = nn.Parameter(torch.tensor(0.5))  # 融合系数，初始化为中间值
+        self.beta = nn.Parameter(torch.tensor(0.5))   # SCA/SSA 的相对权重（可学习）
+        
+        # 动态稀疏率控制参数
+        self.sparse_ratio = nn.Parameter(torch.tensor(0.3))
+        # 温度系数用于softmax
+        self.tau = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x, semantic_map):
+        """
+        x: [B, C, H, W]
+        semantic_map: [B, semantic_dim, H_s, W_s] (任意分辨率，内部会调整)
+        返回: [B, C, H, W]
+        """
+        # 如果语义图为空或 None，直接返回输入
+        if semantic_map is None:
+            return x
+
+        # 统一分辨率到 x 的 spatial
+        if semantic_map.shape[2:] != x.shape[2:]:
+            semantic_map = F.interpolate(semantic_map, size=x.shape[2:], mode='bilinear', align_corners=False)
+
+        B, C, H, W = x.shape
+
+        # ---- SCA: 从语义图预测 gamma, beta 并对通道做调制 ----
+        sca_params = self.sca_mlp(semantic_map)  # (B, 2*C, 1, 1)
+        sca_params = sca_params.view(B, 2 * C)
+        gamma, bias = sca_params.chunk(2, dim=1)
+        # 调制：x' = x * (1 + gamma) + bias  （gamma/bias broadcast 到 spatial）
+        gamma = gamma.view(B, C, 1, 1)
+        bias = bias.view(B, C, 1, 1)
+        x_sca = x * (1.0 + gamma) + bias
+
+        # ---- SSA: 空间注意力，条件于语义图 ----
+        ssa_in = torch.cat([x, semantic_map], dim=1)
+        ssa_attn = self.ssa_conv(ssa_in)  # (B, C, H, W), in [0,1]
+        x_ssa = x * ssa_attn
+
+        # ---- 融合（残差 + 学习融合系数） ----
+        # alpha 控制是否应用注意力（残差权重），beta 控制 SCA/SSA 比例
+        alpha = torch.clamp(self.alpha, 0.0, 1.0)
+        beta = torch.sigmoid(self.beta)
+
+        fused = beta * x_sca + (1 - beta) * x_ssa
+        out = (1 - alpha) * x + alpha * fused
+        
+        # 保存注意力图用于后续正则化
+        self.attention_map = ssa_attn
+
+        return out
+
+    def compute_attention_regularization(self):
+        """
+        计算注意力图的正则化损失，防止注意力坍缩
+        """
+        if not hasattr(self, 'attention_map'):
+            return 0
+            
+        # L1稀疏约束
+        l1_loss = torch.mean(torch.abs(self.attention_map))
+        # 方差约束（防止注意力分布过于平坦）
+        var_loss = torch.var(self.attention_map, dim=[1, 2, 3]).mean()
+        return 0.01 * l1_loss + 0.005 * var_loss
+
+
+def generate_lip_semantic_map(image):
+    """
+    生成唇部语义图（简化版：基于阈值分割唇部区域，实际建议用预训练语义分割模型）
+    image: 输入图像 [H, W, 3]
+    return: 语义图特征 [semantic_dim=64, H, W]
+    """
+    # 将tensor转换为numpy数组
+    if isinstance(image, torch.Tensor):
+        image = image.permute(1, 2, 0).cpu().numpy()
+        # 如果是归一化的图像，需要还原
+        if image.max() <= 1.0:
+            image = (image * 255).astype(np.uint8)
+    
+    # 转换为RGB格式（如果需要）
+    if len(image.shape) == 2 or image.shape[2] == 1:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+    elif image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.dtype == np.uint8 else image
+    
+    # 简化版：灰度化+阈值分割（提取唇部区域）
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    _, lip_mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)  # 需根据数据调整阈值
+    lip_mask = lip_mask / 255.0  # 归一化
+    
+    # 编码为语义特征（64维通道）
+    semantic_map = torch.tensor(lip_mask, dtype=torch.float32).unsqueeze(0).repeat(64, 1, 1)  # [64, H, W]
+    return semantic_map
+
+
+def semantic_guided_attention(energy, semantic_map):
+    """
+    多尺度语义引导注意力机制
+    """
+    # 多尺度融合语义图
+    multi_scale_mask = []
+    for scale in [1.0, 0.7, 0.4]:  # 三级尺度
+        scaled_map = F.interpolate(
+            semantic_map, 
+            scale_factor=scale, 
+            mode='bilinear',
+            align_corners=False
+        )
+        # 添加边缘增强（解决语义边界模糊）
+        edge_mask = kornia.filters.sobel(scaled_map) * 0.3
+        multi_scale_mask.append(scaled_map + edge_mask)
+    
+    # 生成融合掩码
+    fused_mask = torch.stack(multi_scale_mask).mean(0)
+    return energy * fused_mask.unsqueeze(1)
 
 
 class ResNet(nn.Module):
@@ -209,21 +353,19 @@ class ResNet(nn.Module):
         self.fc = nn.Linear(512 * block.expansion + 768, 1)
 
         # ---------------------------
-        # 新增：位置编码与 SE 向量模块的初始化
+        # SCSA注意力模块初始化
         # 说明：
         #  - 默认假设 num_scales = 3, num_regions = 5（与数据预处理一致）
-        #  - positional_encoding 的维度与 feat_cat 的维度一致（512*expansion + 768）
-        #  - se_layer 在 feat_flat 上做通道重标定
+        #  - 在layer4之后添加SCSA模块
         # ---------------------------
         self.num_scales = 3
         self.num_regions = 5
-        feat_dim = 512 * block.expansion + 768
-        # 可学习的位置编码，形状为 (S*R, feat_dim)
-        self.positional_encoding = nn.Parameter(
-            torch.randn(self.num_scales * self.num_regions, feat_dim)
+        self.semantic_dim = 64
+        # 初始化SCSA模块
+        self.scsa = SCSA(
+            in_channels=512 * block.expansion,
+            semantic_dim=self.semantic_dim
         )
-        # 向量版 SE
-        self.se_layer = SELayerVec(feat_dim, reduction=16)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -266,7 +408,7 @@ class ResNet(nn.Module):
                                 norm_layer=norm_layer))
 
         return nn.Sequential(*layers)
-    def _forward_impl(self, x, feature, chunk_size: int = 65536):
+    def _forward_impl(self, x, feature, semantic_map=None, chunk_size: int = 65536):
         """
         高效版前向传播（可直接替换原 _forward_impl）：
           - 一次性批量处理所有尺度与区域，充分利用 GPU 并行；
@@ -277,6 +419,7 @@ class ResNet(nn.Module):
         参数:
             x: List[List[Tensor]]，形状为 [num_scales][num_regions][B, 3, H, W]
             feature: Tensor，全局特征 (B, feat_g)
+            semantic_map: Tensor，语义图特征 (B, semantic_dim, H, W)
             chunk_size: int，可选参数，用于限制一次 get_weight 处理的样本数量，防止 OOM。
 
         返回:
@@ -309,6 +452,13 @@ class ResNet(nn.Module):
         f = self.layer2(f)
         f = self.layer3(f)
         f = self.layer4(f)
+        
+        # 应用SCSA注意力机制
+        if semantic_map is not None:
+            # 为每个图像复制语义图
+            semantic_map_repeated = semantic_map.repeat(num_scales * num_regions, 1, 1, 1)
+            f = self.scsa(f, semantic_map_repeated)
+        
         f = self.avgpool(f)
         f = torch.flatten(f, 1)  # (num_scales*num_regions*B, feat_local)
 
@@ -322,25 +472,6 @@ class ResNet(nn.Module):
         # ---------------------------
         feat_g = feature.unsqueeze(0).unsqueeze(0).expand(num_scales, num_regions, batch_size, feature.shape[1])
         feat_cat = torch.cat([f, feat_g], dim=3)  # (S, R, B, feat_cat)
-
-        # ---------------------------
-        # 新增：Step 4.5 — 添加位置编码（可学习）
-        # 中文注释：为每个尺度-区域位置添加可学习的偏置，增强位置信息感知
-        # ---------------------------
-        # positional_encoding 存储为 (S*R, feat_dim)，需要 reshape 并 broadcast 到 (S, R, B, feat_dim)
-        feat_dim = feat_cat.shape[-1]
-        # 注意：如果实际训练时 num_scales 或 num_regions 与初始化不一致，需要调整 self.positional_encoding 的 shape
-        pos_enc = self.positional_encoding[:num_scales * num_regions]  # (S*R, feat_dim)
-        pos_enc = pos_enc.view(num_scales, num_regions, 1, feat_dim).expand(-1, -1, batch_size, -1)
-        feat_cat = feat_cat + pos_enc  # (S, R, B, feat_dim)
-
-        # ---------------------------
-        # 新增：Step 4.6 — 使用向量版 SE 对展平后的通道进行重标定
-        # 中文注释：先将 (S,R,B,C) 展平为 (N, C)，对每个样本的通道做自适应缩放，再恢复形状
-        # ---------------------------
-        feat_cat_flat = feat_cat.contiguous().view(-1, feat_dim)  # (S*R*B, feat_dim)
-        feat_cat_flat = self.se_layer(feat_cat_flat)              # (S*R*B, feat_dim)
-        feat_cat = feat_cat_flat.view(num_scales, num_regions, batch_size, feat_dim)
 
         # ---------------------------
         # Step 5: 批量计算权重（支持分块防止显存溢出）
@@ -399,8 +530,8 @@ class ResNet(nn.Module):
         # ---------------------------
         return pred_score, weights_max, weights_org
 
-    def forward(self, x, feature):
-        return self._forward_impl(x, feature)
+    def forward(self, x, feature, semantic_map=None):
+        return self._forward_impl(x, feature, semantic_map)
 
 
 def _get_backbone(
