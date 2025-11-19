@@ -88,6 +88,13 @@ class Trainer(nn.Module):
         self.accumulation_count = 0
         # 用于跟踪实际的参数更新步骤
         self.update_steps = 0
+        
+        # 混合精度训练相关组件
+        self.use_amp = opt.use_amp and torch.cuda.is_available()
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
+            # 获取设备类型用于autocast
+            self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
         self.input = input[0].to(self.device)
@@ -95,6 +102,14 @@ class Trainer(nn.Module):
         self.label = input[2].to(self.device).float()
 
     def forward(self):
+        # 使用自动混合精度上下文管理器包装前向传播
+        if self.use_amp:
+            with torch.amp.autocast('cuda'):
+                self._forward_impl()
+        else:
+            self._forward_impl()
+
+    def _forward_impl(self):
         self.get_features()
         self.output, self.weights_max, self.weights_org = self.model.forward(
             self.crops, self.features
@@ -119,35 +134,50 @@ class Trainer(nn.Module):
         return loss_ral, loss_ce
 
     def optimize_parameters(self):
-        # 梯度累积实现
-        # 除以accumulation_steps以获得平均梯度
+        # 1. 前向传播和Loss计算已经在 forward() 中完成
+        
+        # 2. 梯度清零 (只在累积周期的开始做)
+        if self.accumulation_count == 0:
+            self.optimizer.zero_grad()
+            
+        # 3. 反向传播 (Backward)
+        # Loss 需要除以累积步数
         loss_scaled = self.loss / self.accumulation_steps
         
-        # 反向传播
-        loss_scaled.backward()
+        if self.use_amp:
+            self.scaler.scale(loss_scaled).backward()
+        else:
+            loss_scaled.backward()
         
-        # 根据项目规范，添加梯度裁剪来防止梯度爆炸
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        
+        # 增加累积计数
         self.accumulation_count += 1
         
-        # 当达到累积步数时，更新参数并清零梯度
-        if self.accumulation_count == self.accumulation_steps:
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+        # 4. 参数更新 (只在累积周期结束时执行)
+        if self.accumulation_count >= self.accumulation_steps:
+            
+            if self.use_amp:
+                # A. 先 Unscale (将梯度还原回正常数值)
+                self.scaler.unscale_(self.optimizer)
+                
+                # B. 再 Clip (对正常数值的梯度进行裁剪)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # C. 最后 Step (如果梯度中有 Inf/NaN，scaler 会自动跳过 step)
+                self.scaler.step(self.optimizer)
+                
+                # D. 更新 Scaler 因子
+                self.scaler.update()
+            else:
+                # 非 AMP 模式
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            
+            # 重置累积计数
             self.accumulation_count = 0
-            self.update_steps += 1  # 记录实际的参数更新次数
+            self.optimizer.zero_grad() # 确保梯度被清空
+            self.update_steps += 1  # 记录实际更新次数
             
-            # 更新学习率调度器（如果启用）
-            if self.scheduler is not None:
-                self.scheduler.step()
-        # 如果不使用梯度累积（accumulation_steps=1），也要确保调度器更新
-        elif self.accumulation_steps == 1:
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.update_steps += 1
-            
-            # 更新学习率调度器（如果启用）
+            # 更新学习率调度器
             if self.scheduler is not None:
                 self.scheduler.step()
 
@@ -176,5 +206,9 @@ class Trainer(nn.Module):
             "total_steps": self.total_steps,
             "update_steps": self.update_steps,  # 保存实际更新步骤数
         }
+        
+        # 如果使用混合精度，还需要保存scaler的状态
+        if self.use_amp:
+            state_dict["scaler"] = self.scaler.state_dict()
 
         torch.save(state_dict, save_path)

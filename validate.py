@@ -1,153 +1,120 @@
 import argparse
 import torch
 import numpy as np
+import os
+import multiprocessing
 from data import AVLip
 import torch.utils.data
 from models import build_model
 from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve, roc_auc_score
-from tqdm import tqdm  # 导入 tqdm 库
+from tqdm import tqdm
+
+# 定义默认的target_fpr值
+DEFAULT_TARGET_FPR = 0.15
 
 def validate(model, loader, gpu_id):
-
+    # 1. 环境与模式设置
     device = torch.device(f"cuda:{gpu_id[0]}" if torch.cuda.is_available() else "cpu")
-    with torch.no_grad():
-        y_true, y_pred = [], []
-        # 使用 tqdm 包装数据加载器，显示进度条
-        for img, crops, label in tqdm(loader, desc="Validation Progress"):
-            img_tens = img.to(device)
-            crops_tens = [[t.to(device) for t in sublist] for sublist in crops]
-            features = model.get_features(img_tens).to(device)
-
-            y_pred.extend(model(crops_tens, features)[0].sigmoid().flatten().tolist())
-            y_true.extend(label.flatten().tolist())
-    y_true = np.array(y_true)
-    y_pred_prob = np.array(y_pred)  # 保存原始概率值用于AP计算
+    # 检查混合精度支持
+    use_amp = next(model.parameters()).dtype == torch.float16 if len(list(model.parameters())) > 0 else False
     
-    # === 针对多个 target_fpr 计算并打印阈值与指标（便于比较） ===
+    model.eval()
+    y_true, y_pred = [], []
+
+    # 2. 推理循环 (使用 inference_mode 替代 no_grad，性能更优)
+    with torch.inference_mode():
+        for img, crops, label in tqdm(loader, desc="Validation Progress", leave=True):
+            img_tens = img.to(device, non_blocking=True) # non_blocking 加速数据传输
+            
+            # 处理 crops 传输 (假设 crops 是 list of lists 结构)
+            # 如果 crops 结构能改为 Tensor Stack 形式传输会更快，这里保持兼容性
+            crops_tens = [[t.to(device, non_blocking=True) for t in sublist] for sublist in crops]
+
+            # 统一推理逻辑
+            # 如果 gpu_id 是 list, device.type 可能是 'cuda'
+            device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+            
+            # 使用 amp.autocast 包装，指定 device_type
+            if use_amp:
+                with torch.amp.autocast(device_type=device_type):
+                    features = model.get_features(img_tens)
+                    output = model(crops_tens, features)[0]
+            else:
+                features = model.get_features(img_tens)
+                output = model(crops_tens, features)[0]
+
+            # 收集结果 (先转cpu再转list，避免频繁显存交互)
+            y_pred.extend(output.sigmoid().flatten().cpu().tolist())
+            y_true.extend(label.flatten().tolist())
+
+    y_true = np.array(y_true)
+    y_pred_prob = np.array(y_pred)
+
+    # 3. 全局指标计算 (提取到循环外，避免重复计算)
+    # 检查是否只有单一类别，防止报错
+    if len(np.unique(y_true)) > 1:
+        global_ap = average_precision_score(y_true, y_pred_prob)
+        global_auc = roc_auc_score(y_true, y_pred_prob)
+    else:
+        global_ap = 0.0
+        global_auc = 0.0
+
+    # 4. 阈值与多点评估
     fpr_list, tpr_list, thresholds = roc_curve(y_true, y_pred_prob)
     target_fpr_list = [0.02, 0.05, 0.1, 0.15, 0.2]
 
-    # 动态平滑窗口：根据样本量调整窗口大小
-    window_size = max(3, len(tpr_list) // 20)  # 至少为3
-    if len(tpr_list) >= window_size:
-        smoothed_tpr = np.convolve(tpr_list, np.ones(window_size) / window_size, mode='same')
-    else:
-        smoothed_tpr = tpr_list
-
-    # 根据目标 FPR 使用线性插值选择阈值；当在阈值序列边界外时退回边界值
-    def threshold_for_target_fpr(target_fpr):
-        if len(fpr_list) == 0:
-            return 0.5
-        # fpr_list 是递增的
-        if target_fpr <= fpr_list[0]:
-            return float(thresholds[0])
-        if target_fpr >= fpr_list[-1]:
-            return float(thresholds[-1])
-        idx = np.searchsorted(fpr_list, target_fpr)
-        if idx < len(fpr_list) and fpr_list[idx] == target_fpr:
-            return float(thresholds[idx])
-        # 在 idx-1 和 idx 之间插值
-        x0, x1 = fpr_list[idx - 1], fpr_list[idx]
-        t0, t1 = thresholds[idx - 1], thresholds[idx]
-        if x1 == x0:
-            return float(t0)
-        ratio = (target_fpr - x0) / (x1 - x0)
-        return float(t0 + ratio * (t1 - t0))
-
     results_by_target = {}
+
+    # 使用 numpy 自带插值简化逻辑 (注意: fpr是递增的，thresholds是递减的，需翻转)
+    # 解决 thresholds[0] 可能为 inf 的情况 (sklearn 特性)
+    thresholds[0] = min(thresholds[0], 1.0) 
+    
+    print("\nValidation summary for multiple target FPRs:")
+    print(f"{'target_fpr':<12} | {'threshold':<10} | {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} | {'FPR':<6} {'FNR':<6} {'ACC':<6} {'AP':<6} {'AUC':<6}")
+
     for target_fpr in target_fpr_list:
-        # 首先用插值获取与目标 FPR 对齐的阈值
-        optimal_threshold = threshold_for_target_fpr(target_fpr)
-
-        # 尝试在目标附近的小容差范围内选取使（平滑后）TPR 最大的真实阈值
-        tol = 0.005
-        nearby_idx = np.where(np.abs(fpr_list - target_fpr) <= tol)[0]
-        if len(nearby_idx) > 0:
-            weights = 1 / (np.abs(fpr_list[nearby_idx] - target_fpr) + 1e-6)  # 权重：距离越近权重越高
-            best_near = nearby_idx[np.argmax(smoothed_tpr[nearby_idx] * weights)]
-            optimal_threshold = float(thresholds[best_near])
-
+        # === 优化算法：快速找到对应 FPR 的阈值 ===
+        # 使用 numpy.interp 进行线性插值。由于 thresholds 随 fpr 增加而减小，我们需要翻转数组来满足 xp 递增的要求
+        optimal_threshold = np.interp(target_fpr, fpr_list, thresholds)
+        
+        # 二值化
         y_pred_binary_t = (y_pred_prob >= optimal_threshold).astype(int)
 
-        # 更稳健的混淆矩阵展开：若出现单类别缺失，逐样本计数以避免 ravel 出错
-        cm = confusion_matrix(y_true, y_pred_binary_t)
-        if cm.shape == (2, 2):
-            tn_t, fp_t, fn_t, tp_t = cm.ravel()
-        else:
-            tn_t = fp_t = fn_t = tp_t = 0
-            for yt, yp in zip(y_true, y_pred_binary_t):
-                if yt == 0 and yp == 0:
-                    tn_t += 1
-                elif yt == 0 and yp == 1:
-                    fp_t += 1
-                elif yt == 1 and yp == 0:
-                    fn_t += 1
-                elif yt == 1 and yp == 1:
-                    tp_t += 1
+        # === 优化算法：混淆矩阵 ===
+        # 指定 labels=[0, 1] 可强制输出 2x2 矩阵，即使某类样本缺失也不会报错，替代了原来的 for 循环
+        tn_t, fp_t, fn_t, tp_t = confusion_matrix(y_true, y_pred_binary_t, labels=[0, 1]).ravel()
 
+        # 计算衍生指标
         fpr_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0.0
         fnr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0.0
-        acc_t = (tp_t + tn_t) / (tp_t + tn_t + fp_t + fn_t) if (tp_t + tn_t + fp_t + fn_t) > 0 else 0.0
+        acc_t = accuracy_score(y_true, y_pred_binary_t)
 
-        # 对于 AP / AUC，需保证存在正负样本，否则这些指标未定义
-        if len(np.unique(y_true)) > 1:
-            ap_t = average_precision_score(y_true, y_pred_prob)
-            auc_t = roc_auc_score(y_true, y_pred_prob)
-        else:
-            ap_t = 0.0
-            auc_t = 0.0
-
+        # 存入字典
         results_by_target[target_fpr] = {
-            'threshold': float(optimal_threshold),
-            'tn': int(tn_t), 'fp': int(fp_t), 'fn': int(fn_t), 'tp': int(tp_t),
-            'fpr': float(fpr_t), 'fnr': float(fnr_t), 'acc': float(acc_t),
-            'ap': float(ap_t), 'auc': float(auc_t)
+            'threshold': optimal_threshold,
+            'tn': tn_t, 'fp': fp_t, 'fn': fn_t, 'tp': tp_t,
+            'fpr': fpr_t, 'fnr': fnr_t, 'acc': acc_t,
+            'ap': global_ap, 'auc': global_auc
         }
 
-    # 打印比较表格（简洁输出）
-    print("\nValidation summary for multiple target FPRs:")
-    print("target_fpr | threshold |   TP   FP   TN   FN |   FPR   FNR   ACC    AP    AUC")
-    for t in target_fpr_list:
-        r = results_by_target[t]
-        print(f"{t:9.2f} | {r['threshold']:.4f} | {r['tp']:5d} {r['fp']:5d} {r['tn']:5d} {r['fn']:5d} | {r['fpr']:.3f} {r['fnr']:.3f} {r['acc']:.3f} {r['ap']:.3f} {r['auc']:.3f}")
+        print(f"{target_fpr:<12.2f} | {optimal_threshold:.4f}     | {tp_t:<6} {fp_t:<6} {tn_t:<6} {fn_t:<6} | {fpr_t:.3f}  {fnr_t:.3f}  {acc_t:.3f}  {global_ap:.3f}  {global_auc:.3f}")
 
-    # 兼容旧接口：返回 target_fpr=0.02 时的指标（供训练脚本使用）
-    default_r = results_by_target.get(0.15, None)
-    if default_r is None:
-        # 如果未找到则取最接近的
-        closest_t = min(results_by_target.keys(), key=lambda x: abs(x - 0.15))
-        default_r = results_by_target[closest_t]
+    # 5. 返回默认 FPR 下的指标 (兼容旧接口)
+    # 寻找最接近 DEFAULT_TARGET_FPR 的 key
+    closest_t = min(results_by_target.keys(), key=lambda x: abs(x - DEFAULT_TARGET_FPR))
+    res = results_by_target[closest_t]
 
-    y_pred_binary = np.where(y_pred_prob >= default_r['threshold'], 1, 0)
-    optimal_threshold = default_r['threshold']
-    # === 阈值调整结束 ===
+    # 混淆矩阵打印 (使用默认阈值)
+    cm_ravel = [res['tn'], res['fp'], res['fn'], res['tp']]
+    print(f"混淆矩阵展开 (Target FPR ~{closest_t}): {cm_ravel}")
 
-    # Get AP (使用概率值)
-    ap = average_precision_score(y_true, y_pred_prob)
-
-    # 计算AUC值
-    auc = roc_auc_score(y_true, y_pred_prob)
-
-    # 混淆矩阵计算（使用二值化结果）
-    cm = confusion_matrix(y_true, y_pred_binary)
-    print("混淆矩阵展开后的顺序:", cm.ravel())
-
-    tn, fp, fn, tp = cm.ravel()
-    fnr = fn / (fn + tp)
-    fpr = fp / (fp + tn)
-    acc = accuracy_score(y_true, y_pred_binary)
-
-    # tn_correct, fp_correct, fn_correct, tp_correct = cm.ravel()
-    # print(f"tn_correct={tn_correct}, fp_correct={fp_correct}, fn_correct={fn_correct}, tp_correct={tp_correct}")
-    # fnr_correct = fn_correct / (fn_correct + tp_correct)
-    # fpr_correct = fp_correct / (fp_correct + tn_correct)
-    # acc_correct = accuracy_score(y_true, y_pred_binary)
-    # print(f"正确计算: FNR_correct={fnr_correct:.4f}, FPR_correct={fpr_correct:.4f}, ACC_correct={acc_correct:.4f}")
-
-    return ap, fpr, fnr, acc, auc
+    return res['ap'], res['fpr'], res['fnr'], res['acc'], res['auc']
 
 
 if __name__ == "__main__":
+    # 开启 cuDNN benchmark 可以在输入尺寸固定时加速
+    torch.backends.cudnn.benchmark = True
+
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--real_list_path", type=str, default=r"E:\data\val2\0_real")
     parser.add_argument("--fake_list_path", type=str, default=r"E:\data\val2\1_fake")
@@ -157,6 +124,8 @@ if __name__ == "__main__":
     parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14")
     parser.add_argument("--ckpt", type=str, default=r"E:\data\ckpt.pth")
     parser.add_argument("--gpu", type=int, default=0)
+    # 添加 num_workers 参数，允许用户配置
+    parser.add_argument("--workers", type=int, default=4, help="number of data loading workers")
 
     opt = parser.parse_args()
 
@@ -164,25 +133,36 @@ if __name__ == "__main__":
     print(f"Using cuda {opt.gpu} for inference.")
 
     model = build_model(opt.arch)
-    state_dict = torch.load(opt.ckpt, map_location="cpu")
-    # 修改加载方式，允许部分匹配（strict=False）
-    # 这样可以加载旧模型权重，同时保留新增模块的初始化权重
-    model.load_state_dict(state_dict["model"], strict=False)
-    print("Model loaded.")
+    
+    if os.path.exists(opt.ckpt):
+        state_dict = torch.load(opt.ckpt, map_location="cpu")
+        # 保持 strict=False 以适应微调或部分加载
+        model.load_state_dict(state_dict["model"], strict=False)
+        print(f"Model loaded from {opt.ckpt}")
+    else:
+        print(f"Warning: Checkpoint not found at {opt.ckpt}")
 
-    # 打印模型参数量
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型总参数量: {total_params:,}")
-    print(f"可训练参数量: {trainable_params:,}")
     print("\n")
 
-    model.eval()
     model.to(device)
 
     dataset = AVLip(opt)
-    loader = data_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=opt.batch_size, shuffle=True
+    
+    # 优化 DataLoader
+    # 1. shuffle=False: 验证集不需要打乱，减少开销
+    # 2. num_workers: 使用多进程加载数据 (通常设为 CPU 核心数或 4-8)
+    # 3. pin_memory: 加速 CPU 到 GPU 的传输
+    num_workers = min(opt.workers, multiprocessing.cpu_count())
+    loader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=opt.batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0) # 保持 worker 进程存活，减少重建开销
     )
+
     ap, fpr, fnr, acc, auc = validate(model, loader, gpu_id=[opt.gpu])
-    print(f"(Val) acc: {acc:.4f} | ap: {ap:.4f} | fpr: {fpr:.3f} | fnr: {fnr:.3f} | auc: {auc:.4f}")
+    print(f"\n(Final Result @ FPR {DEFAULT_TARGET_FPR}) acc: {acc:.4f} | ap: {ap:.4f} | fpr: {fpr:.3f} | fnr: {fnr:.3f} | auc: {auc:.4f}")
