@@ -43,5 +43,10 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--fine-tune', action='store_true', help='If specified, enables finetuning from a pretrained model.')
         parser.add_argument('--pretrained_model', type=str, default='./checkpoints/experiment_name/model_epoch_29.pth', help='Path to the pretrained model for finetuning.')
         
+        # ===================================================================
+        # 6. 混合精度训练 (Mixed Precision Training)
+        # ===================================================================
+        parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision (AMP) training')
+        
         self.isTrain = True
         return parser

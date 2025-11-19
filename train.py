@@ -80,6 +80,10 @@ if __name__ == "__main__":
     print(f"模型总参数量: {total_params:,}")
     print(f"可训练参数量: {trainable_params:,}")
     print("\n")
+    
+    # 显示是否使用混合精度训练
+    print(f"使用混合精度训练: {'是' if opt.use_amp else '否'}")
+    print("\n")
 
     data_loader = create_dataloader(opt)
     val_loader = create_dataloader(val_opt)
@@ -93,10 +97,14 @@ if __name__ == "__main__":
     best_auc = 0.0
     best_epoch = 0
 
+    # 整个实验的总开始时间
+    experiment_start_time = time.time()
     start_time = time.time()
     for epoch in range(opt.epoch):
+        # 记录每个epoch的开始时间
+        epoch_start_time = time.time()
         model.train()
-        print("epoch: ", epoch + model.step_bias)
+        print(f"epoch: {epoch + model.step_bias}")
         
         # 应用余弦退火学习率（如果启用）
         if opt.cosine_annealing:
@@ -151,7 +159,11 @@ if __name__ == "__main__":
         # 在每个epoch结束时确保梯度更新
         # 如果使用梯度累积且当前累积计数不为0，则执行一次梯度更新
         if hasattr(model, 'accumulation_count') and model.accumulation_count > 0:
-            model.optimizer.step()
+            if model.use_amp:
+                model.scaler.step(model.optimizer)
+                model.scaler.update()
+            else:
+                model.optimizer.step()
             model.optimizer.zero_grad()
             model.accumulation_count = 0
             model.update_steps += 1  # 更新步骤数增加
@@ -192,14 +204,24 @@ if __name__ == "__main__":
             model.save_networks(f"model_epoch_{current_epoch}.pth")
         else:
             print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f}, auc={best_auc:.4f} @ epoch {best_epoch})")
+        
+        # 计算并打印当前epoch的总时间
+        epoch_time = time.time() - epoch_start_time
+        print(f"Epoch {epoch + model.step_bias} 总耗时: {epoch_time:.2f}秒")
 
-    # 训练结束后打印最终的最佳性能
+    # 计算整个实验的总时间
+    experiment_total_time = time.time() - experiment_start_time
+    hours, remainder = divmod(experiment_total_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    # 训练结束后打印最终的最佳性能和总时间
     print(f"\n 训练完成！最佳模型性能:")
     print(f"   准确率 (acc): {best_acc:.4f}")
     print(f"   AP(ap): {best_ap:.4f}")
     print(f"   AUC(auc): {best_auc:.4f}")
     print(f"   所在轮次: {best_epoch}")
     print(f"   最佳模型文件: best_model.pth")
+    print(f"   整个实验总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
     
     # 关闭日志文件
     logger.close()
