@@ -1,6 +1,7 @@
 import time
 import sys
 import os
+import torch  # 需要显式导入 torch，否则 clip_grad_norm_ 会报错
 from validate import validate
 from data import create_dataloader
 from trainer.trainer import Trainer
@@ -26,7 +27,7 @@ class Logger(object):
         self.log.close()
 
 
-def get_val_opt():
+def get_val_opt(opt): # [修改] 传入 opt 参数，避免依赖全局变量导致可能的 NameError
     val_opt = TrainOptions().parse(print_options=False)
     val_opt.isTrain = False
     val_opt.data_label = "val"
@@ -57,7 +58,7 @@ def format_options(opt, parser):
 if __name__ == "__main__":
     train_options = TrainOptions()
     opt = train_options.parse(print_options=False)  # 禁用自动打印选项
-    val_opt = get_val_opt()
+    val_opt = get_val_opt(opt) # [修改] 传入 opt
     model = Trainer(opt)
 
     # 创建日志目录和文件（优化：放在项目根路径下的logs文件夹）
@@ -156,14 +157,24 @@ if __name__ == "__main__":
                     )
                 start_time = time.time()
 
-        # 在每个epoch结束时确保梯度更新
-        # 如果使用梯度累积且当前累积计数不为0，则执行一次梯度更新
+        # ====================================================================
+        # [重要修正] Epoch 结束时的剩余梯度处理
+        # 必须先 Unscale, 再 Clip, 最后 Step，防止梯度爆炸导致 NaN
+        # ====================================================================
         if hasattr(model, 'accumulation_count') and model.accumulation_count > 0:
             if model.use_amp:
+                # 1. Unscale (修正：必须先还原梯度)
+                model.scaler.unscale_(model.optimizer)
+                # 2. Clip (修正：对还原后的梯度裁剪)
+                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
+                # 3. Step
                 model.scaler.step(model.optimizer)
                 model.scaler.update()
             else:
+                # 修正：非 AMP 模式也需要 Clip
+                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
                 model.optimizer.step()
+            
             model.optimizer.zero_grad()
             model.accumulation_count = 0
             model.update_steps += 1  # 更新步骤数增加
@@ -184,26 +195,40 @@ if __name__ == "__main__":
         model.eval()
         ap, fpr, fnr, acc, auc = validate(model.model, val_loader, opt.gpu_ids)
         print(
-            "(Val @ epoch {}) acc: {} ap: {} fpr: {} fnr: {} auc: {}".format(
-                epoch + model.step_bias, acc, ap, fpr, fnr, auc
+            "(Val @ epoch {}) auc: {:.4f} | ap: {:.4f} | acc: {:.4f} | fpr: {:.4f} | fnr: {:.4f}".format(
+                epoch + model.step_bias, auc, ap, acc, fpr, fnr
             )
         )
 
         # 只在验证性能超过历史最佳时才保存模型
+        # 保存准则按优先级排序：AUC > AP > ACC
         current_epoch = epoch + model.step_bias
-        if acc > best_acc or (acc == best_acc and ap > best_ap):
-            # 更新最佳性能指标
+        is_better = False
+        # 优先比较 AUC
+        if auc > best_auc:
+            is_better = True
+        elif auc == best_auc:
+            # AUC 相同时比较 AP
+            if ap > best_ap:
+                is_better = True
+            elif ap == best_ap:
+                # AP 也相同时比较 ACC
+                if acc > best_acc:
+                    is_better = True
+
+        if is_better:
+            # 更新最佳性能指标（按 AUC/AP/ACC 的优先级）
             best_acc = acc
             best_ap = ap
             best_auc = auc
             best_epoch = current_epoch
-            
-            print(f" 发现新的最佳模型 (epoch {current_epoch}): acc={acc:.4f}, ap={ap:.4f}, auc={auc:.4f}")
+
+            print(f" 发现新的最佳模型 (epoch {current_epoch}): auc={best_auc:.4f}, ap={best_ap:.4f}, acc={best_acc:.4f}")
             model.save_networks("best_model.pth")
             # 可选：同时保存带epoch编号的模型用于记录
             model.save_networks(f"model_epoch_{current_epoch}.pth")
         else:
-            print(f" 当前性能未超过最佳 (最佳: acc={best_acc:.4f}, ap={best_ap:.4f}, auc={best_auc:.4f} @ epoch {best_epoch})")
+            print(f" 当前性能未超过最佳 (最佳: auc={best_auc:.4f}, ap={best_ap:.4f}, acc={best_acc:.4f} @ epoch {best_epoch})")
         
         # 计算并打印当前epoch的总时间
         epoch_time = time.time() - epoch_start_time
@@ -216,9 +241,9 @@ if __name__ == "__main__":
     
     # 训练结束后打印最终的最佳性能和总时间
     print(f"\n 训练完成！最佳模型性能:")
-    print(f"   准确率 (acc): {best_acc:.4f}")
-    print(f"   AP(ap): {best_ap:.4f}")
     print(f"   AUC(auc): {best_auc:.4f}")
+    print(f"   AP(ap): {best_ap:.4f}")
+    print(f"   准确率 (acc): {best_acc:.4f}")
     print(f"   所在轮次: {best_epoch}")
     print(f"   最佳模型文件: best_model.pth")
     print(f"   整个实验总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
