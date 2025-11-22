@@ -243,7 +243,7 @@ if __name__ == "__main__":
     print(f"\n 训练完成！最佳模型性能:")
     print(f"   AUC(auc): {best_auc:.4f}")
     print(f"   AP(ap): {best_ap:.4f}")
-    print(f"   准确率 (acc): {best_acc:.4f}")
+    print(f"   ACC(acc): {best_acc:.4f}")
     print(f"   所在轮次: {best_epoch}")
     print(f"   最佳模型文件: best_model.pth")
     print(f"   整个实验总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
