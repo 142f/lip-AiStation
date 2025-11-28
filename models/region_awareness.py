@@ -1,9 +1,7 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-import torch.fft  # 新增：用于频域变换
 from typing import Type, Any, Callable, Union, List, Optional
-from torch.nn.functional import softmax
 
 try:
     from torch.hub import load_state_dict_from_url
@@ -16,10 +14,6 @@ model_urls = {
     'resnet50': 'https://download.pytorch.org/models/resnet50-0676ba61.pth',
     'resnet101': 'https://download.pytorch.org/models/resnet101-63fe2227.pth',
     'resnet152': 'https://download.pytorch.org/models/resnet152-394f9c45.pth',
-    'resnext50_32x4d': 'https://download.pytorch.org/models/resnext50_32x4d-7cdf4587.pth',
-    'resnext101_32x8d': 'https://download.pytorch.org/models/resnext101_32x8d-8ba56ff5.pth',
-    'wideget_backbone50_2': 'https://download.pytorch.org/models/wideget_backbone50_2-95faca4d.pth',
-    'wideget_backbone101_2': 'https://download.pytorch.org/models/wideget_backbone101_2-32ee1156.pth',
 }
 
 
@@ -142,51 +136,122 @@ class SELayerVec(nn.Module):
 
 
 # ---------------------------
-# 新增模块: 频域特征提取器 (FrequencyExtractor)
-# 说明: 提取幅值谱特征，作为 RGB 特征的补充，用于检测频域伪影
+# [修改] 模块: DWT 标准小波变换
 # ---------------------------
-class FrequencyExtractor(nn.Module):
-    def __init__(self, out_dim=256):
-        super(FrequencyExtractor, self).__init__()
-        # 定义一个轻量级的 CNN 来处理频谱图 (输入通道为3, 对应RGB三通道的频谱)
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # Downsample
+class DWT(nn.Module):
+    """
+    基于卷积实现的离散小波变换 (Discrete Wavelet Transform)
+    使用 Haar 小波核，将输入 (B, 3, H, W) 转换为 (B, 12, H/2, W/2)
+    """
+    def __init__(self):
+        super(DWT, self).__init__()
+        self.requires_grad = False  # 小波变换本身不需要训练
+        self.colors = 3             # RGB通道
 
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # Downsample
+        # Haar 小波滤波器定义
+        ll = torch.tensor([[0.5, 0.5], [0.5, 0.5]]).float()
+        lh = torch.tensor([[-0.5, -0.5], [0.5, 0.5]]).float()
+        hl = torch.tensor([[-0.5, 0.5], [-0.5, 0.5]]).float()
+        hh = torch.tensor([[0.5, -0.5], [-0.5, 0.5]]).float()
 
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),  # Global Pool -> (B, 64, 1, 1)
-            nn.Flatten(),                  # -> (B, 64)
-            nn.Linear(64, out_dim),        # -> (B, out_dim)
-            nn.ReLU(inplace=True)
-        )
+        # 组合成 (4, 1, 2, 2)
+        filters = torch.cat([
+            ll.unsqueeze(0), 
+            lh.unsqueeze(0), 
+            hl.unsqueeze(0), 
+            hh.unsqueeze(0)
+        ], dim=0).unsqueeze(1)
+
+        # 扩展到 3个通道: (12, 1, 2, 2)
+        # 这种写法是 depthwise convolution 的形式，每个通道独立计算
+        filters = filters.repeat(self.colors, 1, 1, 1)
+
+        self.register_buffer('filters', filters)
 
     def forward(self, x):
-        # x: (Batch, 3, H, W) - RGB Image
+        # x: (B, 3, H, W)
+        b, c, h, w = x.shape
+        # padding 保证尺寸匹配 (如果输入可能是奇数尺寸)
+        if h % 2 != 0 or w % 2 != 0:
+            x = nn.functional.pad(x, (0, 1, 0, 1), mode='reflect')
+
+        # 使用 group convolution 进行通道独立变换
+        # 输出: (B, 12, H/2, W/2)
+        out = nn.functional.conv2d(x, self.filters, stride=2, groups=c)
+        return out
+
+
+# ---------------------------
+# [修改] 模块: 改进版小波特征提取器
+# ---------------------------
+class WaveletExtractor(nn.Module):
+    def __init__(self, out_dim=256):
+        super(WaveletExtractor, self).__init__()
         
-        # 1. FFT 变换: 计算二维实数傅里叶变换
-        # 结果为复数张量
-        fft = torch.fft.rfft2(x, norm='backward')
+        self.dwt = DWT()
         
-        # 2. 计算幅值谱 (Magnitude/Amplitude Spectrum)
-        mag = torch.abs(fft)
+        # 输入维度: 3 colors * 4 bands (LL, LH, HL, HH) = 12
+        in_channels = 12
         
-        # 3. Log 变换: 压缩动态范围，使低频和高频特征更易被 CNN 提取
-        # 加上微小值防止 log(0)
-        mag = torch.log(mag + 1e-8)
+        # 特征提取网络: Stem -> ResBlock -> ResBlock
+        self.conv_stem = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
         
-        # 4. 通过 CNN 提取特征
-        feat = self.net(mag)
+        self.layer1 = self._make_basic_block(64, 128)
+        self.layer2 = self._make_basic_block(128, 256)
         
-        return feat
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # 最终投影
+        self.fc = nn.Linear(256, out_dim)
+        
+        # 初始化权重
+        self.apply(self._init_weights)
+        
+        # [关键] 零初始化最后一层，保证初始阶段不影响主干梯度
+        nn.init.constant_(self.fc.weight, 0)
+        nn.init.constant_(self.fc.bias, 0)
+
+    def _make_basic_block(self, in_planes, out_planes):
+        """创建一个带下采样的基础卷积块"""
+        return nn.Sequential(
+            nn.Conv2d(in_planes, out_planes, 3, stride=2, padding=1, bias=False), # Downsample
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_planes, out_planes, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU(inplace=True),
+        )
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # 1. DWT 变换 -> (B, 12, H/2, W/2)
+        freq_map = self.dwt(x)
+        
+        # 2. [关键] Log 对数变换
+        # 频域幅值差异很大，取 log 类似于同态滤波，有助于 CNN 学习
+        freq_map = torch.log(torch.abs(freq_map) + 1e-6)
+        
+        # 3. 特征提取
+        x = self.conv_stem(freq_map)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        
+        # 4. 聚合输出
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        
+        return x
 
 
 class ResNet(nn.Module):
@@ -231,10 +296,10 @@ class ResNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         # ---------------------------
-        # 修改 1: 初始化频域提取模块
+        # 修改 1: 初始化小波提取模块 (替换了原 FrequencyExtractor)
         # ---------------------------
         self.freq_dim = 256  # 设定频域特征维度
-        self.freq_extractor = FrequencyExtractor(out_dim=self.freq_dim)
+        self.freq_extractor = WaveletExtractor(out_dim=self.freq_dim)
 
         # ---------------------------
         # 修改 2: 重新计算总特征维度
@@ -255,7 +320,7 @@ class ResNet(nn.Module):
         self.num_scales = 3
         self.num_regions = 5
         
-        # 可学习的位置编码，适应新的 feat_dim
+        # 可学习的位置编码
         self.positional_encoding = nn.Parameter(
             torch.randn(self.num_scales * self.num_regions, feat_dim)
         )
@@ -336,9 +401,9 @@ class ResNet(nn.Module):
         f = f.view(num_scales, num_regions, batch_size, -1)  # (S, R, B, feat_rgb)
 
         # ---------------------------
-        # Step 2.5: 提取 频域 局部特征 (FrequencyExtractor) - [新增]
+        # Step 2.5: 提取 频域/小波 局部特征 - [修改]
         # ---------------------------
-        # 复用 all_images，对每个裁剪区域也进行频域分析
+        # 使用新的 WaveletExtractor
         f_freq_flat = self.freq_extractor(all_images) # (S*R*B, freq_dim)
         
         # Reshape 回结构
@@ -351,7 +416,7 @@ class ResNet(nn.Module):
         feat_g = feature.unsqueeze(0).unsqueeze(0).expand(num_scales, num_regions, batch_size, feature.shape[1])
 
         # ---------------------------
-        # Step 4: 多模态特征融合 (RGB + CLIP + Frequency) - [修改]
+        # Step 4: 多模态特征融合 (RGB + CLIP + Wavelet)
         # ---------------------------
         # 拼接策略：将三种特征在通道维度拼接
         # feat_cat shape: (S, R, B, rgb_dim + clip_dim + freq_dim)
@@ -451,11 +516,13 @@ def get_backbone(pretrained: bool = False, progress: bool = True, **kwargs: Any)
 if __name__ == '__main__':
     # 简单的测试代码，确保维度正确
     model = get_backbone()
+    # 模拟输入: 3个尺度，每个尺度5个区域
     data = [[] for i in range(3)]
     for i in range(3):
         for j in range(5):
-            data[i].append(torch.rand((10, 3, 224, 224)))
-    feature = torch.rand((10, 768))
+            data[i].append(torch.rand((2, 3, 224, 224))) # batch=2
+    feature = torch.rand((2, 768)) # CLIP feature
+    
     pred_score, weights_max, weights_org = model(data, feature)
     print("Output shape:", pred_score.shape)
     print("Freq Dim included in pipeline check:", model.freq_dim)
