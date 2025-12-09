@@ -35,10 +35,10 @@ class BaseOptions:
         # ===================================================================
         # 4. 硬件与环境参数 (Hardware and Environment Arguments)
         # ===================================================================
+        parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
         parser.add_argument("--gpu_ids", type=str, default="0", help="GPU IDs to use. E.g., '0', '0,1,2', or '-1' for CPU.")
         parser.add_argument("--num_threads", type=int, default=0, help="Number of threads for data loading.")
         parser.add_argument('--amp', action='store_true', help='if specified, use amp for training')
-        parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
      
         # 新增参数 --错误点
         parser.add_argument("--suffix", type=str, default="", help="customized suffix: opt.name = opt.name + suffix: e.g., {model}_{netG}_size{load_size}")
