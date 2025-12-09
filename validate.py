@@ -1,120 +1,82 @@
 import argparse
 import torch
 import numpy as np
-import os
-import multiprocessing
 from data import AVLip
 import torch.utils.data
 from models import build_model
 from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve, roc_auc_score
 from tqdm import tqdm
-
-# 定义默认的target_fpr值
-DEFAULT_TARGET_FPR = 0.15
+import os
 
 def validate(model, loader, gpu_id):
-    # 1. 环境与模式设置
     device = torch.device(f"cuda:{gpu_id[0]}" if torch.cuda.is_available() else "cpu")
-    # 检查混合精度支持
-    use_amp = next(model.parameters()).dtype == torch.float16 if len(list(model.parameters())) > 0 else False
-    
-    model.eval()
+    model.eval() # 确保模型处于验证模式
+
     y_true, y_pred = [], []
-
-    # 2. 推理循环 (使用 inference_mode 替代 no_grad，性能更优)
-    with torch.inference_mode():
-        for img, crops, label in tqdm(loader, desc="Validation Progress", leave=True):
-            img_tens = img.to(device, non_blocking=True) # non_blocking 加速数据传输
-            
-            # 处理 crops 传输 (假设 crops 是 list of lists 结构)
-            # 如果 crops 结构能改为 Tensor Stack 形式传输会更快，这里保持兼容性
+    
+    with torch.no_grad():
+        # 使用 tqdm 包装数据加载器
+        for img, crops, label in tqdm(loader, desc="Validation Progress", leave=False):
+            # 优化：non_blocking=True 配合 pin_memory 加速数据传输
+            img_tens = img.to(device, non_blocking=True)
+            # 处理嵌套列表的 tensor 转移
             crops_tens = [[t.to(device, non_blocking=True) for t in sublist] for sublist in crops]
-
-            # 统一推理逻辑
-            # 如果 gpu_id 是 list, device.type 可能是 'cuda'
-            device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
             
-            # 使用 amp.autocast 包装，指定 device_type
-            if use_amp:
-                with torch.amp.autocast(device_type=device_type):
-                    features = model.get_features(img_tens)
-                    output = model(crops_tens, features)[0]
-            else:
-                features = model.get_features(img_tens)
-                output = model(crops_tens, features)[0]
+            features = model.get_features(img_tens).to(device, non_blocking=True)
 
-            # 收集结果 (先转cpu再转list，避免频繁显存交互)
-            y_pred.extend(output.sigmoid().flatten().cpu().tolist())
+            # 获取预测概率
+            pred_score = model(crops_tens, features)[0].sigmoid().flatten()
+            
+            y_pred.extend(pred_score.tolist())
             y_true.extend(label.flatten().tolist())
 
     y_true = np.array(y_true)
     y_pred_prob = np.array(y_pred)
 
-    # 3. 全局指标计算 (提取到循环外，避免重复计算)
-    # 检查是否只有单一类别，防止报错
-    if len(np.unique(y_true)) > 1:
-        global_ap = average_precision_score(y_true, y_pred_prob)
-        global_auc = roc_auc_score(y_true, y_pred_prob)
-    else:
-        global_ap = 0.0
-        global_auc = 0.0
-
-    # 4. 阈值与多点评估
-    fpr_list, tpr_list, thresholds = roc_curve(y_true, y_pred_prob)
-    target_fpr_list = [0.02, 0.05, 0.1, 0.15, 0.2]
-
-    results_by_target = {}
-
-    # 使用 numpy 自带插值简化逻辑 (注意: fpr是递增的，thresholds是递减的，需翻转)
-    # 解决 thresholds[0] 可能为 inf 的情况 (sklearn 特性)
-    thresholds[0] = min(thresholds[0], 1.0) 
+    # --- 核心优化：指标计算 ---
     
-    print("\nValidation summary for multiple target FPRs:")
-    print(f"{'target_fpr':<12} | {'threshold':<10} | {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} | {'FPR':<6} {'FNR':<6} {'ACC':<6} {'AP':<6} {'AUC':<6}")
+    # 1. 安全性检查：防止全0或全1导致报错
+    if len(np.unique(y_true)) < 2:
+        print("Warning: Only one class present in y_true. AUC/AP cannot be calculated correctly.")
+        return 0, 0, 0, 0, 0
 
-    for target_fpr in target_fpr_list:
-        # === 优化算法：快速找到对应 FPR 的阈值 ===
-        # 使用 numpy.interp 进行线性插值。由于 thresholds 随 fpr 增加而减小，我们需要翻转数组来满足 xp 递增的要求
-        optimal_threshold = np.interp(target_fpr, fpr_list, thresholds)
-        
-        # 二值化
-        y_pred_binary_t = (y_pred_prob >= optimal_threshold).astype(int)
+    # 2. 计算 AUC (最高优先级)
+    try:
+        auc = roc_auc_score(y_true, y_pred_prob)
+    except ValueError:
+        auc = 0.0
 
-        # === 优化算法：混淆矩阵 ===
-        # 指定 labels=[0, 1] 可强制输出 2x2 矩阵，即使某类样本缺失也不会报错，替代了原来的 for 循环
-        tn_t, fp_t, fn_t, tp_t = confusion_matrix(y_true, y_pred_binary_t, labels=[0, 1]).ravel()
+    # 3. 计算 AP (次高优先级)
+    ap = average_precision_score(y_true, y_pred_prob)
 
-        # 计算衍生指标
-        fpr_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0.0
-        fnr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0.0
-        acc_t = accuracy_score(y_true, y_pred_binary_t)
+    # 4. 寻找最佳阈值 (Best Accuracy)
+    # 既然 AUC > ACC，说明我们关心分布。默认 0.5 阈值可能不是最优的。
+    # 这里利用 ROC 曲线寻找 Youden's J statistic (TPR - FPR) 最大的点作为最佳阈值
+    fpr_curve, tpr_curve, thresholds = roc_curve(y_true, y_pred_prob)
+    # Youden's J index = TPR - FPR = TPR - (1 - TNR)
+    j_scores = tpr_curve - fpr_curve
+    best_idx = np.argmax(j_scores)
+    best_threshold = thresholds[best_idx]
+    
+    # 使用最佳阈值计算二值化结果
+    y_pred_binary = np.where(y_pred_prob >= best_threshold, 1, 0)
+    
+    # 5. 计算 ACC 及 混淆矩阵
+    acc = accuracy_score(y_true, y_pred_binary)
+    cm = confusion_matrix(y_true, y_pred_binary)
+    
+    # 防止除零错误
+    tn, fp, fn, tp = cm.ravel()
+    fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
 
-        # 存入字典
-        results_by_target[target_fpr] = {
-            'threshold': optimal_threshold,
-            'tn': tn_t, 'fp': fp_t, 'fn': fn_t, 'tp': tp_t,
-            'fpr': fpr_t, 'fnr': fnr_t, 'acc': acc_t,
-            'ap': global_ap, 'auc': global_auc
-        }
+    print(f"Conf Matrix: [TN:{tn} FP:{fp} | FN:{fn} TP:{tp}]")
+    print(f"Best Threshold found: {best_threshold:.4f} (Default is 0.5)")
 
-        print(f"{target_fpr:<12.2f} | {optimal_threshold:.4f}     | {tp_t:<6} {fp_t:<6} {tn_t:<6} {fn_t:<6} | {fpr_t:.3f}  {fnr_t:.3f}  {acc_t:.3f}  {global_ap:.3f}  {global_auc:.3f}")
-
-    # 5. 返回默认 FPR 下的指标 (兼容旧接口)
-    # 寻找最接近 DEFAULT_TARGET_FPR 的 key
-    closest_t = min(results_by_target.keys(), key=lambda x: abs(x - DEFAULT_TARGET_FPR))
-    res = results_by_target[closest_t]
-
-    # 混淆矩阵打印 (使用默认阈值)
-    cm_ravel = [res['tn'], res['fp'], res['fn'], res['tp']]
-    print(f"混淆矩阵展开 (Target FPR ~{closest_t}): {cm_ravel}")
-
-    return res['ap'], res['fpr'], res['fnr'], res['acc'], res['auc']
+    return ap, fpr, fnr, acc, auc
 
 
 if __name__ == "__main__":
-    # 开启 cuDNN benchmark 可以在输入尺寸固定时加速
-    torch.backends.cudnn.benchmark = True
-
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--real_list_path", type=str, default=r"E:\data\val2\0_real")
     parser.add_argument("--fake_list_path", type=str, default=r"E:\data\val2\1_fake")
@@ -124,7 +86,7 @@ if __name__ == "__main__":
     parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14")
     parser.add_argument("--ckpt", type=str, default=r"E:\data\ckpt.pth")
     parser.add_argument("--gpu", type=int, default=0)
-    # 添加 num_workers 参数，允许用户配置
+    # 增加 worker 参数，加速数据加载
     parser.add_argument("--workers", type=int, default=4, help="number of data loading workers")
 
     opt = parser.parse_args()
@@ -134,35 +96,47 @@ if __name__ == "__main__":
 
     model = build_model(opt.arch)
     
+    # 加载权重
     if os.path.exists(opt.ckpt):
         state_dict = torch.load(opt.ckpt, map_location="cpu")
-        # 保持 strict=False 以适应微调或部分加载
-        model.load_state_dict(state_dict["model"], strict=False)
+        # 处理可能存在的 'model' 键
+        if "model" in state_dict:
+            state_dict = state_dict["model"]
+        
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         print(f"Model loaded from {opt.ckpt}")
+        if missing_keys:
+            print(f"Missing keys (partial load): {len(missing_keys)}")
     else:
-        print(f"Warning: Checkpoint not found at {opt.ckpt}")
+        print(f"Warning: Checkpoint {opt.ckpt} not found!")
 
+    # 打印参数量
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型总参数量: {total_params:,}")
-    print("\n")
-
+    print(f"Model Params: {total_params / 1e6:.2f}M")
+    print("\n" + "="*30)
+    
+    model.eval()
     model.to(device)
 
     dataset = AVLip(opt)
     
-    # 优化 DataLoader
-    # 1. shuffle=False: 验证集不需要打乱，减少开销
-    # 2. num_workers: 使用多进程加载数据 (通常设为 CPU 核心数或 4-8)
-    # 3. pin_memory: 加速 CPU 到 GPU 的传输
-    num_workers = min(opt.workers, multiprocessing.cpu_count())
+    # 优化 DataLoader: shuffle=False (验证集通常不需要打乱), num_workers加速, pin_memory加速
     loader = torch.utils.data.DataLoader(
         dataset, 
         batch_size=opt.batch_size, 
         shuffle=False, 
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0) # 保持 worker 进程存活，减少重建开销
+        num_workers=opt.workers,
+        pin_memory=True 
     )
-
+    
     ap, fpr, fnr, acc, auc = validate(model, loader, gpu_id=[opt.gpu])
-    print(f"\n(Final Result @ FPR {DEFAULT_TARGET_FPR}) acc: {acc:.4f} | ap: {ap:.4f} | fpr: {fpr:.3f} | fnr: {fnr:.3f} | auc: {auc:.4f}")
+    
+    # 优化输出格式：强调 AUC > AP > ACC
+    print("="*30)
+    print(f"AUC : {auc:.4f}")
+    print(f"AP  : {ap:.4f}")
+    print(f"ACC : {acc:.4f}")
+    print(f"----------------")
+    print(f"FPR : {fpr:.4f}")
+    print(f"FNR : {fnr:.4f}")
+    print("="*30)

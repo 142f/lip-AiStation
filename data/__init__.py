@@ -48,7 +48,7 @@ def create_dataloader(opt, distributed=False):
         optimal_workers = min(
             max(cpu_count // batch_size_factor, 2),
             cpu_count,  # 不超过逻辑CPU核心数
-            16  # 设置上限防止过多进程
+            4  # 设置上限防止过多进程
         )
         num_workers = optimal_workers
         print(f"[数据加载优化] 自动设置 num_workers={num_workers} (逻辑CPU核心数: {cpu_count}, batch_size: {opt.batch_size})")
