@@ -20,10 +20,10 @@ class BaseOptions:
         # ===================================================================
         # 2. 模型与训练策略参数 (Model and Training Strategy Arguments)
         # ===================================================================
-        parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14", help="Model architecture. See models/__init__.py for options.")
+        parser.add_argument("--arch", type=str, default="DFN:ViT-L/14", help="Model architecture. See models/__init__.py for options.")
         parser.add_argument("--batch_size", type=int, default=10, help="Input batch size for training.")
         parser.add_argument("--fix_backbone", action="store_true", help="If specified, freezes the backbone weights during training.")
-        parser.add_argument("--fix_encoder", action="store_true", default=True, help="If specified, freezes the encoder weights during training.")
+        parser.add_argument("--fix_encoder", action="store_true",help="If specified, freezes the encoder weights during training.")
         parser.add_argument("--serial_batches", action="store_true", help="If true, takes images in order to make batches, otherwise takes them randomly.")
         
         # ===================================================================
@@ -87,7 +87,7 @@ class BaseOptions:
             opt_file.write(message)
             opt_file.write("\n")
 
-    def parse(self, print_options=True):
+    def parse(self, print_options=False):
         opt = self.gather_options()
         opt.isTrain = self.isTrain  # train or test
 
