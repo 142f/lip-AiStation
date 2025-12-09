@@ -99,7 +99,7 @@ class Trainer(nn.Module):
     def set_input(self, input):
         self.input = input[0].to(self.device)
         self.crops = [[t.to(self.device) for t in sublist] for sublist in input[1]]
-        self.label = input[2].to(self.device).float()
+        self.label = input[2].to(self.device).long()
 
     def forward(self):
         # 使用自动混合精度上下文管理器包装前向传播
@@ -114,12 +114,12 @@ class Trainer(nn.Module):
         self.output, self.weights_max, self.weights_org = self.model.forward(
             self.crops, self.features
         )
-        self.output = self.output.view(-1)
+        # self.output = self.output.view(-1)
         # 分别保存两个损失值
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
         # 根据项目规范，CE损失项应乘以0.5的权重系数
-        self.loss = self.loss_ral + 0.5 * self.loss_ce
+        self.loss = 0.1 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()

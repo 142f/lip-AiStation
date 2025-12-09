@@ -312,7 +312,7 @@ class ResNet(nn.Module):
             nn.Linear(feat_dim, 1),
             nn.Sigmoid()
         )
-        self.fc = nn.Linear(feat_dim, 1)
+        self.fc = nn.Linear(feat_dim, num_classes)
 
         # ---------------------------
         # 修改 3: 更新位置编码和 SE 模块的维度
@@ -499,10 +499,10 @@ def _get_backbone(
         progress: bool,
         **kwargs: Any
 ) -> ResNet:
-    model = ResNet(block, layers, num_classes=1, **kwargs)
+    model = ResNet(block, layers, num_classes=2, **kwargs)
     if pretrained:
         state_dict = load_state_dict_from_url(model_urls[arch], progress=progress)
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
     return model
 
 
