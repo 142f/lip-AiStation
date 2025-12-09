@@ -7,6 +7,7 @@ from validate import validate
 from data import create_dataloader
 from trainer.trainer import Trainer
 from options.train_options import TrainOptions
+from utils import set_seed
 
 
 # 添加日志类，用于同时输出到控制台和文件
@@ -59,6 +60,7 @@ def format_options(opt, parser):
 if __name__ == "__main__":
     train_options = TrainOptions()
     opt = train_options.parse(print_options=False)  # 禁用自动打印选项
+    set_seed(opt.seed)
     val_opt = get_val_opt(opt) # [修改] 传入 opt
     model = Trainer(opt)
 

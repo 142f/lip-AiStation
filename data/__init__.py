@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import random
 import os
 from torch.utils.data.sampler import WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -18,6 +19,12 @@ def get_bal_sampler(dataset):
         weights=sample_weights, num_samples=len(sample_weights)
     )
     return sampler
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def create_dataloader(opt, distributed=False):
@@ -58,6 +65,12 @@ def create_dataloader(opt, distributed=False):
     
     # 根据num_workers动态调整prefetch_factor
     prefetch_factor = 2 if num_workers > 0 else None
+
+    generator = torch.Generator()
+    if hasattr(opt, 'seed'):
+        generator.manual_seed(opt.seed)
+    else:
+        generator.manual_seed(0)
     
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -68,5 +81,7 @@ def create_dataloader(opt, distributed=False):
         pin_memory=use_pin_memory,       # 固定内存加速 GPU 传输
         prefetch_factor=prefetch_factor, # 预加载因子，加快数据加载
         persistent_workers=(num_workers > 0),  # 保持worker进程存活
+        worker_init_fn=seed_worker,
+        generator=generator,
     )
     return data_loader
