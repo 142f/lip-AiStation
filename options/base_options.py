@@ -20,7 +20,7 @@ class BaseOptions:
         # ===================================================================
         # 2. 模型与训练策略参数 (Model and Training Strategy Arguments)
         # ===================================================================
-        parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14", help="Model architecture. See models/__init__.py for options.")
+        parser.add_argument("--arch", type=str, default="DFN:ViT-L/14", help="Model architecture. See models/__init__.py for options.")
         parser.add_argument("--batch_size", type=int, default=10, help="Input batch size for training.")
         parser.add_argument("--fix_backbone", action="store_true", help="If specified, freezes the backbone weights during training.")
         parser.add_argument("--fix_encoder", action="store_true",help="If specified, freezes the encoder weights during training.")
