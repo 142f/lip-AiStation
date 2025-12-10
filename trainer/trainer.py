@@ -143,7 +143,7 @@ class Trainer(nn.Module):
         
         # 2. 梯度清零 (只在累积周期的开始做)
         if self.accumulation_count == 0:
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             
         # 3. 反向传播 (Backward)
         # Loss 需要除以累积步数
@@ -179,7 +179,7 @@ class Trainer(nn.Module):
             
             # 重置累积计数
             self.accumulation_count = 0
-            self.optimizer.zero_grad() # 确保梯度被清空
+            self.optimizer.zero_grad(set_to_none=True) # 确保梯度被清空
             self.update_steps += 1  # 记录实际更新次数
             
             # 更新学习率调度器
