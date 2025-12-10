@@ -65,17 +65,75 @@ class SimpleTokenizer(object):
         self.byte_encoder = bytes_to_unicode()
         self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
 
-        # --- 代码修改开始 ---
-        # 1. 定义正确的、非压缩文件的路径
-        correct_bpe_path = '/3240608030/bpe_simple_vocab_16e6.txt'
+        # ==================================================================
+        # [核心修改] 智能加载策略：自动适配路径 + 自动识别压缩格式
+        # ==================================================================
+        import os
+        import gzip
 
-        # 2. 使用标准的 open() 函数读取普通文本文件
-        try:
-            with open(correct_bpe_path, "r", encoding="utf-8") as f:
-                merges = f.read().split('\n')
-        except FileNotFoundError:
-            raise FileNotFoundError(f"BPE vocab file not found at the specified path: {correct_bpe_path}")
-        # --- 代码修改结束 ---
+        # 1. 获取当前脚本所在的目录 (models/clip/)，用于构建相对路径
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 2. 定义所有可能的“藏宝地点”和“文件形态”
+        # 程序会按顺序挨个去找，找到哪个用哪个
+        candidate_paths = [
+            # 优先级 A: 你传入的参数路径 (如果外部指定了)
+            bpe_path,
+            
+            # 优先级 B: Kaggle 环境 / 本地相对路径 (最推荐，纯文本版)
+            # 假设文件在 models/clip/bpe_simple_vocab_16e6.txt
+            os.path.join(current_dir, "bpe_simple_vocab_16e6.txt"),
+            
+            # 优先级 C: Kaggle 环境 / 本地相对路径 (压缩版)
+            # 假设文件在 models/clip/bpe_simple_vocab_16e6.txt.gz
+            os.path.join(current_dir, "bpe_simple_vocab_16e6.txt.gz"),
+
+            # 优先级 D: 服务器 1 的绝对路径 (压缩版)
+            '/3240608030/bpe_simple_vocab_16e6.txt.gz',
+            
+            # 优先级 E: 服务器 1 的绝对路径 (纯文本版，防备万一)
+            '/3240608030/bpe_simple_vocab_16e6.txt',
+            
+            # 优先级 F: Kaggle 特定的硬编码绝对路径
+            "/kaggle/working/LipFD-main/LipFD-main-base/models/clip/bpe_simple_vocab_16e6.txt"
+        ]
+
+        merges = None
+        loaded_path = None
+
+        # 3. 循环尝试每一个路径
+        for path in candidate_paths:
+            # 只有当路径不为空且文件确实存在时，才尝试读取
+            if path and os.path.exists(path):
+                try:
+                    # [关键逻辑] 根据后缀名决定怎么读
+                    if path.endswith(".gz"):
+                        # 针对服务器 1 的 .gz 文件：使用 gzip 打开，'rt'表示文本模式读取
+                        print(f"[SimpleTokenizer] Found .gz file at {path}, unzipping...")
+                        with gzip.open(path, 'rt', encoding='utf-8') as f:
+                            merges = f.read().split('\n')
+                    else:
+                        # 针对 Kaggle 的 .txt 文件：使用普通 open 打开
+                        print(f"[SimpleTokenizer] Found text file at {path}, reading...")
+                        with open(path, "r", encoding="utf-8") as f:
+                            merges = f.read().split('\n')
+                    
+                    loaded_path = path
+                    break # 成功读取，跳出循环
+                except Exception as e:
+                    print(f"[Warning] Found file at {path} but failed to read: {e}")
+                    continue
+
+        # 4. 如果找遍了所有地方都没找到，抛出致命错误
+        if merges is None:
+            error_msg = "\n[Error] Critical: BPE vocab file not found!\nChecked the following paths:\n"
+            error_msg += "\n".join([str(p) for p in candidate_paths])
+            error_msg += "\nPlease ensure 'bpe_simple_vocab_16e6.txt' (or .gz) is inside 'models/clip/' directory."
+            raise FileNotFoundError(error_msg)
+
+        # ==================================================================
+        # [修改结束] 下面是原始的数据处理逻辑，保持不变
+        # ==================================================================
 
         merges = merges[1:49152-256-2+1]
         merges = [tuple(merge.split()) for merge in merges]
