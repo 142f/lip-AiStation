@@ -42,20 +42,17 @@ class LipFD(nn.Module):
 
 
 class RALoss(nn.Module):
-    def __init__(self):
+    def __init__(self, margin=0.15): # 设定及格线 0.15
         super(RALoss, self).__init__()
+        self.margin = margin
+        self.relu = nn.ReLU() # 核心：使用 ReLU 实现自动截断
 
     def forward(self, alphas_max, alphas_org):
-        total_loss = 0.0
-        for i in range(len(alphas_org)):
-            # 正确的张量运算方式
-            diff = alphas_max[i] - alphas_org[i]  # shape: (batch_size, 1)
-            # 添加数值稳定性保护
-            diff = torch.clamp(diff, min=0.0, max=100.0)
-            # 对整个batch进行向量化计算
-            loss_wt = 10 / torch.exp(diff)  # shape: (batch_size, 1)
-            # 对batch取平均
-            total_loss += loss_wt.mean()
-
-        # 对所有区域组取平均
-        return total_loss / len(alphas_org)
+        # 逻辑：希望 Max 至少比 Org 大 margin
+        # 如果达标：(Org + 0.15) - Max < 0 -> ReLU后为 0 -> 梯度为 0
+        diff = (alphas_org + self.margin) - alphas_max
+        
+        # 计算 Loss，不建议再乘 10 了，保持数值纯粹
+        loss = self.relu(diff).mean()
+        
+        return loss

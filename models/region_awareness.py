@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 from typing import Type, Any, Callable, Union, List, Optional
+from torch.nn.functional import softmax
 
 try:
     from torch.hub import load_state_dict_from_url
@@ -14,6 +15,10 @@ model_urls = {
     'resnet50': 'https://download.pytorch.org/models/resnet50-0676ba61.pth',
     'resnet101': 'https://download.pytorch.org/models/resnet101-63fe2227.pth',
     'resnet152': 'https://download.pytorch.org/models/resnet152-394f9c45.pth',
+    'resnext50_32x4d': 'https://download.pytorch.org/models/resnext50_32x4d-7cdf4587.pth',
+    'resnext101_32x8d': 'https://download.pytorch.org/models/resnext101_32x8d-8ba56ff5.pth',
+    'wideget_backbone50_2': 'https://download.pytorch.org/models/wideget_backbone50_2-95faca4d.pth',
+    'wideget_backbone101_2': 'https://download.pytorch.org/models/wideget_backbone101_2-32ee1156.pth',
 }
 
 
@@ -49,6 +54,7 @@ class BasicBlock(nn.Module):
             raise ValueError('BasicBlock only supports groups=1 and base_width=64')
         if dilation > 1:
             raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = norm_layer(planes)
         self.relu = nn.ReLU(inplace=True)
@@ -59,15 +65,20 @@ class BasicBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         identity = x
+
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
+
         out = self.conv2(out)
         out = self.bn2(out)
+
         if self.downsample is not None:
             identity = self.downsample(x)
+
         out += identity
         out = self.relu(out)
+
         return out
 
 
@@ -89,6 +100,7 @@ class Bottleneck(nn.Module):
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
+        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
@@ -101,28 +113,38 @@ class Bottleneck(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         identity = x
+
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
+
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
+
         out = self.conv3(out)
         out = self.bn3(out)
+
         if self.downsample is not None:
             identity = self.downsample(x)
+
         out += identity
         out = self.relu(out)
+
         return out
 
 
 # ---------------------------
-# SELayerVec: 针对展平特征的通道注意力
+# 新增：针对展平特征的通道注意力（向量版 SE）
+# 说明：
+#  - 原始 SE 是对 4D feature map 做全局池化再两个 FC；这里我们对 (N, C) 向量做同样思想的通道重标定，
+#    便于在不修改 backbone 的情况下把 SE 思想加到 feat_cat（拼接后向量）上。
 # ---------------------------
 class SELayerVec(nn.Module):
     def __init__(self, channel: int, reduction: int = 16):
         super(SELayerVec, self).__init__()
         hidden = max(1, channel // reduction)
+        # 中文注释：通道压缩 -> ReLU -> 通道恢复 -> Sigmoid，输出每个通道的缩放系数（每个样本独立）
         self.fc = nn.Sequential(
             nn.Linear(channel, hidden, bias=False),
             nn.ReLU(inplace=True),
@@ -131,127 +153,10 @@ class SELayerVec(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        scale = self.fc(x)
+        # x: (N, C)
+        # 输出与 x 相同形状，按通道放缩
+        scale = self.fc(x)  # (N, C)
         return x * scale
-
-
-# ---------------------------
-# [修改] 模块: DWT 标准小波变换
-# ---------------------------
-class DWT(nn.Module):
-    """
-    基于卷积实现的离散小波变换 (Discrete Wavelet Transform)
-    使用 Haar 小波核，将输入 (B, 3, H, W) 转换为 (B, 12, H/2, W/2)
-    """
-    def __init__(self):
-        super(DWT, self).__init__()
-        self.requires_grad = False  # 小波变换本身不需要训练
-        self.colors = 3             # RGB通道
-
-        # Haar 小波滤波器定义
-        ll = torch.tensor([[0.5, 0.5], [0.5, 0.5]]).float()
-        lh = torch.tensor([[-0.5, -0.5], [0.5, 0.5]]).float()
-        hl = torch.tensor([[-0.5, 0.5], [-0.5, 0.5]]).float()
-        hh = torch.tensor([[0.5, -0.5], [-0.5, 0.5]]).float()
-
-        # 组合成 (4, 1, 2, 2)
-        filters = torch.cat([
-            ll.unsqueeze(0), 
-            lh.unsqueeze(0), 
-            hl.unsqueeze(0), 
-            hh.unsqueeze(0)
-        ], dim=0).unsqueeze(1)
-
-        # 扩展到 3个通道: (12, 1, 2, 2)
-        # 这种写法是 depthwise convolution 的形式，每个通道独立计算
-        filters = filters.repeat(self.colors, 1, 1, 1)
-
-        self.register_buffer('filters', filters)
-
-    def forward(self, x):
-        # x: (B, 3, H, W)
-        b, c, h, w = x.shape
-        # padding 保证尺寸匹配 (如果输入可能是奇数尺寸)
-        if h % 2 != 0 or w % 2 != 0:
-            x = nn.functional.pad(x, (0, 1, 0, 1), mode='reflect')
-
-        # 使用 group convolution 进行通道独立变换
-        # 输出: (B, 12, H/2, W/2)
-        out = nn.functional.conv2d(x, self.filters, stride=2, groups=c)
-        return out
-
-
-# ---------------------------
-# [修改] 模块: 改进版小波特征提取器
-# ---------------------------
-class WaveletExtractor(nn.Module):
-    def __init__(self, out_dim=256):
-        super(WaveletExtractor, self).__init__()
-        
-        self.dwt = DWT()
-        
-        # 输入维度: 3 colors * 4 bands (LL, LH, HL, HH) = 12
-        in_channels = 12
-        
-        # 特征提取网络: Stem -> ResBlock -> ResBlock
-        self.conv_stem = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.layer1 = self._make_basic_block(64, 128)
-        self.layer2 = self._make_basic_block(128, 256)
-        
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # 最终投影
-        self.fc = nn.Linear(256, out_dim)
-        
-        # 初始化权重
-        self.apply(self._init_weights)
-        
-        # [关键] 零初始化最后一层，保证初始阶段不影响主干梯度
-        nn.init.constant_(self.fc.weight, 0)
-        nn.init.constant_(self.fc.bias, 0)
-
-    def _make_basic_block(self, in_planes, out_planes):
-        """创建一个带下采样的基础卷积块"""
-        return nn.Sequential(
-            nn.Conv2d(in_planes, out_planes, 3, stride=2, padding=1, bias=False), # Downsample
-            nn.BatchNorm2d(out_planes),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_planes, out_planes, 3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_planes),
-            nn.ReLU(inplace=True),
-        )
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        # 1. DWT 变换 -> (B, 12, H/2, W/2)
-        freq_map = self.dwt(x)
-        
-        # 2. [关键] Log 对数变换
-        # 频域幅值差异很大，取 log 类似于同态滤波，有助于 CNN 学习
-        freq_map = torch.log(torch.abs(freq_map) + 1e-6)
-        
-        # 3. 特征提取
-        x = self.conv_stem(freq_map)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        
-        # 4. 聚合输出
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        
-        return x
 
 
 class ResNet(nn.Module):
@@ -275,6 +180,8 @@ class ResNet(nn.Module):
         self.inplanes = 64
         self.dilation = 1
         if replace_stride_with_dilation is None:
+            # each element in the tuple indicates if we should replace
+            # the 2x2 stride with a dilated convolution instead
             replace_stride_with_dilation = [False, False, False]
         if len(replace_stride_with_dilation) != 3:
             raise ValueError("replace_stride_with_dilation should be None "
@@ -294,37 +201,28 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
                                        dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # ---------------------------
-        # 修改 1: 初始化小波提取模块 (替换了原 FrequencyExtractor)
-        # ---------------------------
-        self.freq_dim = 256  # 设定频域特征维度
-        self.freq_extractor = WaveletExtractor(out_dim=self.freq_dim)
-
-        # ---------------------------
-        # 修改 2: 重新计算总特征维度
-        # feat_dim = RGB局部特征 + CLIP全局特征 + 频域特征
-        # ---------------------------
-        feat_dim = 512 * block.expansion + 768 + self.freq_dim
-
-        ## 融合层
+        ## 融合了局部细节特征与全局语义特征
         self.get_weight = nn.Sequential(
-            nn.Linear(feat_dim, 1),
+            nn.Linear(512 * block.expansion + 768, 1),  # TODO: 768 is the length of global feature
             nn.Sigmoid()
         )
-        self.fc = nn.Linear(feat_dim, num_classes)
+        self.fc = nn.Linear(512 * block.expansion + 768, num_classes)
 
         # ---------------------------
-        # 修改 3: 更新位置编码和 SE 模块的维度
+        # 新增：位置编码与 SE 向量模块的初始化
+        # 说明：
+        #  - 默认假设 num_scales = 3, num_regions = 5（与数据预处理一致）
+        #  - positional_encoding 的维度与 feat_cat 的维度一致（512*expansion + 768）
+        #  - se_layer 在 feat_flat 上做通道重标定
         # ---------------------------
         self.num_scales = 3
         self.num_regions = 5
-        
-        # 可学习的位置编码
+        feat_dim = 512 * block.expansion + 768
+        # 可学习的位置编码，形状为 (S*R, feat_dim)
         self.positional_encoding = nn.Parameter(
             torch.randn(self.num_scales * self.num_regions, feat_dim)
         )
-        # 向量版 SE，处理融合后的三模态特征
+        # 向量版 SE
         self.se_layer = SELayerVec(feat_dim, reduction=16)
 
         for m in self.modules():
@@ -334,6 +232,9 @@ class ResNet(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
+        # Zero-initialize the last BN in each residual branch,
+        # so that the residual branch starts with zeros, and each residual block behaves like an identity.
+        # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
         if zero_init_residual:
             for m in self.modules():
                 if isinstance(m, Bottleneck):
@@ -365,26 +266,40 @@ class ResNet(nn.Module):
                                 norm_layer=norm_layer))
 
         return nn.Sequential(*layers)
-
     def _forward_impl(self, x, feature, chunk_size: int = 65536):
         """
-        前向传播逻辑
+        高效版前向传播（可直接替换原 _forward_impl）：
+          - 一次性批量处理所有尺度与区域，充分利用 GPU 并行；
+          - 通过 expand 减少全局特征重复内存；
+          - 支持分块计算 get_weight，防止显存溢出；
+          - 返回值与原函数保持一致 (pred_score, weights_max, weights_org)。
+
+        参数:
+            x: List[List[Tensor]]，形状为 [num_scales][num_regions][B, 3, H, W]
+            feature: Tensor，全局特征 (B, feat_g)
+            chunk_size: int，可选参数，用于限制一次 get_weight 处理的样本数量，防止 OOM。
+
+        返回:
+            pred_score: Tensor，分类得分 (B, num_classes)
+            weights_max: Tensor，每个区域在所有尺度下的最大权重
+            weights_org: Tensor，每个区域在第一个尺度下的权重
         """
+
         # ---------------------------
         # 基础维度信息
         # ---------------------------
-        num_scales = len(x)
-        num_regions = len(x[0])
-        batch_size = x[0][0].shape[0]
+        num_scales = len(x)           # 尺度数量
+        num_regions = len(x[0])       # 每尺度区域数
+        batch_size = x[0][0].shape[0] # 每批样本数
 
         # ---------------------------
         # Step 1: 拼接所有区域为一个大批次
         # ---------------------------
         all_images = [x[s][r] for s in range(num_scales) for r in range(num_regions)]
-        all_images = torch.cat(all_images, dim=0)  # (S*R*B, 3, H, W)
+        all_images = torch.cat(all_images, dim=0)  # (num_scales*num_regions*B, 3, H, W)
 
         # ---------------------------
-        # Step 2: 提取 RGB 局部特征 (ResNet)
+        # Step 2: 一次性通过 backbone 提取局部特征
         # ---------------------------
         f = self.conv1(all_images)
         f = self.bn1(f)
@@ -395,96 +310,93 @@ class ResNet(nn.Module):
         f = self.layer3(f)
         f = self.layer4(f)
         f = self.avgpool(f)
-        f = torch.flatten(f, 1)  # (S*R*B, feat_local_rgb)
-
-        # Reshape 回结构
-        f = f.view(num_scales, num_regions, batch_size, -1)  # (S, R, B, feat_rgb)
+        f = torch.flatten(f, 1)  # (num_scales*num_regions*B, feat_local)
 
         # ---------------------------
-        # Step 2.5: 提取 频域/小波 局部特征 - [修改]
+        # Step 3: reshape 回原结构，方便后续处理
         # ---------------------------
-        # 使用新的 WaveletExtractor
-        f_freq_flat = self.freq_extractor(all_images) # (S*R*B, freq_dim)
-        
-        # Reshape 回结构
-        f_freq = f_freq_flat.view(num_scales, num_regions, batch_size, -1) # (S, R, B, freq_dim)
+        f = f.view(num_scales, num_regions, batch_size, -1)  # (S, R, B, feat_local)
 
         # ---------------------------
-        # Step 3: 准备 CLIP 全局特征
+        # Step 4: 拼接全局特征（使用 expand 减少显存复制）
         # ---------------------------
-        # 广播 CLIP 特征以匹配局部特征的结构
         feat_g = feature.unsqueeze(0).unsqueeze(0).expand(num_scales, num_regions, batch_size, feature.shape[1])
+        feat_cat = torch.cat([f, feat_g], dim=3)  # (S, R, B, feat_cat)
 
         # ---------------------------
-        # Step 4: 多模态特征融合 (RGB + CLIP + Wavelet)
+        # 新增：Step 4.5 — 添加位置编码（可学习）
+        # 中文注释：为每个尺度-区域位置添加可学习的偏置，增强位置信息感知
         # ---------------------------
-        # 拼接策略：将三种特征在通道维度拼接
-        # feat_cat shape: (S, R, B, rgb_dim + clip_dim + freq_dim)
-        feat_cat = torch.cat([f, feat_g, f_freq], dim=3)
-
-        # ---------------------------
-        # Step 4.5: 添加位置编码
-        # ---------------------------
+        # positional_encoding 存储为 (S*R, feat_dim)，需要 reshape 并 broadcast 到 (S, R, B, feat_dim)
         feat_dim = feat_cat.shape[-1]
-        pos_enc = self.positional_encoding[:num_scales * num_regions]
+        # 注意：如果实际训练时 num_scales 或 num_regions 与初始化不一致，需要调整 self.positional_encoding 的 shape
+        pos_enc = self.positional_encoding[:num_scales * num_regions]  # (S*R, feat_dim)
         pos_enc = pos_enc.view(num_scales, num_regions, 1, feat_dim).expand(-1, -1, batch_size, -1)
-        feat_cat = feat_cat + pos_enc
+        feat_cat = feat_cat + pos_enc  # (S, R, B, feat_dim)
 
         # ---------------------------
-        # Step 4.6: 使用 SE 模块进行融合权重分配
+        # 新增：Step 4.6 — 使用向量版 SE 对展平后的通道进行重标定
+        # 中文注释：先将 (S,R,B,C) 展平为 (N, C)，对每个样本的通道做自适应缩放，再恢复形状
         # ---------------------------
-        # SE 模块根据内容自适应调整 RGB、CLIP 和 Freq 三部分的权重
-        feat_cat_flat = feat_cat.contiguous().view(-1, feat_dim)
-        feat_cat_flat = self.se_layer(feat_cat_flat)  # 通道注意力重标定
+        feat_cat_flat = feat_cat.contiguous().view(-1, feat_dim)  # (S*R*B, feat_dim)
+        feat_cat_flat = self.se_layer(feat_cat_flat)              # (S*R*B, feat_dim)
         feat_cat = feat_cat_flat.view(num_scales, num_regions, batch_size, feat_dim)
 
         # ---------------------------
-        # Step 5: 批量计算区域权重
+        # Step 5: 批量计算权重（支持分块防止显存溢出）
         # ---------------------------
-        feat_cat_flat = feat_cat.contiguous().view(-1, feat_cat.shape[-1])
+        feat_cat_flat = feat_cat.contiguous().view(-1, feat_cat.shape[-1])  # (S*R*B, feat_cat)
         weights_list = []
         if chunk_size and feat_cat_flat.shape[0] > chunk_size:
+            # 分块计算
             for chunk in torch.split(feat_cat_flat, chunk_size, dim=0):
                 w_chunk = self.get_weight(chunk)
                 weights_list.append(w_chunk)
             weights_all = torch.cat(weights_list, dim=0)
         else:
+            # 一次性计算
             weights_all = self.get_weight(feat_cat_flat)
 
         # ---------------------------
-        # Step 6: 恢复权重结构
+        # Step 6: reshape 权重回原结构
         # ---------------------------
-        weights = weights_all.view(num_scales, num_regions, batch_size, -1)
-        weights_scalar = weights.squeeze(-1)
+        weights = weights_all.view(num_scales, num_regions, batch_size, -1)  # (S, R, B, weight_dim)
+        # 假设 get_weight 输出 (N,1)，则压缩最后一维
+        weights_scalar = weights.squeeze(-1)  # (S, R, B)
 
         # ---------------------------
-        # Step 7: 尺度注意力 Softmax
+        # Step 7: 对每个区域在尺度维做 softmax（用于尺度注意力）
         # ---------------------------
-        weights_soft = torch.softmax(weights_scalar, dim=0)
+        weights_soft = torch.softmax(weights_scalar, dim=0)  # 在尺度维 S 上归一化
 
         # ---------------------------
-        # Step 8: 加权融合
+        # Step 8: 加权融合局部与全局特征
         # ---------------------------
-        fused_parts = (feat_cat * weights_soft.unsqueeze(-1)).sum(dim=0)
-        weights_sum = weights_soft.sum(dim=0) + 1e-8
-        fused_parts = fused_parts / weights_sum.unsqueeze(-1)
+        # 广播相乘并在尺度维求和
+        fused_parts = (feat_cat * weights_soft.unsqueeze(-1)).sum(dim=0)  # (R, B, C)
+        # 防止数值问题，可再除以权重和
+        weights_sum = weights_soft.sum(dim=0) + 1e-8  # (R, B)
+        fused_parts = fused_parts / weights_sum.unsqueeze(-1)  # (R, B, C)
 
         # ---------------------------
-        # Step 9: 区域聚合
+        # Step 9: 区域聚合（平均所有区域特征）
         # ---------------------------
-        out = fused_parts.sum(dim=0).div(fused_parts.shape[0])
+        out = fused_parts.sum(dim=0).div(fused_parts.shape[0])  # (B, C)
 
         # ---------------------------
-        # Step 10: 分类
+        # Step 10: 分类层
         # ---------------------------
-        pred_score = self.fc(out)
+        pred_score = self.fc(out)  # (B, num_classes)
 
         # ---------------------------
-        # Step 11: 辅助输出
+        # Step 11: 计算附加权重输出（保持接口一致）
         # ---------------------------
-        weights_max = weights_soft.max(dim=0)[0]
-        weights_org = weights_soft[0]
+        weights_max = weights_soft.max(dim=0)[0]  # (R, B)，每区域在不同尺度下的最大权重
+        weights_org = weights_soft[0]             # (R, B)，第一个尺度的权重
 
+        # ---------------------------
+        # Step 12: 返回三元组（保持兼容）
+        # ---------------------------
         return pred_score, weights_max, weights_org
 
     def forward(self, x, feature):
@@ -509,20 +421,22 @@ def _get_backbone(
 def get_backbone(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
     r"""ResNet-50 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+        progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _get_backbone('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress, **kwargs)
+    # 使用 GroupNorm 替代 BatchNorm，解决小 Batch Size 问题
+    norm_layer = lambda channels: nn.GroupNorm(32, channels)
+    return _get_backbone('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress, norm_layer=norm_layer, **kwargs)
 
 
 if __name__ == '__main__':
-    # 简单的测试代码，确保维度正确
     model = get_backbone()
-    # 模拟输入: 3个尺度，每个尺度5个区域
     data = [[] for i in range(3)]
     for i in range(3):
         for j in range(5):
-            data[i].append(torch.rand((2, 3, 224, 224))) # batch=2
-    feature = torch.rand((2, 768)) # CLIP feature
-    
+            data[i].append(torch.rand((10, 3, 224, 224)))
+    feature = torch.rand((10, 768))
     pred_score, weights_max, weights_org = model(data, feature)
-    print("Output shape:", pred_score.shape)
-    print("Freq Dim included in pipeline check:", model.freq_dim)
+    pass

@@ -114,12 +114,17 @@ class Trainer(nn.Module):
         self.output, self.weights_max, self.weights_org = self.model.forward(
             self.crops, self.features
         )
-        # self.output = self.output.view(-1)
-        # 分别保存两个损失值
+        
+        # 2. 计算辅助损失 (Aux Path)
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
+        
+        # 3. 计算主损失 (Main Path)
+        # 确保 label 是 long 类型
         self.loss_ce = self.criterion1(self.output, self.label)
-        # 根据项目规范，CE损失项应乘以0.5的权重系数
-        self.loss = 0.1 * self.loss_ral + 1.0 * self.loss_ce
+
+        # 4. 总损失公式 (静态权重配置)
+        # CE 占主导(1.0)，RAL 仅在未达标时以微弱力量(0.01)介入修正
+        self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()
