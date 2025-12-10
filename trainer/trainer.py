@@ -103,10 +103,8 @@ class Trainer(nn.Module):
 
     def forward(self):
         # 使用自动混合精度上下文管理器包装前向传播
-        if self.use_amp:
-            with torch.amp.autocast('cuda'):
-                self._forward_impl()
-        else:
+        # 推荐写法，兼容性最好
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
             self._forward_impl()
 
     def _forward_impl(self):
@@ -114,6 +112,12 @@ class Trainer(nn.Module):
         self.output, self.weights_max, self.weights_org = self.model.forward(
             self.crops, self.features
         )
+        
+        # [新增优化] AMP 稳定性关键：强制转为 float32
+        if self.use_amp:
+            self.output = self.output.float()
+            self.weights_max = self.weights_max.float()
+            self.weights_org = self.weights_org.float()
         
         # 2. 计算辅助损失 (Aux Path)
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
@@ -217,3 +221,24 @@ class Trainer(nn.Module):
             state_dict["scaler"] = self.scaler.state_dict()
 
         torch.save(state_dict, save_path)
+
+    def step_remainder_gradients(self):
+        """处理 Epoch 结束时未满足累积步数的剩余梯度"""
+        if self.accumulation_count > 0:
+            if self.use_amp:
+                # 1. Unscale
+                self.scaler.unscale_(self.optimizer)
+                # 2. Clip (保持和 optimize_parameters 一致)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # 3. Step
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            
+            # 清理状态
+            self.optimizer.zero_grad(set_to_none=True)
+            self.accumulation_count = 0
+            self.update_steps += 1
+            print(f"Debug: Updates remaining gradients at step {self.update_steps}")

@@ -177,27 +177,11 @@ if __name__ == "__main__":
         # [重要修正] Epoch 结束时的剩余梯度处理
         # 必须先 Unscale, 再 Clip, 最后 Step，防止梯度爆炸导致 NaN
         # ====================================================================
-        if hasattr(model, 'accumulation_count') and model.accumulation_count > 0:
-            if model.use_amp:
-                # 1. Unscale (修正：必须先还原梯度)
-                model.scaler.unscale_(model.optimizer)
-                # 2. Clip (修正：对还原后的梯度裁剪)
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
-                # 3. Step
-                model.scaler.step(model.optimizer)
-                model.scaler.update()
-            else:
-                # 修正：非 AMP 模式也需要 Clip
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
-                model.optimizer.step()
+        model.step_remainder_gradients()
             
-            model.optimizer.zero_grad()
-            model.accumulation_count = 0
-            model.update_steps += 1  # 更新步骤数增加
-            
-            # 如果在epoch结束时强制更新了参数，也需要检查是否需要打印损失
-            if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
-                end_time = time.time()
+        # 如果在epoch结束时强制更新了参数，也需要检查是否需要打印损失
+        if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
+            end_time = time.time()
                 elapsed_time = end_time - start_time
                 loss_ral, loss_ce = model.get_individual_losses()
                 total_loss = model.get_loss()
