@@ -25,7 +25,21 @@ def validate(model, loader, gpu_id):
             features = model.get_features(img_tens).to(device, non_blocking=True)
 
             # 获取预测概率
-            pred_score = model(crops_tens, features)[0].sigmoid().flatten()
+            # --- 修改开始 ---
+            # 1. 获取原始 logits，形状 [Batch, 2]
+            logits = model(crops_tens, features)[0]
+
+            # 2. 使用 Softmax 在维度 1 上归一化 (让两个概率加起来等于 1)
+            probs = torch.softmax(logits, dim=1)
+
+            # 3. 取出第 1 列 (索引 1) 作为 "Fake" 类别的概率
+            # 假设: Index 0 = Real, Index 1 = Fake (通常做法)
+            # 这一步后形状变为 [Batch]，与标签数量对齐
+            pred_score = probs[:, 1] 
+
+            # 4. 转为 list (如果需要 flatten 可以加，但通常一维张量不需要)
+            pred_score = pred_score.flatten()
+            # --- 修改结束 ---
             
             y_pred.extend(pred_score.tolist())
             y_true.extend(label.flatten().tolist())
