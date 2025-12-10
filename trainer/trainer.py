@@ -79,7 +79,7 @@ class Trainer(nn.Module):
             self.scheduler = None
 
         self.criterion = get_loss().to(self.device)
-        self.criterion1 = nn.CrossEntropyLoss()
+        self.criterion1 = nn.CrossEntropyLoss(label_smoothing=0.1)
 
         self.model.to(opt.gpu_ids[0] if torch.cuda.is_available() else "cpu")
         
