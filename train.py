@@ -199,7 +199,20 @@ if __name__ == "__main__":
                 start_time = time.time()
 
         model.eval()
-        ap, fpr, fnr, acc, auc = validate(model.model, val_loader, opt.gpu_ids)
+        
+        # ====================================================================
+        # [新增] 使用 EMA 模型进行验证
+        # ====================================================================
+        # 默认使用原始模型
+        val_model = model.model
+        
+        # 如果 EMA 存在，优先使用 EMA 模型（它的泛化能力更强）
+        if hasattr(model, 'model_ema') and model.model_ema is not None:
+            # print("Using EMA model for validation...") # 可选打印
+            val_model = model.model_ema.module
+            
+        # 传入选定的 val_model
+        ap, fpr, fnr, acc, auc = validate(val_model, val_loader, opt.gpu_ids)
         print(
             "(Val @ epoch {}) auc: {:.4f} | ap: {:.4f} | acc: {:.4f} | fpr: {:.4f} | fnr: {:.4f}".format(
                 epoch + model.step_bias, auc, ap, acc, fpr, fnr

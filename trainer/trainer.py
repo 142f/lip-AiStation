@@ -1,9 +1,15 @@
 import os
 import torch
 import torch.nn as nn
-import math
 from models import build_model, get_loss
 
+# [新增] 引入 timm 的 EMA 模块
+try:
+    from timm.utils import ModelEmaV2
+except ImportError:
+    print("[Warning] timm library not found! EMA will not be available.")
+    print("Please install it using: pip install timm")
+    ModelEmaV2 = None
 
 class Trainer(nn.Module):
     def __init__(self, opt):
@@ -16,7 +22,6 @@ class Trainer(nn.Module):
             if opt.gpu_ids
             else torch.device("cpu")
         )
-        self.opt = opt
         self.model = build_model(opt.arch)
 
         self.step_bias = (
@@ -27,23 +32,18 @@ class Trainer(nn.Module):
         if opt.fine_tune:
             state_dict = torch.load(opt.pretrained_model, map_location="cpu")
             self.model.load_state_dict(state_dict["model"], strict=False)
-            self.total_steps = state_dict["total_steps"]
+            self.total_steps = state_dict.get("total_steps", 0)
             print(f"Model loaded @ {opt.pretrained_model.split('/')[-1]}")
 
-
         if opt.fix_encoder:
-            # `params` 变量在这里实际上没有被使用，可以简化
             for name, p in self.model.named_parameters():
                 if name.split(".")[0] in ["encoder"]:
                     p.requires_grad = False
                 else:
-                    p.requires_grad = True # 正确
-            # 只将需要训练的参数传递给优化器
+                    p.requires_grad = True
             params = filter(lambda p: p.requires_grad, self.model.parameters())
         else:
-            # 如果不固定任何部分，所有参数都应该可训练
             params = self.model.parameters()
-
 
         if opt.optim == "adamw":
             self.optimizer = torch.optim.AdamW(
@@ -66,14 +66,10 @@ class Trainer(nn.Module):
         else:
             raise ValueError("optim should be [sgd, adam, adamw]")
 
-        # 初始化学习率调度器（如果启用）
         if opt.cosine_annealing:
-            # 根据项目信息，使用CosineAnnealingWarmRestarts调度器
-            # 重启周期设置为20个epoch，最小学习率设置为1e-7
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self.optimizer, T_0=20, T_mult=1, eta_min=1e-8
             )
-            # 添加一个计数器来跟踪epoch
             self.scheduler_epoch = 0
         else:
             self.scheduler = None
@@ -81,20 +77,28 @@ class Trainer(nn.Module):
         self.criterion = get_loss().to(self.device)
         self.criterion1 = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-        self.model.to(opt.gpu_ids[0] if torch.cuda.is_available() else "cpu")
+        # 确保模型先移动到 GPU
+        self.model.to(self.device)
+        
+        # -----------------------------------------------------------
+        # [新增] EMA 初始化
+        # -----------------------------------------------------------
+        self.model_ema = None
+        if ModelEmaV2 is not None:
+            # decay: 衰减率。0.999 是通用值。
+            # 如果你的 Batch Size 很小(8)，这个值非常重要，它能平滑掉梯度的剧烈抖动。
+            self.model_ema = ModelEmaV2(self.model, decay=0.999, device=self.device)
+            print("[Info] Model EMA initialized with decay 0.999")
         
         # 梯度累积相关参数
         self.accumulation_steps = opt.accumulation_steps
         self.accumulation_count = 0
-        # 用于跟踪实际的参数更新步骤
         self.update_steps = 0
         
         # 混合精度训练相关组件
         self.use_amp = opt.use_amp and torch.cuda.is_available()
         if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
-            # 获取设备类型用于autocast
-            self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
         self.input = input[0].to(self.device)
@@ -102,9 +106,7 @@ class Trainer(nn.Module):
         self.label = input[2].to(self.device).long()
 
     def forward(self):
-        # 使用自动混合精度上下文管理器包装前向传播
-        # [修改] 使用 torch.amp.autocast 替代 torch.cuda.amp.autocast 以消除警告
-        # 注意：device_type 必须指定，通常是 'cuda'
+        # 使用新版 API 消除警告
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             self._forward_impl()
 
@@ -114,28 +116,21 @@ class Trainer(nn.Module):
             self.crops, self.features
         )
         
-        # [新增优化] AMP 稳定性关键：强制转为 float32
         if self.use_amp:
             self.output = self.output.float()
             self.weights_max = self.weights_max.float()
             self.weights_org = self.weights_org.float()
         
-        # 2. 计算辅助损失 (Aux Path)
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
-        
-        # 3. 计算主损失 (Main Path)
-        # 确保 label 是 long 类型
         self.loss_ce = self.criterion1(self.output, self.label)
 
-        # 4. 总损失公式 (静态权重配置)
-        # CE 占主导(1.0)，RAL 仅在未达标时以微弱力量(0.01)介入修正
+        # 保持之前的权重设计
         self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()
         return loss[0] if isinstance(loss, type(list())) else loss
 
-    # 添加获取单独损失值的方法
     def get_individual_losses(self):
         loss_ral = self.loss_ral.data.tolist()
         loss_ral = loss_ral[0] if isinstance(loss_ral, type(list())) else loss_ral
@@ -144,14 +139,11 @@ class Trainer(nn.Module):
         return loss_ral, loss_ce
 
     def optimize_parameters(self):
-        # 1. 前向传播和Loss计算已经在 forward() 中完成
-        
-        # 2. 梯度清零 (只在累积周期的开始做)
+        # 1. 梯度清零
         if self.accumulation_count == 0:
             self.optimizer.zero_grad(set_to_none=True)
             
-        # 3. 反向传播 (Backward)
-        # Loss 需要除以累积步数
+        # 2. 反向传播
         loss_scaled = self.loss / self.accumulation_steps
         
         if self.use_amp:
@@ -159,45 +151,38 @@ class Trainer(nn.Module):
         else:
             loss_scaled.backward()
         
-        # 增加累积计数
         self.accumulation_count += 1
         
-        # 4. 参数更新 (只在累积周期结束时执行)
+        # 3. 参数更新 (满足累积步数时)
         if self.accumulation_count >= self.accumulation_steps:
-            
             if self.use_amp:
-                # A. 先 Unscale (将梯度还原回正常数值)
                 self.scaler.unscale_(self.optimizer)
-                
-                # B. 再 Clip (对正常数值的梯度进行裁剪)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                # C. 最后 Step (如果梯度中有 Inf/NaN，scaler 会自动跳过 step)
                 self.scaler.step(self.optimizer)
-                
-                # D. 更新 Scaler 因子
                 self.scaler.update()
             else:
-                # 非 AMP 模式
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
             
-            # 重置累积计数
+            # -------------------------------------------------------
+            # [新增] EMA 更新：只有在参数真正 update 后才更新 EMA
+            # -------------------------------------------------------
+            if self.model_ema is not None:
+                self.model_ema.update(self.model)
+
             self.accumulation_count = 0
-            self.optimizer.zero_grad(set_to_none=True) # 确保梯度被清空
-            self.update_steps += 1  # 记录实际更新次数
+            self.optimizer.zero_grad(set_to_none=True)
+            self.update_steps += 1
             
-            # 更新学习率调度器
             if self.scheduler is not None:
                 self.scheduler.step()
 
     def get_features(self):
-        self.features = self.model.get_features(self.input).to(
-            self.device
-        )  # shape: (batch_size
+        self.features = self.model.get_features(self.input).to(self.device)
 
     def eval(self):
         self.model.eval()
+        # 注意：EMA模型不需要手动eval，它始终处于评估模式
 
     def test(self):
         with torch.no_grad():
@@ -205,19 +190,20 @@ class Trainer(nn.Module):
 
     def save_networks(self, save_filename):
         save_path = os.path.join(self.save_dir, save_filename)
-
-        # 确保保存目录存在
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # serialize model and optimizer to dict
         state_dict = {
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "total_steps": self.total_steps,
-            "update_steps": self.update_steps,  # 保存实际更新步骤数
+            "update_steps": self.update_steps,
         }
         
-        # 如果使用混合精度，还需要保存scaler的状态
+        # [新增] 保存 EMA 权重
+        # 这是你最宝贵的资产，通常 EMA 权重在验证集上效果更好
+        if self.model_ema is not None:
+            state_dict["model_ema"] = self.model_ema.module.state_dict()
+        
         if self.use_amp:
             state_dict["scaler"] = self.scaler.state_dict()
 
@@ -227,18 +213,18 @@ class Trainer(nn.Module):
         """处理 Epoch 结束时未满足累积步数的剩余梯度"""
         if self.accumulation_count > 0:
             if self.use_amp:
-                # 1. Unscale
                 self.scaler.unscale_(self.optimizer)
-                # 2. Clip (保持和 optimize_parameters 一致)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                # 3. Step
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
             
-            # 清理状态
+            # [新增] 记得这里也要更新 EMA
+            if self.model_ema is not None:
+                self.model_ema.update(self.model)
+            
             self.optimizer.zero_grad(set_to_none=True)
             self.accumulation_count = 0
             self.update_steps += 1
