@@ -177,11 +177,17 @@ if __name__ == "__main__":
         # [重要修正] Epoch 结束时的剩余梯度处理
         # 必须先 Unscale, 再 Clip, 最后 Step，防止梯度爆炸导致 NaN
         # ====================================================================
+        # 1. 记录调用前的 update_steps
+        prev_update_steps = model.update_steps
+        
+        # 2. 处理剩余梯度
         model.step_remainder_gradients()
             
-        # 如果在epoch结束时强制更新了参数，也需要检查是否需要打印损失
-        if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
-            end_time = time.time()
+        # 3. [逻辑修正] 只有当 update_steps 确实增加（发生了新的更新）时，才打印日志
+        # 这样就避免了在刚完成一次完整 Update 后重复打印的问题
+        if model.update_steps > prev_update_steps:
+            if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
+                end_time = time.time()
                 elapsed_time = end_time - start_time
                 loss_ral, loss_ce = model.get_individual_losses()
                 total_loss = model.get_loss()

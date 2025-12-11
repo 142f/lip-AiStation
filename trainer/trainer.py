@@ -103,8 +103,9 @@ class Trainer(nn.Module):
 
     def forward(self):
         # 使用自动混合精度上下文管理器包装前向传播
-        # 推荐写法，兼容性最好
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        # [修改] 使用 torch.amp.autocast 替代 torch.cuda.amp.autocast 以消除警告
+        # 注意：device_type 必须指定，通常是 'cuda'
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
             self._forward_impl()
 
     def _forward_impl(self):
