@@ -7,6 +7,7 @@ from validate import validate
 from data import create_dataloader
 from trainer.trainer import Trainer
 from options.train_options import TrainOptions
+from utils import set_seed
 
 
 # 添加日志类，用于同时输出到控制台和文件
@@ -59,8 +60,16 @@ def format_options(opt, parser):
 if __name__ == "__main__":
     train_options = TrainOptions()
     opt = train_options.parse(print_options=False)  # 禁用自动打印选项
+    set_seed(opt.seed)
+    torch.backends.cudnn.benchmark = True 
     val_opt = get_val_opt(opt) # [修改] 传入 opt
     model = Trainer(opt)
+
+    # [新增] 如果 PyTorch 版本 >= 2.0
+    if int(torch.__version__.split('.')[0]) >= 2:
+        print("Compiling model with torch.compile...")
+        # mode 可以选 'default', 'reduce-overhead', 'max-autotune' (最慢编译，最快运行)
+        model.model = torch.compile(model.model, mode='default') 
 
     # 创建日志目录和文件（优化：放在项目根路径下的logs文件夹）
     log_dir = os.path.join("./logs", opt.name)
@@ -168,25 +177,15 @@ if __name__ == "__main__":
         # [重要修正] Epoch 结束时的剩余梯度处理
         # 必须先 Unscale, 再 Clip, 最后 Step，防止梯度爆炸导致 NaN
         # ====================================================================
-        if hasattr(model, 'accumulation_count') and model.accumulation_count > 0:
-            if model.use_amp:
-                # 1. Unscale (修正：必须先还原梯度)
-                model.scaler.unscale_(model.optimizer)
-                # 2. Clip (修正：对还原后的梯度裁剪)
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
-                # 3. Step
-                model.scaler.step(model.optimizer)
-                model.scaler.update()
-            else:
-                # 修正：非 AMP 模式也需要 Clip
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
-                model.optimizer.step()
+        # 1. 记录调用前的 update_steps
+        prev_update_steps = model.update_steps
+        
+        # 2. 处理剩余梯度
+        model.step_remainder_gradients()
             
-            model.optimizer.zero_grad()
-            model.accumulation_count = 0
-            model.update_steps += 1  # 更新步骤数增加
-            
-            # 如果在epoch结束时强制更新了参数，也需要检查是否需要打印损失
+        # 3. [逻辑修正] 只有当 update_steps 确实增加（发生了新的更新）时，才打印日志
+        # 这样就避免了在刚完成一次完整 Update 后重复打印的问题
+        if model.update_steps > prev_update_steps:
             if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
                 end_time = time.time()
                 elapsed_time = end_time - start_time
@@ -200,7 +199,20 @@ if __name__ == "__main__":
                 start_time = time.time()
 
         model.eval()
-        ap, fpr, fnr, acc, auc = validate(model.model, val_loader, opt.gpu_ids)
+        
+        # ====================================================================
+        # [新增] 使用 EMA 模型进行验证
+        # ====================================================================
+        # 默认使用原始模型
+        val_model = model.model
+        
+        # 如果 EMA 存在，优先使用 EMA 模型（它的泛化能力更强）
+        if hasattr(model, 'model_ema') and model.model_ema is not None:
+            # print("Using EMA model for validation...") # 可选打印
+            val_model = model.model_ema.module
+            
+        # 传入选定的 val_model
+        ap, fpr, fnr, acc, auc = validate(val_model, val_loader, opt.gpu_ids)
         print(
             "(Val @ epoch {}) auc: {:.4f} | ap: {:.4f} | acc: {:.4f} | fpr: {:.4f} | fnr: {:.4f}".format(
                 epoch + model.step_bias, auc, ap, acc, fpr, fnr
