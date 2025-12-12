@@ -87,8 +87,8 @@ class Trainer(nn.Module):
         if ModelEmaV2 is not None:
             # decay: 衰减率。0.999 是通用值。
             # 如果你的 Batch Size 很小(8)，这个值非常重要，它能平滑掉梯度的剧烈抖动。
-            self.model_ema = ModelEmaV2(self.model, decay=0.999, device=self.device)
-            print("[Info] Model EMA initialized with decay 0.999")
+            self.model_ema = ModelEmaV2(self.model, decay=0.99, device=self.device)
+            print("[Info] Model EMA initialized with decay 0.99")
         
         # 梯度累积相关参数
         self.accumulation_steps = opt.accumulation_steps
