@@ -242,12 +242,8 @@ if __name__ == "__main__":
         # ====================================================================
         current_epoch_num = current_epoch
         
-        # 1. 始终保存当前 Epoch 的权重 (用于回溯分析)
-        # save_optimizer=False 确保文件只有 1.8GB
-        model.save_networks(f"model_epoch_{current_epoch_num}.pth", save_optimizer=False)
-        
-        # 2. [核心逻辑] 滚动删除：删除 3 个 Epoch 之前的模型
-        # 例如：当前是 Epoch 10，则保留 10, 9, 8；删除 Epoch 7
+        # [重要修复] 先删除旧文件，再保存新文件，避免磁盘空间不足导致的数据丢失
+        # 1. 先删除3个Epoch之前的模型（释放空间）
         obsolete_epoch = current_epoch_num - 3
         if obsolete_epoch >= 0:
             obsolete_path = os.path.join(model.save_dir, f"model_epoch_{obsolete_epoch}.pth")
@@ -257,6 +253,10 @@ if __name__ == "__main__":
                     print(f"[Cleanup] 已删除旧模型以释放空间: {os.path.basename(obsolete_path)}")
                 except OSError as e:
                     print(f"[Warning] 删除失败: {e}")
+        
+        # 2. 再保存当前Epoch的权重 (用于回溯分析)
+        # save_optimizer=False 确保文件只有 1.8GB
+        model.save_networks(f"model_epoch_{current_epoch_num}.pth", save_optimizer=False)
 
         # 3. 保存最佳模型 (覆盖更新)
         # 如果当前是最佳模型，额外存一份 best_model.pth
