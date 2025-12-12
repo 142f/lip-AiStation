@@ -239,15 +239,30 @@ class Trainer(nn.Module):
     def step_remainder_gradients(self):
         """处理 Epoch 结束时未满足累积步数的剩余梯度"""
         if self.accumulation_count > 0:
+            # [修正] 调整梯度比例：因为之前是按 accumulation_steps 平均的，现在只有 accumulation_count 个样本
+            # 需要乘以 accumulation_steps / accumulation_count 恢复正确的平均值
+            scale_factor = self.accumulation_steps / self.accumulation_count
+
             if self.use_amp:
     # -------------------------------------------------------
     # [AMP 修改 6] 处理剩余梯度的更新逻辑
     # -------------------------------------------------------
                 self.scaler.unscale_(self.optimizer)
+                
+                # [新增] 修正梯度幅度
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(scale_factor)
+
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
+                # [新增] 修正梯度幅度 (非 AMP 模式也需要)
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(scale_factor)
+
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
             

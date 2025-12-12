@@ -93,7 +93,7 @@ if __name__ == "__main__":
     print("\n")
     
     # 显示是否使用混合精度训练
-    print(f"使用混合精度训练: {'是' if opt.use_amp else '否'}")
+    print(f"使用混合精度训练: {'是' if model.use_amp else '否'}")
     print("\n")
 
     data_loader = create_dataloader(opt)
@@ -151,7 +151,8 @@ if __name__ == "__main__":
             else:
                 # 使用梯度累积，按照参数更新频率打印
                 # 只有当完成一次完整的梯度累积周期时才打印
-                should_print_loss = (model.update_steps > 0 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0 and model.accumulation_count == 0)
+                log_freq = max(1, opt.loss_freq // opt.accumulation_steps)
+                should_print_loss = (model.update_steps > 0 and model.update_steps % log_freq == 0 and model.accumulation_count == 0)
 
             if should_print_loss:
                 end_time = time.time()
@@ -186,7 +187,8 @@ if __name__ == "__main__":
         # 3. [逻辑修正] 只有当 update_steps 确实增加（发生了新的更新）时，才打印日志
         # 这样就避免了在刚完成一次完整 Update 后重复打印的问题
         if model.update_steps > prev_update_steps:
-            if opt.accumulation_steps > 1 and model.update_steps % (opt.loss_freq // opt.accumulation_steps) == 0:
+            log_freq = max(1, opt.loss_freq // opt.accumulation_steps)
+            if opt.accumulation_steps > 1 and model.update_steps % log_freq == 0:
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 loss_ral, loss_ce = model.get_individual_losses()
