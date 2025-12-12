@@ -105,8 +105,16 @@ class Trainer(nn.Module):
             self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
-        self.input = input[0].to(self.device)
-        self.crops = [[t.to(self.device) for t in sublist] for sublist in input[1]]
+        # input[0]: 全局图 (B, 3, 1120, 1120)
+        # input[1]: 局部 Crops (B, 3, 5, 3, 224, 224) - 现在是 Tensor 了！
+        # input[2]: 标签 (B,)
+        
+        self.input = input[0].to(self.device, non_blocking=True)
+        
+        # [修改核心] 以前是 List[List[Tensor]]，需要双重循环。
+        # 现在是 5D Tensor，直接整块搬运，速度飞快。
+        self.crops = input[1].to(self.device, non_blocking=True)
+        
         self.label = input[2].to(self.device).long()
 
     def forward(self):
