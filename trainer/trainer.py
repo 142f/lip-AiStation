@@ -206,26 +206,35 @@ class Trainer(nn.Module):
         with torch.no_grad():
             self.forward()
 
-    def save_networks(self, save_filename):
+    def save_networks(self, save_filename, save_optimizer=False):
+        """
+        保存模型权重。
+        Args:
+            save_filename: 文件名
+            save_optimizer: 是否保存优化器状态（默认False，以节省空间）
+        """
         save_path = os.path.join(self.save_dir, save_filename)
         os.makedirs(self.save_dir, exist_ok=True)
 
+        # 1. 基础部分：始终保存模型参数
         state_dict = {
             "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
             "total_steps": self.total_steps,
             "update_steps": self.update_steps,
         }
         
-        # [新增] 保存 EMA 权重
-    # -------------------------------------------------------
-        if self.model_ema is not None:
+        # 2. EMA 部分：这是最宝贵的推理权重，必须保存
+        if hasattr(self, 'model_ema') and self.model_ema is not None:
             state_dict["model_ema"] = self.model_ema.module.state_dict()
-        
-        if self.use_amp:
-            state_dict["scaler"] = self.scaler.state_dict()
+
+        # 3. 优化器部分：体积巨大(3GB+)，仅在需要断点续训时才保存
+        if save_optimizer:
+            state_dict["optimizer"] = self.optimizer.state_dict()
+            if self.use_amp:
+                state_dict["scaler"] = self.scaler.state_dict()
 
         torch.save(state_dict, save_path)
+        # print(f"[Info] Saved model to {save_path} (Optimizer: {'Yes' if save_optimizer else 'No'})")
 
     def step_remainder_gradients(self):
         """处理 Epoch 结束时未满足累积步数的剩余梯度"""
