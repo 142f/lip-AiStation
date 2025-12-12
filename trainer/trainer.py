@@ -87,18 +87,22 @@ class Trainer(nn.Module):
         if ModelEmaV2 is not None:
             # decay: 衰减率。0.999 是通用值。
             # 如果你的 Batch Size 很小(8)，这个值非常重要，它能平滑掉梯度的剧烈抖动。
-            self.model_ema = ModelEmaV2(self.model, decay=0.999, device=self.device)
-            print("[Info] Model EMA initialized with decay 0.999")
+            self.model_ema = ModelEmaV2(self.model, decay=0.99, device=self.device)
+            print("[Info] Model EMA initialized with decay 0.99")
         
         # 梯度累积相关参数
         self.accumulation_steps = opt.accumulation_steps
         self.accumulation_count = 0
         self.update_steps = 0
         
-        # 混合精度训练相关组件
+        # -------------------------------------------------------
+        # [AMP 修改 1] 初始化混合精度组件
+        # -------------------------------------------------------
         self.use_amp = opt.use_amp and torch.cuda.is_available()
         if self.use_amp:
+            # 初始化梯度缩放器，用于防止 FP16 下梯度的下溢出
             self.scaler = torch.cuda.amp.GradScaler()
+            self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
         self.input = input[0].to(self.device)
@@ -106,8 +110,11 @@ class Trainer(nn.Module):
         self.label = input[2].to(self.device).long()
 
     def forward(self):
-        # 使用新版 API 消除警告
-        with torch.amp.autocast('cuda', enabled=self.use_amp):
+        # -------------------------------------------------------
+        # [AMP 修改 2] 前向传播上下文管理
+        # -------------------------------------------------------
+        # 使用 autocast 自动将部分算子转为 FP16 运行
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
             self._forward_impl()
 
     def _forward_impl(self):
@@ -116,6 +123,10 @@ class Trainer(nn.Module):
             self.crops, self.features
         )
         
+        # -------------------------------------------------------
+        # [AMP 修改 3] 稳定性保障：计算 Loss 前强制转回 FP32
+        # -------------------------------------------------------
+        # 防止 CrossEntropyLoss 中的 exp() 计算在 FP16 下溢出导致 NaN
         if self.use_amp:
             self.output = self.output.float()
             self.weights_max = self.weights_max.float()
@@ -123,8 +134,6 @@ class Trainer(nn.Module):
         
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
-
-        # 保持之前的权重设计
         self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
@@ -139,32 +148,41 @@ class Trainer(nn.Module):
         return loss_ral, loss_ce
 
     def optimize_parameters(self):
-        # 1. 梯度清零
         if self.accumulation_count == 0:
             self.optimizer.zero_grad(set_to_none=True)
             
-        # 2. 反向传播
+        # -------------------------------------------------------
+        # [AMP 修改 4] 反向传播 (Backward)
+        # -------------------------------------------------------
         loss_scaled = self.loss / self.accumulation_steps
         
         if self.use_amp:
+            # 使用 scaler 缩放 loss，防止梯度下溢
             self.scaler.scale(loss_scaled).backward()
         else:
             loss_scaled.backward()
         
         self.accumulation_count += 1
         
-        # 3. 参数更新 (满足累积步数时)
+        # -------------------------------------------------------
+        # [AMP 修改 5] 参数更新 (Step)
+        # -------------------------------------------------------
         if self.accumulation_count >= self.accumulation_steps:
             if self.use_amp:
+                # A. 先 Unscale (将梯度还原回正常数值，以便进行裁剪)
                 self.scaler.unscale_(self.optimizer)
+                
+                # B. 再 Clip (对正常数值的梯度进行裁剪，防止梯度爆炸)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # C. 最后 Step (如果梯度中有 Inf/NaN，scaler 会自动跳过 step)
                 self.scaler.step(self.optimizer)
+                
+                # D. 更新 Scaler 因子 (准备下一次迭代)
                 self.scaler.update()
             else:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-            
-            # -------------------------------------------------------
             # [新增] EMA 更新：只有在参数真正 update 后才更新 EMA
             # -------------------------------------------------------
             if self.model_ema is not None:
@@ -188,31 +206,43 @@ class Trainer(nn.Module):
         with torch.no_grad():
             self.forward()
 
-    def save_networks(self, save_filename):
+    def save_networks(self, save_filename, save_optimizer=False):
+        """
+        保存模型权重。
+        Args:
+            save_filename: 文件名
+            save_optimizer: 是否保存优化器状态（默认False，以节省空间）
+        """
         save_path = os.path.join(self.save_dir, save_filename)
         os.makedirs(self.save_dir, exist_ok=True)
 
+        # 1. 基础部分：始终保存模型参数
         state_dict = {
             "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
             "total_steps": self.total_steps,
             "update_steps": self.update_steps,
         }
         
-        # [新增] 保存 EMA 权重
-        # 这是你最宝贵的资产，通常 EMA 权重在验证集上效果更好
-        if self.model_ema is not None:
+        # 2. EMA 部分：这是最宝贵的推理权重，必须保存
+        if hasattr(self, 'model_ema') and self.model_ema is not None:
             state_dict["model_ema"] = self.model_ema.module.state_dict()
-        
-        if self.use_amp:
-            state_dict["scaler"] = self.scaler.state_dict()
+
+        # 3. 优化器部分：体积巨大(3GB+)，仅在需要断点续训时才保存
+        if save_optimizer:
+            state_dict["optimizer"] = self.optimizer.state_dict()
+            if self.use_amp:
+                state_dict["scaler"] = self.scaler.state_dict()
 
         torch.save(state_dict, save_path)
+        # print(f"[Info] Saved model to {save_path} (Optimizer: {'Yes' if save_optimizer else 'No'})")
 
     def step_remainder_gradients(self):
         """处理 Epoch 结束时未满足累积步数的剩余梯度"""
         if self.accumulation_count > 0:
             if self.use_amp:
+    # -------------------------------------------------------
+    # [AMP 修改 6] 处理剩余梯度的更新逻辑
+    # -------------------------------------------------------
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)

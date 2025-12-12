@@ -235,6 +235,29 @@ if __name__ == "__main__":
                 if acc > best_acc:
                     is_better = True
 
+        # ====================================================================
+        # [优化] 模型保存策略：只留最佳 + 最新3个 (且只存权重)
+        # ====================================================================
+        current_epoch_num = current_epoch
+        
+        # 1. 始终保存当前 Epoch 的权重 (用于回溯分析)
+        # save_optimizer=False 确保文件只有 1.8GB
+        model.save_networks(f"model_epoch_{current_epoch_num}.pth", save_optimizer=False)
+        
+        # 2. [核心逻辑] 滚动删除：删除 3 个 Epoch 之前的模型
+        # 例如：当前是 Epoch 10，则保留 10, 9, 8；删除 Epoch 7
+        obsolete_epoch = current_epoch_num - 3
+        if obsolete_epoch >= 0:
+            obsolete_path = os.path.join(model.save_dir, f"model_epoch_{obsolete_epoch}.pth")
+            if os.path.exists(obsolete_path):
+                try:
+                    os.remove(obsolete_path)
+                    print(f"[Cleanup] 已删除旧模型以释放空间: {os.path.basename(obsolete_path)}")
+                except OSError as e:
+                    print(f"[Warning] 删除失败: {e}")
+
+        # 3. 保存最佳模型 (覆盖更新)
+        # 如果当前是最佳模型，额外存一份 best_model.pth
         if is_better:
             # 更新最佳性能指标（按 AUC/AP/ACC 的优先级）
             best_acc = acc
@@ -243,11 +266,14 @@ if __name__ == "__main__":
             best_epoch = current_epoch
 
             print(f" 发现新的最佳模型 (epoch {current_epoch}): auc={best_auc:.4f}, ap={best_ap:.4f}, acc={best_acc:.4f}")
-            model.save_networks("best_model.pth")
-            # 可选：同时保存带epoch编号的模型用于记录
-            model.save_networks(f"model_epoch_{current_epoch}.pth")
+            # 只存权重，不存优化器
+            model.save_networks("best_model.pth", save_optimizer=False)
         else:
             print(f" 当前性能未超过最佳 (最佳: auc={best_auc:.4f}, ap={best_ap:.4f}, acc={best_acc:.4f} @ epoch {best_epoch})")
+        
+        # 4. (可选建议) 始终保存一份带优化器的 latest.pth 用于断点续训
+        # 每次覆盖写入，只占一份空间，万一崩溃了可以用它恢复
+        model.save_networks("latest_checkpoint.pth", save_optimizer=True)
         
         # 计算并打印当前epoch的总时间
         epoch_time = time.time() - epoch_start_time
