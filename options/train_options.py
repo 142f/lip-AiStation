@@ -48,7 +48,7 @@ class TrainOptions(BaseOptions):
         # ===================================================================
         parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision (AMP) training')
         parser.add_argument('--use_ema', action='store_true', help='If specified, use EMA (Exponential Moving Average) for model weights.')
-        parser.add_argument('--ema_decay', type=float, default=0.999, help='Decay rate for EMA.')
+        parser.add_argument('--ema_decay', type=float, default=0.99, help='Decay rate for EMA.')
         
         self.isTrain = True
         return parser
