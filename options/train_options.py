@@ -47,6 +47,8 @@ class TrainOptions(BaseOptions):
         # 6. 混合精度训练 (Mixed Precision Training)
         # ===================================================================
         parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision (AMP) training')
+        parser.add_argument('--use_ema', action='store_true', help='If specified, use EMA (Exponential Moving Average) for model weights.')
+        parser.add_argument('--ema_decay', type=float, default=0.999, help='Decay rate for EMA.')
         
         self.isTrain = True
         return parser
