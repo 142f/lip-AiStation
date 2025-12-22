@@ -84,11 +84,11 @@ class Trainer(nn.Module):
         # [新增] EMA 初始化
         # -----------------------------------------------------------
         self.model_ema = None
-        if ModelEmaV2 is not None:
+        if self.opt.use_ema and ModelEmaV2 is not None:
             # decay: 衰减率。0.999 是通用值。
             # 如果你的 Batch Size 很小(8)，这个值非常重要，它能平滑掉梯度的剧烈抖动。
-            self.model_ema = ModelEmaV2(self.model, decay=0.99, device=self.device)
-            print("[Info] Model EMA initialized with decay 0.99")
+            self.model_ema = ModelEmaV2(self.model, decay=self.opt.ema_decay, device=self.device)
+            print(f"[Info] Model EMA initialized with decay {self.opt.ema_decay}")
         
         # 梯度累积相关参数
         self.accumulation_steps = opt.accumulation_steps
@@ -142,7 +142,7 @@ class Trainer(nn.Module):
         
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
-        self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
+        self.loss = 1 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()
