@@ -50,5 +50,10 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--use_ema', action='store_true', help='If specified, use EMA (Exponential Moving Average) for model weights.')
         parser.add_argument('--ema_decay', type=float, default=0.995, help='Decay rate for EMA.')
         
+        # ===================================================================
+        # 7. 性能分析 (Profiling)
+        # ===================================================================
+        parser.add_argument('--profile', action='store_true', help='Run torch.profiler to diagnose performance bottlenecks.')
+        
         self.isTrain = True
         return parser

@@ -8,6 +8,28 @@ from data import create_dataloader
 from trainer.trainer import Trainer
 from options.train_options import TrainOptions
 from utils import set_seed
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+
+# 定义分析器设置
+def get_expert_profiler(log_dir="./logs/profiler_results"):
+    # wait: 跳过前几轮（等待系统稳定）
+    # warmup: 预热轮次（让 CUDA 算子进入状态）
+    # active: 真正记录的轮次
+    # repeat: 重复记录的次数
+    schedule = torch.profiler.schedule(wait=2, warmup=3, active=5, repeat=1)
+    
+    return torch.profiler.profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA,
+        ],
+        schedule=schedule,
+        on_trace_ready=tensorboard_trace_handler(log_dir), # 导出 TensorBoard 格式
+        record_shapes=True,        # 记录 Tensor 形状，方便排查由于维度不匹配导致的性能问题
+        profile_memory=True,       # 记录显存分配，排查 OOM 风险
+        with_stack=True            # 记录 Python 调用栈，直接定位到哪一行代码慢
+    )
+
 
 
 # 添加日志类，用于同时输出到控制台和文件
@@ -108,6 +130,17 @@ if __name__ == "__main__":
     best_auc = 0.0
     best_epoch = 0
 
+    # [新增] 初始化分析器 (如果启用)
+    prof = None
+    if opt.profile:
+        print("\n" + "="*50)
+        print(" [Profiler] 性能分析模式已启动")
+        print(" [Profiler] 将运行 10-15 个 Step 后自动停止并生成报告")
+        print(" [Profiler] 请勿用于正式训练！")
+        print("="*50 + "\n")
+        prof = get_expert_profiler(log_dir=os.path.join(log_dir, "trace"))
+        prof.start()
+
     # 整个实验的总开始时间
     experiment_start_time = time.time()
     start_time = time.time()
@@ -135,11 +168,30 @@ if __name__ == "__main__":
         for i, (img, crops , label) in enumerate(data_loader):
             model.total_steps += 1
 
-            model.set_input((img, crops , label))
-            model.forward()
-            loss = model.get_loss()
+            # [Profiler] 包装数据加载
+            if opt.profile:
+                with record_function("## Data Transfer ##"):
+                    model.set_input((img, crops , label))
+            else:
+                model.set_input((img, crops , label))
 
-            model.optimize_parameters()
+            # [Profiler] 包装前向与优化
+            if opt.profile:
+                with record_function("## Forward & Optimize ##"):
+                    model.forward()
+                    loss = model.get_loss()
+                    model.optimize_parameters()
+            else:
+                model.forward()
+                loss = model.get_loss()
+                model.optimize_parameters()
+
+            # [Profiler] 更新分析器状态
+            if opt.profile and prof is not None:
+                prof.step()
+                # 当分析器完成所有计划轮次后停止 (2 wait + 3 warmup + 5 active = 10 steps)
+                if i >= 12: 
+                    break
 
             # 修改损失打印条件，使其与参数更新同步
             # 如果不使用梯度累积，则每次迭代都打印
@@ -199,6 +251,21 @@ if __name__ == "__main__":
                     )
                 )
                 start_time = time.time()
+
+        # [Profiler] 结束分析并退出
+        if opt.profile and prof is not None:
+            prof.stop()
+            print("\n" + "="*20 + " 性能分析报告 (Top 10 CUDA Kernels) " + "="*20)
+            # 按照总的 CUDA 耗时排序
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+            
+            # 导出为 Chrome Trace 格式
+            trace_path = os.path.join(log_dir, "expert_trace.json")
+            prof.export_chrome_trace(trace_path)
+            print(f"\n[提示] 详细追踪文件已保存至: {trace_path}")
+            print("[提示] 请在 Chrome 浏览器访问 chrome://tracing 并加载该文件。")
+            print("="*50)
+            break # 分析一次就够了，直接跳出实验
 
         model.eval()
         
