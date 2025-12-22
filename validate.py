@@ -4,11 +4,27 @@ import numpy as np
 from data import AVLip
 import torch.utils.data
 from models import build_model
-from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve, roc_auc_score
+from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve, roc_auc_score, precision_recall_curve
 from tqdm import tqdm
 import os
 
 def validate(model, loader, gpu_id):
+    """
+    验证模型性能
+    
+    Args:
+        model: 要验证的模型
+        loader: 验证数据加载器
+        gpu_id: GPU ID列表
+        
+    Returns:
+        ap: Average Precision
+        fpr: False Positive Rate
+        fnr: False Negative Rate
+        acc: Accuracy
+        auc: Area Under ROC Curve
+        f1: F1 Score
+    """
     device = torch.device(f"cuda:{gpu_id[0]}" if torch.cuda.is_available() else "cpu")
     model.eval() # 确保模型处于验证模式
 
@@ -54,7 +70,7 @@ def validate(model, loader, gpu_id):
     # 1. 安全性检查：防止全0或全1导致报错
     if len(np.unique(y_true)) < 2:
         print("Warning: Only one class present in y_true. AUC/AP cannot be calculated correctly.")
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
 
     # 2. 计算 AUC (最高优先级)
     try:
@@ -85,11 +101,28 @@ def validate(model, loader, gpu_id):
     tn, fp, fn, tp = cm.ravel()
     fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+    
+    # 计算精确率、召回率和F1分数
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1_at_youden = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
-    print(f"Conf Matrix: [TN:{tn} FP:{fp} | FN:{fn} TP:{tp}]")
-    print(f"Best Threshold found: {best_threshold:.4f} (Default is 0.5)")
+    # [新增] 计算理论最佳 F1 Score (Best F1)
+    # Youden's J 阈值侧重于平衡 TPR/FPR，但不一定能最大化 F1。
+    # 这里我们额外计算 Precision-Recall 曲线上的最佳 F1。
+    precisions, recalls, pr_thresholds = precision_recall_curve(y_true, y_pred_prob)
+    # 防止除零
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    best_f1 = np.max(f1_scores)
+    
+    # 最终返回 Best F1 以展示模型最佳潜力
+    f1 = best_f1
 
-    return ap, fpr, fnr, acc, auc
+    print(f"Conf Matrix : [TN: {tn:>4}  FP: {fp:>4} | FN: {fn:>4}  TP: {tp:>4}]")
+    print(f"Threshold   : {best_threshold:.4f} (Youden)")
+    print(f"F1 Scores   : Youden: {f1_at_youden:.4f} | Best: {best_f1:.4f}")
+
+    return ap, fpr, fnr, acc, auc, f1
 
 
 if __name__ == "__main__":
@@ -145,13 +178,14 @@ if __name__ == "__main__":
         pin_memory=True 
     )
     
-    ap, fpr, fnr, acc, auc = validate(model, loader, gpu_id=[opt.gpu])
+    ap, fpr, fnr, acc, auc, f1 = validate(model, loader, gpu_id=[opt.gpu])
     
     # 优化输出格式：强调 AUC > AP > ACC
     print("="*30)
     print(f"AUC : {auc:.4f}")
     print(f"AP  : {ap:.4f}")
     print(f"ACC : {acc:.4f}")
+    print(f"F1  : {f1:.4f}")
     print(f"----------------")
     print(f"FPR : {fpr:.4f}")
     print(f"FNR : {fnr:.4f}")

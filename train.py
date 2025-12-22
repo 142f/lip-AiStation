@@ -162,13 +162,13 @@ if __name__ == "__main__":
                 total_loss = model.get_loss()
                 if opt.accumulation_steps <= 1:
                     print(
-                        "Step {:6d} | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
+                        "Step {:>6d} | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | Time: {:>6.2f}s".format(
                             model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
                         )
                     )
                 else:
                     print(
-                        "Update Step {:6d} (Total Step {:6d}) | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
+                        "Update Step {:>5d} (Total {:>6d}) | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | Time: {:>6.2f}s".format(
                             model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
                         )
                     )
@@ -194,7 +194,7 @@ if __name__ == "__main__":
                 loss_ral, loss_ce = model.get_individual_losses()
                 total_loss = model.get_loss()
                 print(
-                    "Update Step {:6d} (Total Step {:6d}) | loss RAL: {:8.4f} | loss CE: {:8.4f} | Total loss: {:8.4f} | Time: {:6.2f}s".format(
+                    "Update Step {:>5d} (Total {:>6d}) | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | Time: {:>6.2f}s".format(
                         model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
                     )
                 )
@@ -214,12 +214,14 @@ if __name__ == "__main__":
             val_model = model.model_ema.module
             
         # 传入选定的 val_model
-        ap, fpr, fnr, acc, auc = validate(val_model, val_loader, opt.gpu_ids)
+        ap, fpr, fnr, acc, auc, f1 = validate(val_model, val_loader, opt.gpu_ids)
+        print("-" * 100)
         print(
-            "(Val @ epoch {}) auc: {:.4f} | ap: {:.4f} | acc: {:.4f} | fpr: {:.4f} | fnr: {:.4f}".format(
-                epoch + model.step_bias, auc, ap, acc, fpr, fnr
+            "(Val @ Epoch {:>3}) AUC: {:.4f} | AP: {:.4f} | ACC: {:.4f} | F1: {:.4f} | FPR: {:.4f} | FNR: {:.4f}".format(
+                epoch + model.step_bias, auc, ap, acc, f1, fpr, fnr
             )
         )
+        print("-" * 100)
 
         # 只在验证性能超过历史最佳时才保存模型
         # 保存准则按优先级排序：AUC > AP > ACC
@@ -267,11 +269,12 @@ if __name__ == "__main__":
             best_auc = auc
             best_epoch = current_epoch
 
-            print(f" 发现新的最佳模型 (epoch {current_epoch}): auc={best_auc:.4f}, ap={best_ap:.4f}, acc={best_acc:.4f}")
+            print(f" [Result] 发现新的最佳模型! (Epoch {current_epoch})")
+            print(f" [Result] 性能指标: AUC={best_auc:.4f} | AP={best_ap:.4f} | ACC={best_acc:.4f}")
             # 只存权重，不存优化器
             model.save_networks("best_model.pth", save_optimizer=False)
         else:
-            print(f" 当前性能未超过最佳 (最佳: auc={best_auc:.4f}, ap={best_ap:.4f}, acc={best_acc:.4f} @ epoch {best_epoch})")
+            print(f" [Status] 未破纪录 (最佳: AUC={best_auc:.4f} | AP={best_ap:.4f} | ACC={best_acc:.4f} @ Epoch {best_epoch})")
         
         # 4. (可选建议) 始终保存一份带优化器的 latest.pth 用于断点续训
         # 每次覆盖写入，只占一份空间，万一崩溃了可以用它恢复
