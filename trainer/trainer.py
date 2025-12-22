@@ -142,7 +142,7 @@ class Trainer(nn.Module):
         
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
-        self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
+        self.loss = 1 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()
