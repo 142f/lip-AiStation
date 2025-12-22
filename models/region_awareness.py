@@ -1,13 +1,11 @@
 import torch
-from torch import Tensor
 import torch.nn as nn
-from typing import Type, Any, Callable, Union, List, Optional
+import torch.nn.functional as F
+from torch import Tensor
+from typing import Type, Any, Callable, Union, List, Optional, cast
 from torch.nn.functional import softmax
 
-try:
-    from torch.hub import load_state_dict_from_url
-except ImportError:
-    from torch.utils.model_zoo import load_url as load_state_dict_from_url
+from torch.hub import load_state_dict_from_url
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-f37072fd.pth',
@@ -159,6 +157,53 @@ class SELayerVec(nn.Module):
         return x * scale
 
 
+# ---------------------------
+# 新增：尺度敏感的频率增强模块
+# ---------------------------
+class ScaleAwareFrequencyEnhancer(nn.Module):
+    def __init__(self, in_channels=3):
+        super(ScaleAwareFrequencyEnhancer, self).__init__()
+        
+        # 1. 为 Scale 2 准备的小波核 (DWT)
+        h = torch.tensor([[1, 1], [1, 1]], dtype=torch.float32) / 2.0
+        lh = torch.tensor([[1, -1], [1, -1]], dtype=torch.float32) / 2.0
+        hl = torch.tensor([[1, 1], [-1, -1]], dtype=torch.float32) / 2.0
+        hh = torch.tensor([[1, -1], [-1, 1]], dtype=torch.float32) / 2.0
+        kernels = torch.stack([h, lh, hl, hh], dim=0).unsqueeze(1).repeat(in_channels, 1, 1, 1)
+        self.register_buffer('dwt_kernels', kernels)
+        
+        # 2. 为 Scale 0/1 准备的简单高通滤波器 (拉普拉斯算子)
+        laplacian = torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('hpf_kernels', laplacian.repeat(in_channels, 1, 1, 1))
+
+        # 3. 频率特征映射层 (将 DWT 后的 12 通道映射回 3 通道，保持 Backbone 兼容)
+        self.dwt_mapping = nn.Conv2d(in_channels * 4, in_channels, kernel_size=1)
+
+    def forward(self, x_scales):
+        """
+        x_scales: List[Tensor], 每个元素形状为 (B*R, C, H, W)，对应 S=0, 1, 2
+        """
+        # 显式转换类型以消除 Pylance 报错
+        hpf_kernels = cast(Tensor, self.hpf_kernels)
+        dwt_kernels = cast(Tensor, self.dwt_kernels)
+
+        # --- 处理 Scale 0 & 1 (头部与面部): 应用简单高通滤波增强边缘 ---
+        s0_enhanced = x_scales[0] + F.conv2d(x_scales[0], hpf_kernels, padding=1, groups=3) * 0.1
+        s1_enhanced = x_scales[1] + F.conv2d(x_scales[1], hpf_kernels, padding=1, groups=3) * 0.1
+
+        # --- 处理 Scale 2 (嘴部特写): 应用 DWT 深度提取频率指纹 ---
+        # 形状变换: (B*R, 12, H/2, W/2)
+        dwt_out = F.conv2d(x_scales[2], dwt_kernels, stride=2, groups=3)
+        # 还原到原始分辨率并映射通道 (B*R, 3, H, W)
+        s2_freq = self.dwt_mapping(F.interpolate(dwt_out, size=x_scales[2].shape[-2:], mode='bilinear', align_corners=False))
+        s2_enhanced = x_scales[2] + s2_freq
+
+        # 中文打印：确认增强完成
+        # print(f"--- [调试] 尺度敏感频率增强完成: S0={s0_enhanced.shape}, S2={s2_enhanced.shape} ---")
+        
+        return [s0_enhanced, s1_enhanced, s2_enhanced]
+
+
 class ResNet(nn.Module):
 
     def __init__(
@@ -207,6 +252,9 @@ class ResNet(nn.Module):
             nn.Sigmoid()
         )
         self.fc = nn.Linear(512 * block.expansion + 768, num_classes)
+
+        # [新增] 初始化我们的尺度敏感增强器
+        self.freq_enhancer = ScaleAwareFrequencyEnhancer(in_channels=3)
 
         # ---------------------------
         # 新增：位置编码与 SE 向量模块的初始化
@@ -267,20 +315,20 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
     def _forward_impl(self, x, feature, chunk_size: int = 65536):
-        """
-        高效版前向传播：
-        Args:
-            x: Tensor, shape (B, 3, 5, 3, 224, 224) [Batch, Scales, Regions, Channel, H, W]
-            feature: Tensor, 全局特征 (B, feat_g)
-        """
-        # 1. 获取维度信息
+        # x: (B, S, R, C, H, W)
         B, S, R, C, H, W = x.shape
         
-        # 2. [性能核心] 合并前三个维度 (Batch * Scales * Regions)
-        # 这使得我们可以一次性将所有图片送入 CNN，充分利用 GPU 并行能力
-        x_flat = x.view(B * S * R, C, H, W)
+        # 1. 拆分 Scale (S 维度)
+        # x_list 包含 3 个形状为 (B, R, C, H, W) 的 Tensor
+        x_list = [x[:, i].contiguous().view(B * R, C, H, W) for i in range(S)]
 
-        # 3. Backbone 特征提取 (一次性通过)
+        # 2. 执行尺度敏感的频率增强 [创新点核心]
+        x_list_enhanced = self.freq_enhancer(x_list)
+
+        # 3. 合并回扁平化的 Batch 维度进入 Backbone
+        x_flat = torch.cat(x_list_enhanced, dim=0) # (B*S*R, C, H, W)
+
+        # 4. 进入卷积 Backbone
         f = self.conv1(x_flat)
         f = self.bn1(f)
         f = self.relu(f)
@@ -290,13 +338,10 @@ class ResNet(nn.Module):
         f = self.layer3(f)
         f = self.layer4(f)
         f = self.avgpool(f)
-        f = torch.flatten(f, 1)  # 结果形状: (B*S*R, feat_local)
+        f = torch.flatten(f, 1)
 
-        # 4. 恢复维度结构以适配后续 Attention 逻辑
-        # 原始逻辑期望: (Scales, Regions, Batch, feat_dim)
-        # 当前数据流: (Batch, Scales, Regions, feat_dim)
-        f = f.view(B, S, R, -1)      # (B, S, R, feat_dim)
-        f = f.permute(1, 2, 0, 3)    # (S, R, B, feat_dim) -> 完美对接原逻辑
+        # 5. 恢复维度并对接后续融合逻辑
+        f = f.view(S, B, R, -1).permute(0, 2, 1, 3) # (S, R, B, feat_dim)
 
         # ---------------------------
         # 下面的逻辑保持不变 (复制过来即可)
