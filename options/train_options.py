@@ -25,6 +25,9 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--lr', type=float, default=1e-4, help='Initial learning rate.')
         parser.add_argument('--beta1', type=float, default=0.9, help='Momentum term for the Adam optimizer.')
         parser.add_argument('--cosine_annealing', action='store_true', help='Use cosine annealing learning rate scheduler.')
+        
+        # [新增] 预热参数 Warmup
+        parser.add_argument('--warmup_epochs', type=int, default=5, help='Number of warmup epochs before cosine annealing.')
 
         # ===================================================================
         # 3. 检查点与日志 (Checkpoints and Logging)

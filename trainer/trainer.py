@@ -2,6 +2,8 @@ import os
 import torch
 import torch.nn as nn
 from models import build_model, get_loss
+# [新增] 引入调度器组件
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 
 # [新增] 引入 timm 的 EMA 模块
 try:
@@ -66,10 +68,34 @@ class Trainer(nn.Module):
         else:
             raise ValueError("optim should be [sgd, adam, adamw]")
 
+        # ===========================================================
+        # [修改] 学习率调度器：支持 Warmup + Cosine
+        # ===========================================================
         if opt.cosine_annealing:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            # 1. 定义主调度器 (Cosine)
+            # T_0=20: 每20个Epoch重置一次学习率
+            main_scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer, T_0=20, T_mult=1, eta_min=1e-8
             )
+            
+            if opt.warmup_epochs > 0:
+                print(f"[Info] 启用学习率预热: 前 {opt.warmup_epochs} 个 Epoch 线性增长")
+                # 2. 定义预热调度器 (Linear)
+                # start_factor=0.001: 初始学习率从 lr * 0.001 开始
+                warmup_scheduler = LinearLR(
+                    self.optimizer, start_factor=0.001, end_factor=1.0, total_iters=opt.warmup_epochs
+                )
+                
+                # 3. 串联调度器 (Sequential)
+                # 前 warmup_epochs 轮用 Linear，之后切换到 Cosine
+                self.scheduler = SequentialLR(
+                    self.optimizer, 
+                    schedulers=[warmup_scheduler, main_scheduler], 
+                    milestones=[opt.warmup_epochs]
+                )
+            else:
+                self.scheduler = main_scheduler
+                
             self.scheduler_epoch = 0
         else:
             self.scheduler = None
@@ -200,8 +226,8 @@ class Trainer(nn.Module):
             self.optimizer.zero_grad(set_to_none=True)
             self.update_steps += 1
             
-            if self.scheduler is not None:
-                self.scheduler.step()
+            # if self.scheduler is not None:
+            #     self.scheduler.step()
 
     def get_features(self):
         self.features = self.model.get_features(self.input).to(self.device)
