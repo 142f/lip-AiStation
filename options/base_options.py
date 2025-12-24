@@ -48,6 +48,18 @@ class BaseOptions:
         parser.add_argument('--jpg_qual', type=str, default='75,100', help='jpeg quality range, comma-separated')
         parser.add_argument('--weight_decay', type=float, default=0.01, help='weight decay for optimizers')
         parser.add_argument('--class_bal', action='store_true', help='if specified, use class balancing for the dataset loader')
+
+        # ===================================================================
+        # 5. 数据增强参数 (Data Augmentation)
+        # ===================================================================
+        parser.add_argument('--use_aug', action='store_true', help='Enable training-time data augmentation (recommended).')
+        # 对“上半频谱”做 SpecAugment 风格遮挡（不做时间平移，避免破坏音画对齐）
+        parser.add_argument('--spec_aug', action='store_true', help='Apply SpecAugment-style masks to the spectrogram (top half) during training.')
+        parser.add_argument('--spec_num_masks', type=int, default=2, help='Number of spec masks to apply when --spec_aug is enabled.')
+        parser.add_argument('--spec_time_mask', type=float, default=0.12, help='Max fraction of width to mask (time-axis) in spectrogram region.')
+        parser.add_argument('--spec_freq_mask', type=float, default=0.18, help='Max fraction of height to mask (freq-axis) in spectrogram region.')
+        # 轻度分辨率退化（模拟转码/低清），会 resize 回原大小
+        parser.add_argument('--rz_scale', type=str, default='0.7,1.0', help='Random resize scale range (min,max) for degradation, e.g., 0.7,1.0')
         self.initialized = True
         return parser
 
