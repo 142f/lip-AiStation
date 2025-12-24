@@ -212,16 +212,19 @@ if __name__ == "__main__":
                 # 获取并打印单独的损失值和总和
                 loss_ral, loss_ce = model.get_individual_losses()
                 total_loss = model.get_loss()
+                # [新增] 实时获取当前学习率，用于验证是否在Step内保持不变
+                current_step_lr = model.optimizer.param_groups[0]['lr']
+                
                 if opt.accumulation_steps <= 1:
                     print(
-                        "Step {:>6d} | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | Time: {:>6.2f}s".format(
-                            model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
+                        "Step {:>6d} | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | LR: {:.2e} | Time: {:>6.2f}s".format(
+                            model.total_steps, loss_ral, loss_ce, total_loss, current_step_lr, elapsed_time
                         )
                     )
                 else:
                     print(
-                        "Update Step {:>5d} (Total {:>6d}) | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | Time: {:>6.2f}s".format(
-                            model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
+                        "Update Step {:>5d} (Total {:>6d}) | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | LR: {:.2e} | Time: {:>6.2f}s".format(
+                            model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, current_step_lr, elapsed_time
                         )
                     )
                 start_time = time.time()
