@@ -42,14 +42,14 @@ class LipFD(nn.Module):
 
 
 class RALoss(nn.Module):
-    def __init__(self, margin=0.25): # 设定及格线 0.25
+    def __init__(self, margin=0.15): # 设定及格线 0.15
         super(RALoss, self).__init__()
         self.margin = margin
         self.relu = nn.ReLU() # 核心：使用 ReLU 实现自动截断
 
     def forward(self, alphas_max, alphas_org):
         # 逻辑：希望 Max 至少比 Org 大 margin
-        # 如果达标：(Org + 0.25) - Max < 0 -> ReLU后为 0 -> 梯度为 0
+        # 如果达标：(Org + 0.15) - Max < 0 -> ReLU后为 0 -> 梯度为 0
         diff = (alphas_org + self.margin) - alphas_max
         
         # 计算 Loss，不建议再乘 10 了，保持数值纯粹

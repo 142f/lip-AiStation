@@ -155,7 +155,7 @@ if __name__ == "__main__":
             # 注意：PyTorch的CosineAnnealingWarmRestarts调度器会在optimizer.step()中自动更新学习率
             # 增加epoch计数器并更新学习率调度器
             model.scheduler_epoch += 1
-            model.scheduler.step(model.scheduler_epoch)
+            model.scheduler.step()
             current_lr = model.optimizer.param_groups[0]['lr']
             # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
             from datetime import timedelta

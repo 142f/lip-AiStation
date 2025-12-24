@@ -36,9 +36,8 @@ def validate(model, loader, gpu_id):
             # 优化：non_blocking=True 配合 pin_memory 加速数据传输
             img_tens = img.to(device, non_blocking=True)
             
-            # [修复核心] 你的 Dataset 现在返回的是 5D Tensor，直接整块搬运即可
-            # 这一步对应 Trainer 中的 self.crops = input[1].to(...)
-            crops_tens = crops.to(device, non_blocking=True)
+            # 处理嵌套列表的 tensor 转移
+            crops_tens = [[t.to(device, non_blocking=True) for t in sublist] for sublist in crops]
             
             features = model.get_features(img_tens).to(device, non_blocking=True)
 
