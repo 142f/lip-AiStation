@@ -150,6 +150,18 @@ if __name__ == "__main__":
         # 处理可能存在的 'model' 键
         if "model" in state_dict:
             state_dict = state_dict["model"]
+
+        # 【核心修复】去除 'module.' 和 '_orig_mod.' 前缀
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k
+            while name.startswith('module.') or name.startswith('_orig_mod.'):
+                if name.startswith('module.'):
+                    name = name[7:]
+                elif name.startswith('_orig_mod.'):
+                    name = name[10:]
+            new_state_dict[name] = v
+        state_dict = new_state_dict
         
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         print(f"Model loaded from {opt.ckpt}")

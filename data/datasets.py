@@ -8,7 +8,7 @@ import numpy as np
 
 class AVLip(Dataset):
     def __init__(self, opt):
-        assert opt.data_label in ["train", "val"]
+        assert opt.data_label in ["train", "val", "test"]
         self.data_label = opt.data_label
         self.real_list = utils.get_list(opt.real_list_path)
         self.fake_list = utils.get_list(opt.fake_list_path)
