@@ -150,21 +150,6 @@ if __name__ == "__main__":
         model.train()
         print(f"epoch: {epoch + model.step_bias}")
         
-        # 应用余弦退火学习率（如果启用）
-        if opt.cosine_annealing:
-            # 注意：PyTorch的CosineAnnealingWarmRestarts调度器会在optimizer.step()中自动更新学习率
-            # 增加epoch计数器并更新学习率调度器
-            model.scheduler_epoch += 1
-            model.scheduler.step()
-            current_lr = model.optimizer.param_groups[0]['lr']
-            # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
-            from datetime import timedelta
-            # 创建UTC+8时区
-            china_tz = timezone(timedelta(hours=8))
-            # 获取当前时间并转换为中国时区
-            current_time = datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"当前学习率: {current_lr:.2e} | 系统时间: {current_time}")
-        
         for i, (img, crops , label) in enumerate(data_loader):
             model.total_steps += 1
 
@@ -349,6 +334,21 @@ if __name__ == "__main__":
         # 4. (可选建议) 始终保存一份带优化器的 latest.pth 用于断点续训
         # 每次覆盖写入，只占一份空间，万一崩溃了可以用它恢复
         model.save_networks("latest_checkpoint.pth", save_optimizer=True)
+
+        # 应用余弦退火学习率（如果启用）
+        if opt.cosine_annealing:
+            # 注意：PyTorch的CosineAnnealingWarmRestarts调度器会在optimizer.step()中自动更新学习率
+            # 增加epoch计数器并更新学习率调度器
+            model.scheduler_epoch += 1
+            model.scheduler.step()
+            current_lr = model.optimizer.param_groups[0]['lr']
+            # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
+            from datetime import timedelta
+            # 创建UTC+8时区
+            china_tz = timezone(timedelta(hours=8))
+            # 获取当前时间并转换为中国时区
+            current_time = datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"当前学习率: {current_lr:.2e} | 系统时间: {current_time}")
         
         # 计算并打印当前epoch的总时间
         epoch_time = time.time() - epoch_start_time

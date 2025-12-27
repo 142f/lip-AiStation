@@ -412,10 +412,32 @@ def _get_backbone(
         **kwargs: Any
 ) -> ResNet:
     model = ResNet(block, layers, num_classes=2, **kwargs)
+
     if pretrained:
         state_dict = load_state_dict_from_url(model_urls[arch], progress=progress)
-        model.load_state_dict(state_dict, strict=False)
+
+        # ==========================================================
+        # ✅ 最稳加载：只加载 key 存在且 shape 完全一致的参数
+        #    - 自动跳过 fc.*（1000类 vs 2类/2816维）
+        #    - 未来改结构也不会再因为 shape mismatch 崩溃
+        # ==========================================================
+        model_dict = model.state_dict()
+        filtered = {}
+
+        for k, v in state_dict.items():
+            if k in model_dict and v.shape == model_dict[k].shape:
+                filtered[k] = v
+
+        # 用过滤后的权重更新当前模型参数
+        model_dict.update(filtered)
+        model.load_state_dict(model_dict, strict=False)
+
+        skipped = len(state_dict) - len(filtered)
+        print(f"[Backbone] Loaded pretrained params: {len(filtered)}/{len(state_dict)} "
+              f"(skipped {skipped} mismatched keys)")
+
     return model
+
 
 
 def get_backbone(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
