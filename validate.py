@@ -36,9 +36,8 @@ def validate(model, loader, gpu_id):
             # 优化：non_blocking=True 配合 pin_memory 加速数据传输
             img_tens = img.to(device, non_blocking=True)
             
-            # [修复核心] 你的 Dataset 现在返回的是 5D Tensor，直接整块搬运即可
-            # 这一步对应 Trainer 中的 self.crops = input[1].to(...)
-            crops_tens = crops.to(device, non_blocking=True)
+            # 处理嵌套列表的 tensor 转移
+            crops_tens = [[t.to(device, non_blocking=True) for t in sublist] for sublist in crops]
             
             features = model.get_features(img_tens).to(device, non_blocking=True)
 
@@ -151,6 +150,18 @@ if __name__ == "__main__":
         # 处理可能存在的 'model' 键
         if "model" in state_dict:
             state_dict = state_dict["model"]
+
+        # 【核心修复】去除 'module.' 和 '_orig_mod.' 前缀
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k
+            while name.startswith('module.') or name.startswith('_orig_mod.'):
+                if name.startswith('module.'):
+                    name = name[7:]
+                elif name.startswith('_orig_mod.'):
+                    name = name[10:]
+            new_state_dict[name] = v
+        state_dict = new_state_dict
         
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         print(f"Model loaded from {opt.ckpt}")
