@@ -60,6 +60,18 @@ class BaseOptions:
         parser.add_argument('--spec_freq_mask', type=float, default=0.18, help='Max fraction of height to mask (freq-axis) in spectrogram region.')
         # 轻度分辨率退化（模拟转码/低清），会 resize 回原大小
         parser.add_argument('--rz_scale', type=str, default='0.7,1.0', help='Random resize scale range (min,max) for degradation, e.g., 0.7,1.0')
+
+        # =========================
+        # [关键] 消融实验开关
+        # =========================
+        # 总开关：开启后强制回退到 Baseline (只保留 conv1 + 原生 CLIP)
+        parser.add_argument("--no_innov", action="store_true", help="[Ablation] Master switch: Baseline Mode")
+        # 分项开关
+        parser.add_argument("--no_modality_bias", action="store_true", help="[Ablation] Disable BERT Modality Embedding")
+        parser.add_argument("--no_attn_bias",     action="store_true", help="[Ablation] Disable Attention Bias")
+        parser.add_argument("--no_se_fusion",     action="store_true", help="[Ablation] Disable SE Fusion")
+        parser.add_argument("--no_residual_cls",  action="store_true", help="[Ablation] Disable Residual CLS")
+
         self.initialized = True
         return parser
 
@@ -88,6 +100,11 @@ class BaseOptions:
             if v != default:
                 comment = "\t[default: %s]" % str(default)
             message += "{:>25}: {:<30}{}\n".format(str(k), str(v), comment)
+        
+        # Print Env Var for verification
+        no_innov = os.environ.get("LIPFD_NO_INNOV", "Unknown")
+        message += f"{'[Env] NO_INNOV':>25}: {no_innov}\n"
+
         message += "----------------- End -------------------"
         print(message)
 
@@ -121,6 +138,15 @@ class BaseOptions:
                 opt.gpu_ids.append(id)
         if len(opt.gpu_ids) > 0:
             torch.cuda.set_device(opt.gpu_ids[0])
+
+        # =================================================================
+        # [修复方案] 将参数注入环境变量，确保 LipFD 能读到
+        # =================================================================
+        os.environ["LIPFD_NO_INNOV"]       = "1" if opt.no_innov else "0"
+        os.environ["LIPFD_NO_MODALITY_BIAS"] = "1" if opt.no_modality_bias else "0"
+        os.environ["LIPFD_NO_ATTN_BIAS"]     = "1" if opt.no_attn_bias else "0"
+        os.environ["LIPFD_NO_SE_FUSION"]     = "1" if opt.no_se_fusion else "0"
+        os.environ["LIPFD_NO_RESIDUAL_CLS"]  = "1" if opt.no_residual_cls else "0"
 
         # additional
         # opt.classes = opt.classes.split(',')
