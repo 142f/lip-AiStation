@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .clip import clip
 import os
+import sys
 import open_clip
 from .region_awareness import get_backbone, SELayerVec
 
@@ -14,16 +15,21 @@ class LipFD(nn.Module):
         self.name = name
 
         # =================================================================
-        # [配置控制] 从环境变量读取消融实验配置
+        # [配置控制] 直接从命令行参数检测消融实验配置
+        # 这样就不需要在 train.py/validate.py 中设置环境变量了
         # =================================================================
-        self.no_innov = (os.getenv("LIPFD_NO_INNOV", "0") == "1")
+        self.no_innov = "--no_innov" in sys.argv
         
+        # 打印消融状态，方便调试
         if self.no_innov:
+            print(f"[LipFD] !!! 消融实验模式开启 (Ablation Mode) !!!")
+            print(f"[LipFD] 创新模块将被物理移除，参数量应显著下降。")
             self.use_modality_bias = False
             self.use_attn_bias     = False
             self.use_se_fusion     = False
             self.use_residual_cls  = False
         else:
+            print(f"[LipFD] 完整模式开启 (Full Mode)")
             self.use_modality_bias = (os.getenv("LIPFD_NO_MODALITY_BIAS", "0") != "1")
             self.use_attn_bias     = (os.getenv("LIPFD_NO_ATTN_BIAS", "0") != "1")
             self.use_se_fusion     = (os.getenv("LIPFD_NO_SE_FUSION", "0") != "1")
@@ -38,7 +44,6 @@ class LipFD(nn.Module):
         # --- 2. 加载 CLIP / DFN 模型 ---
         if name.startswith("DFN:"):
             print(f"[LipFD] 正在加载 Apple DFN 模型: {name}")
-            # 指定 device 为 cpu，后续由 trainer 搬运
             self.encoder, _, self.preprocess = open_clip.create_model_and_transforms(
                 'ViT-L-14', pretrained='dfn2b', device='cpu'
             )
@@ -49,26 +54,38 @@ class LipFD(nn.Module):
 
         self.backbone = get_backbone(pretrained=True)
 
-        # 策略组件初始化
+        # --- 3. 策略组件初始化 (核心修改：物理隔离) ---
         if hasattr(self.encoder, 'visual') and hasattr(self.encoder.visual, 'transformer'):
             visual = self.encoder.visual
             self.vit_width = visual.transformer.width
             self.output_dim = visual.output_dim
 
-            # 策略 1: 模态偏置
-            self.modality_bias = nn.Parameter(torch.zeros(2, self.vit_width))
-            nn.init.normal_(self.modality_bias, std=0.02)
+            if not self.no_innov:
+                # 【正常模式】初始化所有创新模块参数
+                print("[LipFD] 初始化创新模块参数...")
+                
+                # 策略 1: 模态偏置
+                self.modality_bias = nn.Parameter(torch.zeros(2, self.vit_width))
+                nn.init.normal_(self.modality_bias, std=0.02)
 
-            # 策略 2: SE 融合
-            self.fusion_se = SELayerVec(self.vit_width * 2, reduction=16)
-            self.fusion_proj = nn.Linear(self.vit_width * 2, self.output_dim)
-            nn.init.normal_(self.fusion_proj.weight, std=self.vit_width ** -0.5)
+                # 策略 2: SE 融合
+                self.fusion_se = SELayerVec(self.vit_width * 2, reduction=16)
+                self.fusion_proj = nn.Linear(self.vit_width * 2, self.output_dim)
+                nn.init.normal_(self.fusion_proj.weight, std=self.vit_width ** -0.5)
 
-            # 策略 3: 残差连接
-            self.cls_residual_scale = nn.Parameter(torch.tensor(0.5))
+                # 策略 3: 残差连接
+                self.cls_residual_scale = nn.Parameter(torch.tensor(0.5))
 
-            # 策略 4: 注意力注入
-            self._build_attention_bias(visual)
+                # 策略 4: 注意力注入
+                self._build_attention_bias(visual)
+            else:
+                # 【消融模式】不初始化参数，设为 None
+                print("[LipFD] 跳过创新模块参数初始化 (节省显存/参数量)")
+                self.modality_bias = None
+                self.fusion_se = None
+                self.fusion_proj = None
+                self.cls_residual_scale = None
+                # 注意：不需要 build attention bias
 
     def _build_attention_bias(self, visual):
         patch_size = visual.conv1.kernel_size[0]
@@ -88,7 +105,8 @@ class LipFD(nn.Module):
         self.inject_layers = [0, 1, 2]
 
     def _apply_attention_bias(self, visual, device, dtype):
-        if self.use_attn_bias and hasattr(self, "attn_bias"):
+        # 只有在非消融模式且开启 attention bias 时才应用
+        if not self.no_innov and self.use_attn_bias and hasattr(self, "attn_bias"):
             bias = self.attn_bias.to(device=device, dtype=dtype)
             for i in self.inject_layers:
                 if i < len(visual.transformer.resblocks):
@@ -110,13 +128,16 @@ class LipFD(nn.Module):
             # 1. 基础下采样
             x = self.conv1(x) 
             
-            # 2. Baseline 判定
+            # 2. Baseline 判定 (消融模式直接返回)
             if self.no_innov:
+                # 确保清理掉可能存在的 attention mask (虽然理论上没初始化)
                 if hasattr(self.encoder, 'visual'):
+                     # 传入 dummy device 即可，主要为了触发清理逻辑
                     self._apply_attention_bias(self.encoder.visual, x.device, x.dtype)
                 return self.encoder.encode_image(x)
 
-            # 3. 手动前向传播 (支持消融)
+            # 3. 手动前向传播 (仅在完整模式下执行)
+            # 这里的代码只有在 no_innov=False 时才会走到，保证了安全性
             visual = self.encoder.visual
             x = x.float()
 
@@ -130,7 +151,9 @@ class LipFD(nn.Module):
             # 模态注入
             n_patches = x.shape[1] - 1
             split_idx = n_patches // 2
-            if self.use_modality_bias:
+            
+            # 安全检查：确保 parameter 存在
+            if self.use_modality_bias and self.modality_bias is not None:
                 bias_audio = self.modality_bias[0].view(1, 1, -1).float()
                 bias_video = self.modality_bias[1].view(1, 1, -1).float()
                 x[:, 1:1 + split_idx, :] = x[:, 1:1 + split_idx, :] + bias_audio
@@ -145,23 +168,17 @@ class LipFD(nn.Module):
             x = x.permute(1, 0, 2)
             out = visual.transformer(x)
             
-            # =============================================================
-            # [核心修复] 动态解包 Transformer 输出 (支持 Tensor, Tuple, Dict)
-            # =============================================================
+            # 动态解包 Transformer 输出
             if isinstance(out, torch.Tensor):
                 x = out
             elif isinstance(out, tuple) or isinstance(out, list):
-                # 针对 open_clip DFN，特征通常在 index 0 或根据特定版本在 index 1
-                # 兼容性处理：取第一个是张量的元素
                 x = out[0] if isinstance(out[0], torch.Tensor) else out[1]
             elif isinstance(out, dict):
-                # 针对 Apple DFN 或 HuggingFace 风格输出
                 if 'last_hidden_state' in out:
                     x = out['last_hidden_state']
                 elif 'x' in out:
                     x = out['x']
                 else:
-                    # 最后的兜底：取字典中的第一个张量
                     x = next(v for v in out.values() if isinstance(v, torch.Tensor))
             else:
                 raise TypeError(f"无法处理的 Transformer 输出类型: {type(out)}")
@@ -177,13 +194,14 @@ class LipFD(nn.Module):
             combined = torch.cat([feat_audio, feat_video], dim=1)
 
             # SE Fusion
-            if self.use_se_fusion:
+            if self.use_se_fusion and self.fusion_se is not None:
                 combined = self.fusion_se(combined)
             
+            # 如果 fusion_proj 为 None (消融模式)，这里会报错，但前面已经 return 了，所以安全
             features = self.fusion_proj(combined)
 
             # Residual CLS
-            if self.use_residual_cls:
+            if self.use_residual_cls and self.cls_residual_scale is not None:
                 proj_cls = cls_token_t @ visual.proj.float() if visual.proj is not None else cls_token_t
                 features = features + self.cls_residual_scale.float() * proj_cls
 
