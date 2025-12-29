@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
+import os
 from typing import Type, Any, Callable, Union, List, Optional
 from torch.nn.functional import softmax
 
@@ -209,6 +210,16 @@ class ResNet(nn.Module):
         self.fc = nn.Linear(512 * block.expansion + 768, num_classes)
 
         # ---------------------------
+        # [关键修改] 自动从环境变量读取消融配置
+        # ---------------------------
+        # 默认值为 "0" (代表启用)，如果环境变量设为 "1" 则代表禁用
+        self.with_pe = os.getenv("REGION_NO_PE", "0") != "1"
+        self.with_se = os.getenv("REGION_NO_SE", "0") != "1"
+
+        if not self.with_pe or not self.with_se:
+            print(f"[RegionAwareness] 消融实验配置生效: PE={self.with_pe}, SE={self.with_se}")
+
+        # ---------------------------
         # 新增：位置编码与 SE 向量模块的初始化
         # 说明：
         #  - 默认假设 num_scales = 3, num_regions = 5（与数据预处理一致）
@@ -218,12 +229,22 @@ class ResNet(nn.Module):
         self.num_scales = 3
         self.num_regions = 5
         feat_dim = 512 * block.expansion + 768
-        # 可学习的位置编码，形状为 (S*R, feat_dim)
-        self.positional_encoding = nn.Parameter(
-            torch.randn(self.num_scales * self.num_regions, feat_dim)
-        )
-        # 向量版 SE
-        self.se_layer = SELayerVec(feat_dim, reduction=16)
+        
+        # [控制] 是否初始化位置编码
+        if self.with_pe:
+            # 可学习的位置编码，形状为 (S*R, feat_dim)
+            self.positional_encoding = nn.Parameter(
+                torch.randn(self.num_scales * self.num_regions, feat_dim)
+            )
+        else:
+            self.positional_encoding = None
+        
+        # [控制] 是否初始化 SE 模块
+        if self.with_se:
+            # 向量版 SE
+            self.se_layer = SELayerVec(feat_dim, reduction=16)
+        else:
+            self.se_layer = None
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -322,25 +343,25 @@ class ResNet(nn.Module):
         # ---------------------------
         feat_g = feature.unsqueeze(0).unsqueeze(0).expand(num_scales, num_regions, batch_size, feature.shape[1])
         feat_cat = torch.cat([f, feat_g], dim=3)  # (S, R, B, feat_cat)
-
-        # ---------------------------
-        # 新增：Step 4.5 — 添加位置编码（可学习）
-        # 中文注释：为每个尺度-区域位置添加可学习的偏置，增强位置信息感知
-        # ---------------------------
-        # positional_encoding 存储为 (S*R, feat_dim)，需要 reshape 并 broadcast 到 (S, R, B, feat_dim)
         feat_dim = feat_cat.shape[-1]
-        # 注意：如果实际训练时 num_scales 或 num_regions 与初始化不一致，需要调整 self.positional_encoding 的 shape
-        pos_enc = self.positional_encoding[:num_scales * num_regions]  # (S*R, feat_dim)
-        pos_enc = pos_enc.view(num_scales, num_regions, 1, feat_dim).expand(-1, -1, batch_size, -1)
-        feat_cat = feat_cat + pos_enc  # (S, R, B, feat_dim)
 
         # ---------------------------
-        # 新增：Step 4.6 — 使用向量版 SE 对展平后的通道进行重标定
-        # 中文注释：先将 (S,R,B,C) 展平为 (N, C)，对每个样本的通道做自适应缩放，再恢复形状
+        # [修改] Step 4.5 — 条件性添加位置编码
         # ---------------------------
-        feat_cat_flat = feat_cat.contiguous().view(-1, feat_dim)  # (S*R*B, feat_dim)
-        feat_cat_flat = self.se_layer(feat_cat_flat)              # (S*R*B, feat_dim)
-        feat_cat = feat_cat_flat.view(num_scales, num_regions, batch_size, feat_dim)
+        if self.with_pe and self.positional_encoding is not None:
+            # 只有开启且参数存在时才执行
+            pos_enc = self.positional_encoding[:num_scales * num_regions]
+            pos_enc = pos_enc.view(num_scales, num_regions, 1, feat_dim).expand(-1, -1, batch_size, -1)
+            feat_cat = feat_cat + pos_enc
+
+        # ---------------------------
+        # [修改] Step 4.6 — 条件性使用向量版 SE
+        # ---------------------------
+        if self.with_se and self.se_layer is not None:
+            # 只有开启且模块存在时才执行
+            feat_cat_flat = feat_cat.contiguous().view(-1, feat_dim)
+            feat_cat_flat = self.se_layer(feat_cat_flat)
+            feat_cat = feat_cat_flat.view(num_scales, num_regions, batch_size, feat_dim)
 
         # ---------------------------
         # Step 5: 批量计算权重（支持分块防止显存溢出）

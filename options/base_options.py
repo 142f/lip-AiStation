@@ -72,6 +72,13 @@ class BaseOptions:
         parser.add_argument("--no_se_fusion",     action="store_true", help="[Ablation] Disable SE Fusion")
         parser.add_argument("--no_residual_cls",  action="store_true", help="[Ablation] Disable Residual CLS")
 
+        # =========================
+        # [新增] Region Backbone 消融开关 (仅控制 region_awareness.py)
+        # =========================
+        parser.add_argument("--no_region_innov", action="store_true", help="[Region] Master switch: Disable both PE and SE")
+        parser.add_argument("--no_region_pe", action="store_true", help="[Region] Disable Positional Encoding in region_awareness.py")
+        parser.add_argument("--no_region_se", action="store_true", help="[Region] Disable SE Attention in region_awareness.py")
+
         self.initialized = True
         return parser
 
@@ -147,6 +154,9 @@ class BaseOptions:
         os.environ["LIPFD_NO_ATTN_BIAS"]     = "1" if opt.no_attn_bias else "0"
         os.environ["LIPFD_NO_SE_FUSION"]     = "1" if opt.no_se_fusion else "0"
         os.environ["LIPFD_NO_RESIDUAL_CLS"]  = "1" if opt.no_residual_cls else "0"
+
+        os.environ["REGION_NO_PE"] = "1" if (opt.no_region_pe or opt.no_region_innov) else "0"
+        os.environ["REGION_NO_SE"] = "1" if (opt.no_region_se or opt.no_region_innov) else "0"
 
         # additional
         # opt.classes = opt.classes.split(',')
