@@ -203,10 +203,8 @@ class ResNet(nn.Module):
                                        dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         ## 融合了局部细节特征与全局语义特征
-        self.get_weight = nn.Sequential(
-            nn.Linear(512 * block.expansion + 768, 1),  # TODO: 768 is the length of global feature
-            nn.Sigmoid()
-        )
+        # [修改] 去掉 Sigmoid，直接输出 logits，配合后续 softmax 使用
+        self.get_weight = nn.Linear(512 * block.expansion + 768, 1)
         self.fc = nn.Linear(512 * block.expansion + 768, num_classes)
 
         # ---------------------------
@@ -230,21 +228,15 @@ class ResNet(nn.Module):
         self.num_regions = 5
         feat_dim = 512 * block.expansion + 768
         
-        # [控制] 是否初始化位置编码
-        if self.with_pe:
-            # 可学习的位置编码，形状为 (S*R, feat_dim)
-            self.positional_encoding = nn.Parameter(
-                torch.randn(self.num_scales * self.num_regions, feat_dim)
-            )
-        else:
-            self.positional_encoding = None
+        # [控制] 始终初始化位置编码与门控系数（保证模型结构一致，避免加载权重报错）
+        # 即使 with_pe=False，这些参数也会存在（但不参与计算/更新）
+        self.positional_encoding = nn.Parameter(
+            torch.zeros(self.num_scales * self.num_regions, feat_dim)
+        )
+        self.pe_alpha = nn.Parameter(torch.tensor(0.0))
         
-        # [控制] 是否初始化 SE 模块
-        if self.with_se:
-            # 向量版 SE
-            self.se_layer = SELayerVec(feat_dim, reduction=16)
-        else:
-            self.se_layer = None
+        # [控制] 始终初始化 SE 模块（保证模型结构一致）
+        self.se_layer = SELayerVec(feat_dim, reduction=16)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -352,13 +344,15 @@ class ResNet(nn.Module):
             # 只有开启且参数存在时才执行
             pos_enc = self.positional_encoding[:num_scales * num_regions]
             pos_enc = pos_enc.view(num_scales, num_regions, 1, feat_dim).expand(-1, -1, batch_size, -1)
-            feat_cat = feat_cat + pos_enc
+            # ✅ 原来：feat_cat = feat_cat + pos_enc   （强行加进去，可能伤模型）
+            # ✅ 现在：默认 alpha=0 -> 等价于不加；只有有用时才学出来
+            feat_cat = feat_cat + self.pe_alpha * pos_enc
 
         # ---------------------------
         # [修改] Step 4.6 — 条件性使用向量版 SE
         # ---------------------------
-        if self.with_se and self.se_layer is not None:
-            # 只有开启且模块存在时才执行
+        if self.with_se:
+            # 只有开启时才执行
             feat_cat_flat = feat_cat.contiguous().view(-1, feat_dim)
             feat_cat_flat = self.se_layer(feat_cat_flat)
             feat_cat = feat_cat_flat.view(num_scales, num_regions, batch_size, feat_dim)
