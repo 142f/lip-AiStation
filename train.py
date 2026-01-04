@@ -2,7 +2,7 @@ import time
 import sys
 import os
 import torch  # 需要显式导入 torch，否则 clip_grad_norm_ 会报错
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from validate import validate
 from data import create_dataloader
 from trainer.trainer import Trainer
@@ -144,9 +144,17 @@ if __name__ == "__main__":
     # 整个实验的总开始时间
     experiment_start_time = time.time()
     start_time = time.time()
+
+
+
     for epoch in range(opt.epoch):
         # 记录每个epoch的开始时间
         epoch_start_time = time.time()
+        
+        # [新增] 打印当前 Epoch 开始时的 LR (验证 Warmup 是否生效)
+        if model.optimizer is not None:
+            print(f"[LR-START] epoch {epoch+1}: {model.optimizer.param_groups[0]['lr']:.6e}")
+
         model.train()
         print(f"epoch: {epoch + model.step_bias}")
         
@@ -335,20 +343,25 @@ if __name__ == "__main__":
         # 每次覆盖写入，只占一份空间，万一崩溃了可以用它恢复
         model.save_networks("latest_checkpoint.pth", save_optimizer=True)
 
-        # 应用余弦退火学习率（如果启用）
-        if opt.cosine_annealing:
-            # 注意：PyTorch的CosineAnnealingWarmRestarts调度器会在optimizer.step()中自动更新学习率
-            # 增加epoch计数器并更新学习率调度器
-            model.scheduler_epoch += 1
+        # ====== Epoch end ======
+        # 先记录“本 epoch 训练过程中用的 lr”
+        lr_this_epoch = model.optimizer.param_groups[0]['lr']
+
+        if (
+            opt.cosine_annealing
+            and getattr(model, "scheduler", None) is not None
+            and epoch < opt.epoch - 1
+        ):
             model.scheduler.step()
-            current_lr = model.optimizer.param_groups[0]['lr']
-            # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
-            from datetime import timedelta
-            # 创建UTC+8时区
-            china_tz = timezone(timedelta(hours=8))
-            # 获取当前时间并转换为中国时区
-            current_time = datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"当前学习率: {current_lr:.2e} | 系统时间: {current_time}")
+
+        # step 后的是“下一 epoch 会用的 lr”
+        lr_next_epoch = model.optimizer.param_groups[0]['lr']
+
+        # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
+        china_tz = timezone(timedelta(hours=8))
+        current_time = datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"[LR-END] epoch {epoch+1}: {lr_this_epoch:.2e} | [LR-NEXT] epoch {epoch+2}: {lr_next_epoch:.2e} | 系统时间: {current_time}")
         
         # 计算并打印当前epoch的总时间
         epoch_time = time.time() - epoch_start_time

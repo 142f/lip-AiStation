@@ -29,6 +29,10 @@ class TrainOptions(BaseOptions):
         # [新增] 预热参数 Warmup
         parser.add_argument('--warmup_epochs', type=int, default=5, help='Number of warmup epochs before cosine annealing.')
 
+        # [新增] 余弦退火（不重启）下的最小学习率
+        # 建议不要太低（例如 1e-8/1e-7），否则后期几乎不更新。
+        parser.add_argument('--eta_min', type=float, default=1e-6, help='Minimum learning rate for cosine annealing (no restart).')
+
         # ===================================================================
         # 3. 检查点与日志 (Checkpoints and Logging)
         # ===================================================================
