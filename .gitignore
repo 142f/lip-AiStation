@@ -5,9 +5,12 @@
 *.pyc
 __pycache__/
 teee.py
-preprocess-val-test.py
 auto_retry_download.bat
 auto_retry_download_deepfakes.bat
+
+mse.py
+tt.py
+preprocess-val-test.py
 
 # 虚拟环境
 venv/

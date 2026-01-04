@@ -128,7 +128,25 @@ if __name__ == "__main__":
     best_acc = 0.0
     best_ap = 0.0
     best_auc = 0.0
+    best_f1  = 0.0
     best_epoch = 0
+
+    LOG_W = 100
+
+    def rule_epoch():
+        print("=" * LOG_W)   # epoch之间
+
+    def rule_inner():
+        print("-" * LOG_W)   # epoch内部
+
+    def fmt_metric4(auc, ap, acc, f1) -> str:
+        return f"AUC: {auc:.4f} | AP : {ap:.4f} | ACC: {acc:.4f} | F1 : {f1:.4f}"
+
+    def fmt_metric6(auc, ap, acc, f1, fpr, fnr) -> str:
+        return (
+            f"AUC: {auc:.4f} | AP : {ap:.4f} | ACC: {acc:.4f} | F1 : {f1:.4f} | "
+            f"FPR: {fpr:.4f} | FNR: {fnr:.4f}"
+        )
 
     # [新增] 初始化分析器 (如果启用)
     prof = None
@@ -145,18 +163,18 @@ if __name__ == "__main__":
     experiment_start_time = time.time()
     start_time = time.time()
 
-
-
+    # 训练循环
     for epoch in range(opt.epoch):
-        # 记录每个epoch的开始时间
         epoch_start_time = time.time()
-        
-        # [新增] 打印当前 Epoch 开始时的 LR (验证 Warmup 是否生效)
-        if model.optimizer is not None:
-            print(f"[LR-START] epoch {epoch+1}: {model.optimizer.param_groups[0]['lr']:.6e}")
+        epoch_id = epoch + model.step_bias
+        lr_now = model.optimizer.param_groups[0]['lr'] if model.optimizer is not None else 0.0
+
+        print("")
+        rule_epoch()
+        print(f"[EPOCH-START] epoch {epoch_id:>3} | LR: {lr_now:.6e}")
+        rule_inner()   # 关键：EPOCH-START 后进入 epoch 内部，用 '-'
 
         model.train()
-        print(f"epoch: {epoch + model.step_bias}")
         
         for i, (img, crops , label) in enumerate(data_loader):
             model.total_steps += 1
@@ -273,22 +291,16 @@ if __name__ == "__main__":
         
         # 如果 EMA 存在，优先使用 EMA 模型（它的泛化能力更强）
         if hasattr(model, 'model_ema') and model.model_ema is not None:
-            # print("Using EMA model for validation...") # 可选打印
-            val_model = model.model_ema.module
-            
-        # 传入选定的 val_model
+            val_model = model.model_ema.module if hasattr(model.model_ema, 'module') else model.model_ema
+        
+        current_epoch = epoch_id  # 修复：current_epoch 赋值提前
         ap, fpr, fnr, acc, auc, f1 = validate(val_model, val_loader, opt.gpu_ids)
-        print("-" * 100)
-        print(
-            "(Val @ Epoch {:>3}) AUC: {:.4f} | AP: {:.4f} | ACC: {:.4f} | F1: {:.4f} | FPR: {:.4f} | FNR: {:.4f}".format(
-                epoch + model.step_bias, auc, ap, acc, f1, fpr, fnr
-            )
-        )
-        print("-" * 100)
+        rule_inner()
+        print(f"(Val@E {current_epoch:>3}) {fmt_metric6(auc, ap, acc, f1, fpr, fnr)}")
+        rule_inner()
 
         # 只在验证性能超过历史最佳时才保存模型
         # 保存准则按优先级排序：AUC > AP > ACC
-        current_epoch = epoch + model.step_bias
         is_better = False
         # 优先比较 AUC
         if auc > best_auc:
@@ -305,7 +317,7 @@ if __name__ == "__main__":
         # ====================================================================
         # [优化] 模型保存策略：只留最佳 + 最新3个 (且只存权重)
         # ====================================================================
-        current_epoch_num = current_epoch
+        current_epoch_num = epoch_id
         
         # [重要修复] 先删除旧文件，再保存新文件，避免磁盘空间不足导致的数据丢失
         # 1. 先删除3个Epoch之前的模型（释放空间）
@@ -330,16 +342,15 @@ if __name__ == "__main__":
             best_acc = acc
             best_ap = ap
             best_auc = auc
+            best_f1  = f1
             best_epoch = current_epoch
 
-            print(f" [Result] 发现新的最佳模型! (Epoch {current_epoch})")
-            print(f" [Result] 性能指标: AUC={best_auc:.4f} | AP={best_ap:.4f} | ACC={best_acc:.4f}")
+            print(f"[Result] 发现新的最佳模型! (Epoch {current_epoch})")
+            print(f"[Result] 最佳指标: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch}")
             # 只存权重，不存优化器
             model.save_networks("best_model.pth", save_optimizer=False)
         else:
-            print(f" [Status] 未破纪录 (最佳: AUC={best_auc:.4f} | AP={best_ap:.4f} | ACC={best_acc:.4f} @ Epoch {best_epoch})")
-        
-        # 4. (可选建议) 始终保存一份带优化器的 latest.pth 用于断点续训
+            print(f"[Status] 未破纪录 (最佳: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch})")
         # 每次覆盖写入，只占一份空间，万一崩溃了可以用它恢复
         model.save_networks("latest_checkpoint.pth", save_optimizer=True)
 
@@ -366,7 +377,8 @@ if __name__ == "__main__":
         # 计算并打印当前epoch的总时间
         epoch_time = time.time() - epoch_start_time
         print(f"Epoch {epoch + model.step_bias} 总耗时: {epoch_time:.2f}秒")
-
+        rule_epoch()
+        print("")
     # 计算整个实验的总时间
     experiment_total_time = time.time() - experiment_start_time
     hours, remainder = divmod(experiment_total_time, 3600)
@@ -379,6 +391,7 @@ if __name__ == "__main__":
     print(f"   ACC(acc): {best_acc:.4f}")
     print(f"   所在轮次: {best_epoch}")
     print(f"   最佳模型文件: best_model.pth")
+    print(f"   F1(f1): {best_f1:.4f}")
     print(f"   整个实验总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
     
     # 关闭日志文件
