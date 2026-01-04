@@ -31,15 +31,31 @@ def validate(model, loader, gpu_id):
     y_true, y_pred = [], []
     
     with torch.no_grad():
+        # --- [GPU 归一化准备] ---
+        # 移到循环外，避免每个 batch 重复创建 tensor，减少 GPU 开销
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        
+        def process(tensor):
+            # [鲁棒性修复] 增加 dtype 检查
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.float().div_(255.0)
+            return (tensor - mean) / std
+
         # 使用 tqdm 包装数据加载器
         for img, crops, label in tqdm(loader, desc="Validation Progress", leave=False):
             # 优化：non_blocking=True 配合 pin_memory 加速数据传输
+            # 此时 img 是 uint8，传输量小
             img_tens = img.to(device, non_blocking=True)
             
             # 处理嵌套列表的 tensor 转移
             crops_tens = [[t.to(device, non_blocking=True) for t in sublist] for sublist in crops]
             
-            features = model.get_features(img_tens).to(device, non_blocking=True)
+            # 应用归一化
+            img_tens = process(img_tens)
+            crops_tens = [[process(t) for t in sublist] for sublist in crops_tens]
+            
+            features = model.get_features(img_tens)
 
             # 获取预测概率
             # --- 修改开始 ---

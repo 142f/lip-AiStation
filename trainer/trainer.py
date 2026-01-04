@@ -140,9 +140,33 @@ class Trainer(nn.Module):
             self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
-        self.input = input[0].to(self.device)
-        self.crops = [[t.to(self.device) for t in sublist] for sublist in input[1]]
-        self.label = input[2].to(self.device).long()
+        # 1. 传输到 GPU (uint8)
+        self.input = input[0].to(self.device, non_blocking=True)
+        
+        # [鲁棒性修复] 增加 dtype 检查，防止重复归一化
+        if self.input.dtype == torch.uint8:
+             self.input = self.input.float().div_(255.0)
+
+        # 2. GPU 上执行归一化
+        if not hasattr(self, 'mean_tensor'):
+             self.mean_tensor = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
+             self.std_tensor = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
+
+        self.input = (self.input - self.mean_tensor) / self.std_tensor
+
+        # 处理 crops
+        self.crops = []
+        for sublist in input[1]:
+            new_sublist = []
+            for t in sublist:
+                t = t.to(self.device, non_blocking=True)
+                if t.dtype == torch.uint8:
+                    t = t.float().div_(255.0)
+                t = (t - self.mean_tensor) / self.std_tensor
+                new_sublist.append(t)
+            self.crops.append(new_sublist)
+
+        self.label = input[2].to(self.device, non_blocking=True).long()
 
     def forward(self):
         # -------------------------------------------------------
@@ -231,7 +255,7 @@ class Trainer(nn.Module):
             #     self.scheduler.step()
 
     def get_features(self):
-        self.features = self.model.get_features(self.input).to(self.device)
+        self.features = self.model.get_features(self.input)
 
     def eval(self):
         self.model.eval()

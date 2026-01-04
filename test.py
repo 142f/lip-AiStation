@@ -59,6 +59,17 @@ def test(model, loader, gpu_id):
     print("\n" + "="*20 + " 开始测试循环 (Testing Loop) " + "="*20)
     
     with torch.no_grad():
+        # --- [GPU 归一化准备] ---
+        # 移到循环外，避免每个 batch 重复创建 tensor
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        
+        def process(tensor):
+            # [鲁棒性修复] 增加 dtype 检查
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.float().div_(255.0)
+            return (tensor - mean) / std
+
         for i, (img, crops, label) in enumerate(tqdm(loader, desc="Testing", leave=True)):
             # 1. 处理 img
             img_tens = img.to(device, non_blocking=True)
@@ -67,6 +78,10 @@ def test(model, loader, gpu_id):
             # collate_fn 已将其转换为 [3尺度][5区域][B, C, H, W] 结构
             # 将每个 Tensor 移动到 device
             crops_tens = [[t.to(device, non_blocking=True) for t in scale_crops] for scale_crops in crops]
+            
+            # 应用归一化
+            img_tens = process(img_tens)
+            crops_tens = [[process(t) for t in sublist] for sublist in crops_tens]
             
             # 3. 模型推理
             # 注意：get_features 返回的 tensor 已经在 model 所在的 device 上

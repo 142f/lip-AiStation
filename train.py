@@ -190,11 +190,11 @@ if __name__ == "__main__":
             if opt.profile:
                 with record_function("## Forward & Optimize ##"):
                     model.forward()
-                    loss = model.get_loss()
+                    # loss = model.get_loss()
                     model.optimize_parameters()
             else:
                 model.forward()
-                loss = model.get_loss()
+                # loss = model.get_loss()
                 model.optimize_parameters()
 
             # [Profiler] 更新分析器状态

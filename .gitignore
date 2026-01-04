@@ -11,6 +11,8 @@ auto_retry_download_deepfakes.bat
 mse.py
 tt.py
 preprocess-val-test.py
+README.assets
+cpu-diff.py
 
 # 虚拟环境
 venv/
