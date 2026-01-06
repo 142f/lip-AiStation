@@ -140,33 +140,41 @@ class Trainer(nn.Module):
             self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
-        # 1. 传输到 GPU (uint8)
-        self.input = input[0].to(self.device, non_blocking=True)
+        # 1. 接收数据
+        x = input[0].to(self.device, non_blocking=True)
+        self.label = input[2].to(self.device, non_blocking=True).long()
         
-        # [鲁棒性修复] 增加 dtype 检查，防止重复归一化
-        if self.input.dtype == torch.uint8:
-             self.input = self.input.float().div_(255.0)
-
-        # 2. GPU 上执行归一化
+        # 2. 初始化归一化参数
         if not hasattr(self, 'mean_tensor'):
              self.mean_tensor = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
              self.std_tensor = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
 
-        self.input = (self.input - self.mean_tensor) / self.std_tensor
+        # 3. 处理 Global Input - 在GPU上进行归一化以提高效率
+        # 如果是uint8，先转换为float32并除以255
+        if x.dtype == torch.uint8:
+            x = x.float().div_(255.0)
+        # 如果已经是float32(0-1)，不需要额外处理
+        
+        # 保存原始数据（用于可能的调试）
+        self.input_raw = x
+        
+        # 归一化
+        self.input = x.sub_(self.mean_tensor).div_(self.std_tensor)
 
-        # 处理 crops
+        # 4. 处理 Crops
+        # input[1] 是 list of list of tensors
         self.crops = []
-        for sublist in input[1]:
-            new_sublist = []
-            for t in sublist:
-                t = t.to(self.device, non_blocking=True)
-                if t.dtype == torch.uint8:
-                    t = t.float().div_(255.0)
-                t = (t - self.mean_tensor) / self.std_tensor
-                new_sublist.append(t)
-            self.crops.append(new_sublist)
-
-        self.label = input[2].to(self.device, non_blocking=True).long()
+        
+        raw_crops = input[1] # List[List[Tensor]]
+        
+        for scale_list in raw_crops:
+            processed_scale = []
+            for crop_batch in scale_list:
+                # crop_batch is (B, 3, 224, 224) Float Normalized (from CPU)
+                c = crop_batch.to(self.device, non_blocking=True)
+                # [Hybrid Strategy] Crops are already normalized on CPU to preserve precision
+                processed_scale.append(c)
+            self.crops.append(processed_scale)
 
     def forward(self):
         # -------------------------------------------------------

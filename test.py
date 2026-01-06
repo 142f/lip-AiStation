@@ -70,18 +70,27 @@ def test(model, loader, gpu_id):
                 tensor = tensor.float().div_(255.0)
             return (tensor - mean) / std
 
-        for i, (img, crops, label) in enumerate(tqdm(loader, desc="Testing", leave=True)):
-            # 1. 处理 img
-            img_tens = img.to(device, non_blocking=True)
+        for i, (img, raw_crops, label) in enumerate(tqdm(loader, desc="Testing", leave=True)):
+            # 1. 接收数据
+            img = img.to(device, non_blocking=True)
             
-            # 2. 处理 crops (List[List[Tensor]])
-            # collate_fn 已将其转换为 [3尺度][5区域][B, C, H, W] 结构
-            # 将每个 Tensor 移动到 device
-            crops_tens = [[t.to(device, non_blocking=True) for t in scale_crops] for scale_crops in crops]
+            # 2. Global Input Normalization (Sync with validate.py)
+            # dataset returns [0, 1] float tensor for img
+            if img.dtype == torch.uint8:
+                img = img.float().div_(255.0)
+            img_tens = img.sub(mean).div(std)
             
-            # 应用归一化
-            img_tens = process(img_tens)
-            crops_tens = [[process(t) for t in sublist] for sublist in crops_tens]
+            # 3. Process Crops
+            # raw_crops is List[List[Tensor]] from custom_collate_fn
+            # Dataset has already normalized the crops!
+            crops_tens = []
+            for scale_list in raw_crops:
+                processed_scale = []
+                for crop_batch in scale_list:
+                    # 直接移至 GPU 即可，不要再次归一化
+                    c = crop_batch.to(device, non_blocking=True)
+                    processed_scale.append(c)
+                crops_tens.append(processed_scale)
             
             # 3. 模型推理
             # 注意：get_features 返回的 tensor 已经在 model 所在的 device 上

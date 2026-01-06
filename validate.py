@@ -43,17 +43,28 @@ def validate(model, loader, gpu_id):
             return (tensor - mean) / std
 
         # 使用 tqdm 包装数据加载器
-        for img, crops, label in tqdm(loader, desc="Validation Progress", leave=False):
-            # 优化：non_blocking=True 配合 pin_memory 加速数据传输
-            # 此时 img 是 uint8，传输量小
-            img_tens = img.to(device, non_blocking=True)
+        for img, raw_crops, label in tqdm(loader, desc="Validation Progress", leave=False):
+            # 1. 接收数据
+            img = img.to(device, non_blocking=True)
             
-            # 处理嵌套列表的 tensor 转移
-            crops_tens = [[t.to(device, non_blocking=True) for t in sublist] for sublist in crops]
+            # 2. Global Input Normalization - 与trainer.py保持一致
+            # 健壮的归一化处理，无论输入是uint8还是float32都能正确处理
+            if img.dtype == torch.uint8:
+                img = img.float().div_(255.0)   # ✅ 必须有
+            # 如果已经是float32(0-1)，不需要额外处理
             
-            # 应用归一化
-            img_tens = process(img_tens)
-            crops_tens = [[process(t) for t in sublist] for sublist in crops_tens]
+            img_tens = img.sub(mean).div(std)
+            
+            # 3. Process Crops
+            # raw_crops is List[List[Tensor]] from DataLoader
+            crops_tens = []
+            for scale_list in raw_crops:
+                processed_scale = []
+                for crop_batch in scale_list:
+                    c = crop_batch.to(device, non_blocking=True)
+                    # [Hybrid Strategy] Crops are already normalized on CPU
+                    processed_scale.append(c)
+                crops_tens.append(processed_scale)
             
             features = model.get_features(img_tens)
 
