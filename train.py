@@ -1,0 +1,399 @@
+import time
+import sys
+import os
+import torch  # 需要显式导入 torch，否则 clip_grad_norm_ 会报错
+from datetime import datetime, timezone, timedelta
+from validate import validate
+from data import create_dataloader
+from trainer.trainer import Trainer
+from options.train_options import TrainOptions
+from utils import set_seed
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+
+# 定义分析器设置
+def get_expert_profiler(log_dir="./logs/profiler_results"):
+    # wait: 跳过前几轮（等待系统稳定）
+    # warmup: 预热轮次（让 CUDA 算子进入状态）
+    # active: 真正记录的轮次
+    # repeat: 重复记录的次数
+    schedule = torch.profiler.schedule(wait=2, warmup=3, active=5, repeat=1)
+    
+    return torch.profiler.profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA,
+        ],
+        schedule=schedule,
+        on_trace_ready=tensorboard_trace_handler(log_dir), # 导出 TensorBoard 格式
+        record_shapes=True,        # 记录 Tensor 形状，方便排查由于维度不匹配导致的性能问题
+        profile_memory=True,       # 记录显存分配，排查 OOM 风险
+        with_stack=True            # 记录 Python 调用栈，直接定位到哪一行代码慢
+    )
+
+
+
+# 添加日志类，用于同时输出到控制台和文件
+class Logger(object):
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log = open(log_file, "w", encoding="utf-8")
+        
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
+
+
+def get_val_opt(opt): # [修改] 传入 opt 参数，避免依赖全局变量导致可能的 NameError
+    val_opt = TrainOptions().parse(print_options=False)
+    val_opt.isTrain = False
+    val_opt.data_label = "val"
+    # val_opt.real_list_path = r"/3240608030/val/0_real"
+    # val_opt.fake_list_path = r"/3240608030/val/1_fake"
+
+    # 使用命令行参数控制验证集路径，如果没有提供则使用默认路径
+    val_opt.real_list_path = opt.val_real_list_path
+    val_opt.fake_list_path = opt.val_fake_list_path
+    return val_opt
+
+def format_options(opt, parser):
+    """格式化选项信息，与BaseOptions.print_options方法保持一致"""
+    message = ""
+    message += "----------------- Options ---------------\n"
+    for k, v in sorted(vars(opt).items()):
+        comment = ""
+        try:
+            default = parser.get_default(k)
+            if v != default:
+                comment = "\t[default: %s]" % str(default)
+        except Exception:
+            pass
+        message += "{:>25}: {:<30}{}\n".format(str(k), str(v), comment)
+    message += "----------------- End -------------------"
+    return message
+
+if __name__ == "__main__":
+    train_options = TrainOptions()
+    opt = train_options.parse(print_options=False)  # 禁用自动打印选项
+    set_seed(opt.seed)
+    torch.backends.cudnn.benchmark = True 
+    val_opt = get_val_opt(opt) # [修改] 传入 opt
+    model = Trainer(opt)
+
+    # [新增] 如果 PyTorch 版本 >= 2.0
+    if int(torch.__version__.split('.')[0]) >= 2:
+        print("Compiling model with torch.compile...")
+        # mode 可以选 'default', 'reduce-overhead', 'max-autotune' (最慢编译，最快运行)
+        model.model = torch.compile(model.model, mode='default') 
+
+    # 创建日志目录和文件（优化：放在项目根路径下的logs文件夹）
+    log_dir = os.path.join("./logs", opt.name)
+    os.makedirs(log_dir, exist_ok=True)
+    # 优化日志文件名格式为{实验名称}_{年月日}_{时分秒}.log
+    log_file = os.path.join(log_dir, f"model_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    
+    # 重定向标准输出到日志文件和控制台
+    logger = Logger(log_file)
+    sys.stdout = logger
+
+    # 将训练选项写入日志文件
+    print(format_options(opt, train_options.parser))
+    print("\n")
+
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.model.parameters())
+    trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    print(f"模型总参数量: {total_params:,}")
+    print(f"可训练参数量: {trainable_params:,}")
+    print("\n")
+    
+    # 显示是否使用混合精度训练
+    print(f"使用混合精度训练: {'是' if model.use_amp else '否'}")
+    print("\n")
+
+    data_loader = create_dataloader(opt)
+    val_loader = create_dataloader(val_opt)
+
+    print("Length of data loader: %d" % (len(data_loader)))
+    print("Length of val  loader: %d" % (len(val_loader)))
+
+    # 初始化最佳性能跟踪变量
+    best_acc = 0.0
+    best_ap = 0.0
+    best_auc = 0.0
+    best_f1  = 0.0
+    best_epoch = 0
+
+    LOG_W = 100
+
+    def rule_epoch():
+        print("=" * LOG_W)   # epoch之间
+
+    def rule_inner():
+        print("-" * LOG_W)   # epoch内部
+
+    def fmt_metric4(auc, ap, acc, f1) -> str:
+        return f"AUC: {auc:.4f} | AP : {ap:.4f} | ACC: {acc:.4f} | F1 : {f1:.4f}"
+
+    def fmt_metric6(auc, ap, acc, f1, fpr, fnr) -> str:
+        return (
+            f"AUC: {auc:.4f} | AP : {ap:.4f} | ACC: {acc:.4f} | F1 : {f1:.4f} | "
+            f"FPR: {fpr:.4f} | FNR: {fnr:.4f}"
+        )
+
+    # [新增] 初始化分析器 (如果启用)
+    prof = None
+    if opt.profile:
+        print("\n" + "="*50)
+        print(" [Profiler] 性能分析模式已启动")
+        print(" [Profiler] 将运行 10-15 个 Step 后自动停止并生成报告")
+        print(" [Profiler] 请勿用于正式训练！")
+        print("="*50 + "\n")
+        prof = get_expert_profiler(log_dir=os.path.join(log_dir, "trace"))
+        prof.start()
+
+    # 整个实验的总开始时间
+    experiment_start_time = time.time()
+    start_time = time.time()
+
+    # 训练循环
+    for epoch in range(opt.epoch):
+        epoch_start_time = time.time()
+        epoch_id = epoch + model.step_bias
+        lr_now = model.optimizer.param_groups[0]['lr'] if model.optimizer is not None else 0.0
+
+        print("")
+        rule_epoch()
+        print(f"[EPOCH-START] epoch {epoch_id:>3} | LR: {lr_now:.6e}")
+        rule_inner()   # 关键：EPOCH-START 后进入 epoch 内部，用 '-'
+
+        model.train()
+        
+        for i, (img, crops , label) in enumerate(data_loader):
+            model.total_steps += 1
+
+            # [Profiler] 包装数据加载
+            if opt.profile:
+                with record_function("## Data Transfer ##"):
+                    model.set_input((img, crops , label))
+            else:
+                model.set_input((img, crops , label))
+
+            # [Profiler] 包装前向与优化
+            if opt.profile:
+                with record_function("## Forward & Optimize ##"):
+                    model.forward()
+                    # loss = model.get_loss()
+                    model.optimize_parameters()
+            else:
+                model.forward()
+                # loss = model.get_loss()
+                model.optimize_parameters()
+
+            # [Profiler] 更新分析器状态
+            if opt.profile and prof is not None:
+                prof.step()
+                # 当分析器完成所有计划轮次后停止 (2 wait + 3 warmup + 5 active = 10 steps)
+                if i >= 12: 
+                    break
+
+            # 修改损失打印条件，使其与参数更新同步
+            # 如果不使用梯度累积，则每次迭代都打印
+            # 如果使用梯度累积，则只在完成一次参数更新后打印
+            should_print_loss = False
+            if opt.accumulation_steps <= 1:
+                # 不使用梯度累积，按照原来的频率打印
+                should_print_loss = (model.total_steps % opt.loss_freq == 0)
+            else:
+                # 使用梯度累积，按照参数更新频率打印
+                # 只有当完成一次完整的梯度累积周期时才打印
+                log_freq = max(1, opt.loss_freq // opt.accumulation_steps)
+                should_print_loss = (model.update_steps > 0 and model.update_steps % log_freq == 0 and model.accumulation_count == 0)
+
+            if should_print_loss:
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                # 获取并打印单独的损失值和总和
+                loss_ral, loss_ce = model.get_individual_losses()
+                total_loss = model.get_loss()
+                # [新增] 实时获取当前学习率，用于验证是否在Step内保持不变
+                current_step_lr = model.optimizer.param_groups[0]['lr']
+                
+                if opt.accumulation_steps <= 1:
+                    print(
+                        "Step {:>6d} | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | LR: {:.2e} | Time: {:>6.2f}s".format(
+                            model.total_steps, loss_ral, loss_ce, total_loss, current_step_lr, elapsed_time
+                        )
+                    )
+                else:
+                    print(
+                        "Update Step {:>5d} (Total {:>6d}) | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | LR: {:.2e} | Time: {:>6.2f}s".format(
+                            model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, current_step_lr, elapsed_time
+                        )
+                    )
+                start_time = time.time()
+
+        # ====================================================================
+        # [重要修正] Epoch 结束时的剩余梯度处理
+        # 必须先 Unscale, 再 Clip, 最后 Step，防止梯度爆炸导致 NaN
+        # ====================================================================
+        # 1. 记录调用前的 update_steps
+        prev_update_steps = model.update_steps
+        
+        # 2. 处理剩余梯度
+        model.step_remainder_gradients()
+            
+        # 3. [逻辑修正] 只有当 update_steps 确实增加（发生了新的更新）时，才打印日志
+        # 这样就避免了在刚完成一次完整 Update 后重复打印的问题
+        if model.update_steps > prev_update_steps:
+            log_freq = max(1, opt.loss_freq // opt.accumulation_steps)
+            if opt.accumulation_steps > 1 and model.update_steps % log_freq == 0:
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                loss_ral, loss_ce = model.get_individual_losses()
+                total_loss = model.get_loss()
+                print(
+                    "Update Step {:>5d} (Total {:>6d}) | Loss RAL: {:>7.4f} | Loss CE: {:>7.4f} | Total: {:>7.4f} | Time: {:>6.2f}s".format(
+                        model.update_steps, model.total_steps, loss_ral, loss_ce, total_loss, elapsed_time
+                    )
+                )
+                start_time = time.time()
+
+        # [Profiler] 结束分析并退出
+        if opt.profile and prof is not None:
+            prof.stop()
+            print("\n" + "="*20 + " 性能分析报告 (Top 10 CUDA Kernels) " + "="*20)
+            # 按照总的 CUDA 耗时排序
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+            
+            # 导出为 Chrome Trace 格式
+            trace_path = os.path.join(log_dir, "expert_trace.json")
+            prof.export_chrome_trace(trace_path)
+            print(f"\n[提示] 详细追踪文件已保存至: {trace_path}")
+            print("[提示] 请在 Chrome 浏览器访问 chrome://tracing 并加载该文件。")
+            print("="*50)
+            break # 分析一次就够了，直接跳出实验
+
+        model.eval()
+        
+        # ====================================================================
+        # [新增] 使用 EMA 模型进行验证
+        # ====================================================================
+        # 默认使用原始模型
+        val_model = model.model
+        
+        # 如果 EMA 存在，优先使用 EMA 模型（它的泛化能力更强）
+        if hasattr(model, 'model_ema') and model.model_ema is not None:
+            val_model = model.model_ema.module if hasattr(model.model_ema, 'module') else model.model_ema
+        
+        current_epoch = epoch_id  # 修复：current_epoch 赋值提前
+        ap, fpr, fnr, acc, auc, f1 = validate(val_model, val_loader, opt.gpu_ids)
+        rule_inner()
+        print(f"(Val@E {current_epoch:>3}) {fmt_metric6(auc, ap, acc, f1, fpr, fnr)}")
+        rule_inner()
+
+        # 只在验证性能超过历史最佳时才保存模型
+        # 保存准则按优先级排序：AUC > AP > ACC
+        is_better = False
+        # 优先比较 AUC
+        if auc > best_auc:
+            is_better = True
+        elif auc == best_auc:
+            # AUC 相同时比较 AP
+            if ap > best_ap:
+                is_better = True
+            elif ap == best_ap:
+                # AP 也相同时比较 ACC
+                if acc > best_acc:
+                    is_better = True
+
+        # ====================================================================
+        # [优化] 模型保存策略：只留最佳 + 最新3个 (且只存权重)
+        # ====================================================================
+        current_epoch_num = epoch_id
+        
+        # [重要修复] 先删除旧文件，再保存新文件，避免磁盘空间不足导致的数据丢失
+        # 1. 先删除3个Epoch之前的模型（释放空间）
+        obsolete_epoch = current_epoch_num - 3
+        if obsolete_epoch >= 0:
+            obsolete_path = os.path.join(model.save_dir, f"model_epoch_{obsolete_epoch}.pth")
+            if os.path.exists(obsolete_path):
+                try:
+                    os.remove(obsolete_path)
+                    print(f"[Cleanup] 已删除旧模型以释放空间: {os.path.basename(obsolete_path)}")
+                except OSError as e:
+                    print(f"[Warning] 删除失败: {e}")
+        
+        # 2. 再保存当前Epoch的权重 (用于回溯分析)
+        # save_optimizer=False 确保文件只有 1.8GB
+        model.save_networks(f"model_epoch_{current_epoch_num}.pth", save_optimizer=False)
+
+        # 3. 保存最佳模型 (覆盖更新)
+        # 如果当前是最佳模型，额外存一份 best_model.pth
+        if is_better:
+            # 更新最佳性能指标（按 AUC/AP/ACC 的优先级）
+            best_acc = acc
+            best_ap = ap
+            best_auc = auc
+            best_f1  = f1
+            best_epoch = current_epoch
+
+            print(f"[Result] 发现新的最佳模型! (Epoch {current_epoch})")
+            print(f"[Result] 最佳指标: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch}")
+            # 只存权重，不存优化器
+            model.save_networks("best_model.pth", save_optimizer=False)
+        else:
+            print(f"[Status] 未破纪录 (最佳: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch})")
+        # 每次覆盖写入，只占一份空间，万一崩溃了可以用它恢复
+        model.save_networks("latest_checkpoint.pth", save_optimizer=True)
+
+        # ====== Epoch end ======
+        # 先记录“本 epoch 训练过程中用的 lr”
+        lr_this_epoch = model.optimizer.param_groups[0]['lr']
+
+        if (
+            opt.cosine_annealing
+            and getattr(model, "scheduler", None) is not None
+            and epoch < opt.epoch - 1
+        ):
+            model.scheduler.step()
+
+        # step 后的是“下一 epoch 会用的 lr”
+        lr_next_epoch = model.optimizer.param_groups[0]['lr']
+
+        # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
+        china_tz = timezone(timedelta(hours=8))
+        current_time = datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"[LR-END] epoch {epoch+1}: {lr_this_epoch:.2e} | [LR-NEXT] epoch {epoch+2}: {lr_next_epoch:.2e} | 系统时间: {current_time}")
+        
+        # 计算并打印当前epoch的总时间
+        epoch_time = time.time() - epoch_start_time
+        print(f"Epoch {epoch + model.step_bias} 总耗时: {epoch_time:.2f}秒")
+        rule_epoch()
+        print("")
+    # 计算整个实验的总时间
+    experiment_total_time = time.time() - experiment_start_time
+    hours, remainder = divmod(experiment_total_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    # 训练结束后打印最终的最佳性能和总时间
+    print(f"\n 训练完成！最佳模型性能:")
+    print(f"   AUC(auc): {best_auc:.4f}")
+    print(f"   AP(ap): {best_ap:.4f}")
+    print(f"   ACC(acc): {best_acc:.4f}")
+    print(f"   所在轮次: {best_epoch}")
+    print(f"   最佳模型文件: best_model.pth")
+    print(f"   F1(f1): {best_f1:.4f}")
+    print(f"   整个实验总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
+    
+    # 关闭日志文件
+    logger.close()
+    sys.stdout = logger.terminal  # 恢复标准输出
