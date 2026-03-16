@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from models import build_model, get_loss
 # [新增] 引入调度器组件
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 # [新增] 引入 timm 的 EMA 模块
 try:
@@ -68,35 +68,44 @@ class Trainer(nn.Module):
         else:
             raise ValueError("optim should be [sgd, adam, adamw]")
 
-        # ===========================================================
-        # [修改] 学习率调度器：支持 Warmup + Cosine
-        # ===========================================================
+        # ============================
+        # LR Scheduler: Warmup + CosineAnnealingLR (NO restart)
+        #
+        # 关键点（配合本项目“epoch 末尾 step 一次”的用法）：
+        # 1) lr 会在“下一轮 epoch 开始时”生效（因为 step() 放在 epoch 末尾）。
+        # 2) SequentialLR 在 last_epoch 命中 milestone 时会切换到下一个 scheduler，并调用 next_scheduler.step(0)，
+        #    因此命中 milestone 的那一次不会再推进 warmup_scheduler。
+        # 3) 约定 warmup_epochs=N 表示 warmup 覆盖前 N 个 epoch。
+        #    为了让第 N 个 warmup epoch 能到达 base lr（而不是延后到第 N+1 个），
+        #    LinearLR.total_iters 应该设置为 N-1（当 N>=2）。当 N==1 时用 total_iters=1。
+        # ============================
+        self.scheduler = None
         if opt.cosine_annealing:
-            # 1. 定义主调度器 (Cosine)
-            # T_0=20: 每20个Epoch重置一次学习率
-            main_scheduler = CosineAnnealingWarmRestarts(
-                self.optimizer, T_0=20, T_mult=1, eta_min=1e-8
-            )
-            
-            if opt.warmup_epochs > 0:
-                print(f"[Info] 启用学习率预热: 前 {opt.warmup_epochs} 个 Epoch 线性增长")
-                # 2. 定义预热调度器 (Linear)
-                # start_factor=0.001: 初始学习率从 lr * 0.001 开始
+            warmup_epochs = max(int(getattr(opt, "warmup_epochs", 0)), 0)
+            warmup_epochs = min(warmup_epochs, int(getattr(opt, "epoch", warmup_epochs)))  # ✅ 防止 warmup > 总epoch
+            eta_min = float(getattr(opt, "eta_min", 1e-6))
+
+            cosine_epochs = max(opt.epoch - warmup_epochs, 1)
+            T_max = max(cosine_epochs - 1, 1)
+
+            main_scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max, eta_min=eta_min)
+
+            if warmup_epochs > 0:
+                # ✅ 关键修正：让 warmup 在切换到 cosine 之前就达到 base_lr，避免切换瞬间上跳
+                warmup_total_iters = max(warmup_epochs - 1, 1)
                 warmup_scheduler = LinearLR(
-                    self.optimizer, start_factor=0.001, end_factor=1.0, total_iters=opt.warmup_epochs
+                    self.optimizer,
+                    start_factor=0.001,
+                    end_factor=1.0,
+                    total_iters=warmup_total_iters
                 )
-                
-                # 3. 串联调度器 (Sequential)
-                # 前 warmup_epochs 轮用 Linear，之后切换到 Cosine
                 self.scheduler = SequentialLR(
-                    self.optimizer, 
-                    schedulers=[warmup_scheduler, main_scheduler], 
-                    milestones=[opt.warmup_epochs]
+                    self.optimizer,
+                    schedulers=[warmup_scheduler, main_scheduler],
+                    milestones=[warmup_epochs]
                 )
             else:
                 self.scheduler = main_scheduler
-                
-            self.scheduler_epoch = 0
         else:
             self.scheduler = None
 
@@ -131,10 +140,41 @@ class Trainer(nn.Module):
             self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
-        self.input = input[0].to(self.device)
-        self.crops = [[t.to(self.device) for t in sublist] for sublist in input[1]]
-        self.label = input[2].to(self.device).long()
+        # 1. 接收数据
+        x = input[0].to(self.device, non_blocking=True)
+        self.label = input[2].to(self.device, non_blocking=True).long()
+        
+        # 2. 初始化归一化参数
+        if not hasattr(self, 'mean_tensor'):
+             self.mean_tensor = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
+             self.std_tensor = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
 
+        # 3. 处理 Global Input - 在GPU上进行归一化以提高效率
+        # 如果是uint8，先转换为float32并除以255
+        if x.dtype == torch.uint8:
+            x = x.float().div_(255.0)
+        # 如果已经是float32(0-1)，不需要额外处理
+        
+        # 保存原始数据（用于可能的调试）
+        self.input_raw = x
+        
+        # 归一化
+        self.input = x.sub_(self.mean_tensor).div_(self.std_tensor)
+
+        # 4. 处理 Crops
+        # input[1] 是 list of list of tensors
+        self.crops = []
+        
+        raw_crops = input[1] # List[List[Tensor]]
+        
+        for scale_list in raw_crops:
+            processed_scale = []
+            for crop_batch in scale_list:
+                # crop_batch is (B, 3, 224, 224) Float Normalized (from CPU)
+                c = crop_batch.to(self.device, non_blocking=True)
+                # [Hybrid Strategy] Crops are already normalized on CPU to preserve precision
+                processed_scale.append(c)
+            self.crops.append(processed_scale)
 
     def forward(self):
         # -------------------------------------------------------
@@ -223,7 +263,7 @@ class Trainer(nn.Module):
             #     self.scheduler.step()
 
     def get_features(self):
-        self.features = self.model.get_features(self.input).to(self.device)
+        self.features = self.model.get_features(self.input)
 
     def eval(self):
         self.model.eval()

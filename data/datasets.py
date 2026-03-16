@@ -5,6 +5,11 @@ from torch.utils.data import Dataset
 import utils
 import numpy as np
 
+# 建议：避免 DataLoader 多 worker 时 OpenCV 线程爆炸
+try:
+    cv2.setNumThreads(0)
+except Exception:
+    pass
 
 class AVLip(Dataset):
     def __init__(self, opt):
@@ -12,13 +17,11 @@ class AVLip(Dataset):
         self.data_label = opt.data_label
         self.real_list = utils.get_list(opt.real_list_path)
         self.fake_list = utils.get_list(opt.fake_list_path)
-        self.label_dict = dict()
-        for i in self.real_list:
-            self.label_dict[i] = 0
-        for i in self.fake_list:
-            self.label_dict[i] = 1
-        self.total_list = self.real_list + self.fake_list
 
+        self.label_dict = {p: 0 for p in self.real_list}
+        self.label_dict.update({p: 1 for p in self.fake_list})
+
+        self.total_list = self.real_list + self.fake_list
         self.targets = [self.label_dict[path] for path in self.total_list]
 
     def __len__(self):
@@ -31,8 +34,13 @@ class AVLip(Dataset):
         # 1. 读取 (BGR)
         img_cv = cv2.imread(img_path)
         if img_cv is None:
-            # 返回全0数据防止崩溃，尺寸需对应修改后的逻辑
-            return torch.zeros((3, 1120, 1120)), [[torch.zeros((3, 224, 224))]*5]*3, label
+            # 返回全0数据防止崩溃
+            # Global: uint8 (3, 1120, 1120)
+            zero_img = torch.zeros((3, 1120, 1120), dtype=torch.uint8)
+            # Crops: Float Normalized (3, 224, 224)
+            zero_crop = torch.zeros((3, 224, 224), dtype=torch.float32)
+            crops = [[zero_crop.clone() for _ in range(5)] for _ in range(3)]
+            return zero_img, crops, label
 
         # 2. 颜色转换 BGR -> RGB (此时还是 uint8，速度快)
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
@@ -61,19 +69,20 @@ class AVLip(Dataset):
                  patch_cv = np.zeros((500, 500, 3), dtype=np.uint8)
             
             patch_cv = cv2.resize(patch_cv, (224, 224), interpolation=cv2.INTER_LINEAR)
+            
+            # [Crops Strategy] Keep Normalization on CPU for correctness (Float precision for Scale 1/2)
             patch_tensor = normalize(to_tensor(patch_cv))
             crops_list.append(patch_tensor)
 
         crops = [crops_list, [], []]
 
         # 后续的 crops[1] 和 crops[2] 是基于 crops[0] (也就是 Scale 0) 再次裁剪的
-        # 因为 crops[0] 已经是 Tensor 了，这里用 transforms 是可以的，或者也可以继续优化为 numpy 操作
-        # 但这部分是在 224x224 上操作，开销不大，维持原样即可
+        # 因为 crops[0] 已经是 Tensor 了，这里用 transforms 是可以的
         crop_idx = [(28, 196), (61, 163)]
         crop_resize = transforms.Resize((224, 224))
         
         for i in range(len(crops[0])):
-            # 注意：这里 crops[0][i] 已经是 (C, H, W)
+            # 注意：这里 crops[0][i] 已经是 (C, H, W) Normalized Float
             # crop_idx 同样可以直接切片
             crops[1].append(crop_resize(crops[0][i][:, crop_idx[0][0]:crop_idx[0][1], crop_idx[0][0]:crop_idx[0][1]]))
             crops[2].append(crop_resize(crops[0][i][:, crop_idx[1][0]:crop_idx[1][1], crop_idx[1][0]:crop_idx[1][1]]))
@@ -81,6 +90,9 @@ class AVLip(Dataset):
         # 最后处理大图 (Global Context)
         # 同样先 resize numpy 再转 tensor
         img_global = cv2.resize(img_cv, (1120, 1120), interpolation=cv2.INTER_LINEAR)
-        img = normalize(to_tensor(img_global))
+        
+        # [优化] 将归一化移到GPU进行，提高效率
+        # 先转换为tensor，归一化将在GPU上进行
+        img = to_tensor(img_global)
 
         return img, crops, label

@@ -31,15 +31,42 @@ def validate(model, loader, gpu_id):
     y_true, y_pred = [], []
     
     with torch.no_grad():
+        # --- [GPU 归一化准备] ---
+        # 移到循环外，避免每个 batch 重复创建 tensor，减少 GPU 开销
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        
+        def process(tensor):
+            # [鲁棒性修复] 增加 dtype 检查
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.float().div_(255.0)
+            return (tensor - mean) / std
+
         # 使用 tqdm 包装数据加载器
-        for img, crops, label in tqdm(loader, desc="Validation Progress", leave=False):
-            # 优化：non_blocking=True 配合 pin_memory 加速数据传输
-            img_tens = img.to(device, non_blocking=True)
+        for img, raw_crops, label in tqdm(loader, desc="Validation Progress", leave=False):
+            # 1. 接收数据
+            img = img.to(device, non_blocking=True)
             
-            # 处理嵌套列表的 tensor 转移
-            crops_tens = [[t.to(device, non_blocking=True) for t in sublist] for sublist in crops]
+            # 2. Global Input Normalization - 与trainer.py保持一致
+            # 健壮的归一化处理，无论输入是uint8还是float32都能正确处理
+            if img.dtype == torch.uint8:
+                img = img.float().div_(255.0)   # ✅ 必须有
+            # 如果已经是float32(0-1)，不需要额外处理
             
-            features = model.get_features(img_tens).to(device, non_blocking=True)
+            img_tens = img.sub(mean).div(std)
+            
+            # 3. Process Crops
+            # raw_crops is List[List[Tensor]] from DataLoader
+            crops_tens = []
+            for scale_list in raw_crops:
+                processed_scale = []
+                for crop_batch in scale_list:
+                    c = crop_batch.to(device, non_blocking=True)
+                    # [Hybrid Strategy] Crops are already normalized on CPU
+                    processed_scale.append(c)
+                crops_tens.append(processed_scale)
+            
+            features = model.get_features(img_tens)
 
             # 获取预测概率
             # --- 修改开始 ---
