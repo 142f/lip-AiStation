@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 from .clip import clip
 import os
-import sys
-import open_clip
+try:
+    import open_clip
+except Exception:
+    open_clip = None
 from .region_awareness import get_backbone, SELayerVec
 
 # 设置 HuggingFace 镜像
@@ -15,10 +17,10 @@ class LipFD(nn.Module):
         self.name = name
 
         # =================================================================
-        # [配置控制] 直接从命令行参数检测消融实验配置
-        # 这样就不需要在 train.py/validate.py 中设置环境变量了
+        # [配置控制] 统一从环境变量读取消融配置
+        # 避免与 options/base_options.py 的注入逻辑不一致
         # =================================================================
-        self.no_innov = "--no_innov" in sys.argv
+        self.no_innov = (os.getenv("LIPFD_NO_INNOV", "0") == "1")
         
         # 打印消融状态，方便调试
         if self.no_innov:
@@ -43,6 +45,11 @@ class LipFD(nn.Module):
 
         # --- 2. 加载 CLIP / DFN 模型 ---
         if name.startswith("DFN:"):
+            if open_clip is None:
+                raise ImportError(
+                    "DFN backbone requires `open_clip` but it is not available. "
+                    "Please install a working open-clip package."
+                )
             print(f"[LipFD] 正在加载 Apple DFN 模型: {name}")
             self.encoder, _, self.preprocess = open_clip.create_model_and_transforms(
                 'ViT-L-14', pretrained='dfn2b', device='cpu'

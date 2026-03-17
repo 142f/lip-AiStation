@@ -7,17 +7,24 @@ from .datasets import AVLip
 
 
 def get_bal_sampler(dataset):
-    targets = []
-    for d in dataset.datasets:
-        targets.extend(d.targets)
+    if not hasattr(dataset, "targets"):
+        raise AttributeError("Dataset must provide `targets` for class-balanced sampling.")
 
-    ratio = np.bincount(targets)
-    w = 1.0 / torch.tensor(ratio, dtype=torch.float)
-    sample_weights = w[targets]
-    sampler = WeightedRandomSampler(
-        weights=sample_weights, num_samples=len(sample_weights)
+    targets = np.asarray(dataset.targets, dtype=np.int64)
+    if targets.size == 0:
+        raise ValueError("Empty dataset: cannot build class-balanced sampler.")
+
+    class_count = np.bincount(targets)
+    non_zero = class_count > 0
+    class_weights = np.zeros_like(class_count, dtype=np.float32)
+    class_weights[non_zero] = 1.0 / class_count[non_zero].astype(np.float32)
+
+    sample_weights = torch.as_tensor(class_weights[targets], dtype=torch.float32)
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
     )
-    return sampler
 
 
 def create_dataloader(opt, distributed=False):
@@ -38,7 +45,7 @@ def create_dataloader(opt, distributed=False):
 
     # 优化 num_workers 配置
     num_workers = int(opt.num_threads)
-    if num_workers == 0:
+    if num_workers < 0:
         # 自动检测：基于CPU核心数、batch_size和GPU数量优化设置
         cpu_count = os.cpu_count() or 4
         # 根据batch_size动态调整num_workers
