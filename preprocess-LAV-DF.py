@@ -2,6 +2,11 @@ import os
 import json
 import cv2
 import numpy as np
+
+# librosa 会触发 numba JIT；在部分 Windows 环境首次运行可能长时间卡在编译/缓存阶段。
+# 预处理任务以稳定为先，默认关闭 JIT。
+os.environ["NUMBA_DISABLE_JIT"] = "1"
+
 import librosa
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -151,6 +156,7 @@ def resolve_ffmpeg_exe():
             r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
             os.path.join(user_profile, "scoop", "shims", "ffmpeg.exe"),
             os.path.join(user_profile, "scoop", "apps", "ffmpeg", "current", "bin", "ffmpeg.exe"),
+            os.path.join(local_app_data, "Microsoft", "WinGet", "Links", "ffmpeg.exe"),
         ]
 
         for exe_path in windows_candidates:
@@ -159,8 +165,9 @@ def resolve_ffmpeg_exe():
         # winget 安装通常位于该目录下的版本号子目录中
         winget_pkg_root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
         if winget_pkg_root.exists():
-            for exe_path in winget_pkg_root.glob("*ffmpeg*/*/ffmpeg.exe"):
-                add_candidate(str(exe_path))
+            for exe_path in winget_pkg_root.rglob("ffmpeg.exe"):
+                if "ffmpeg" in str(exe_path).lower():
+                    add_candidate(str(exe_path))
 
     # 去重并校验
     checked = set()
