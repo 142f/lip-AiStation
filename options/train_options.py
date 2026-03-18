@@ -56,6 +56,12 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision (AMP) training')
         parser.add_argument('--use_ema', action='store_true', help='If specified, use EMA (Exponential Moving Average) for model weights.')
         parser.add_argument('--ema_decay', type=float, default=0.995, help='Decay rate for EMA.')
+        parser.add_argument(
+            '--region_consistency_weight',
+            type=float,
+            default=0.02,
+            help='Weight of region-global consistency KL regularization.',
+        )
         
         # ===================================================================
         # 7. 性能分析 (Profiling)

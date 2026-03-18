@@ -139,6 +139,7 @@ class Trainer(nn.Module):
 
         self.use_amp = bool(opt.use_amp and torch.cuda.is_available())
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        self.region_consistency_weight = float(getattr(opt, "region_consistency_weight", 0.02))
 
     def _apply_freeze_policy(self):
         if self.opt.fix_encoder:
@@ -222,9 +223,14 @@ class Trainer(nn.Module):
 
     def _forward_impl(self):
         self.get_features()
-        self.output, self.weights_max, self.weights_org = self.model.forward(
-            self.crops, self.features
-        )
+        forward_out = self.model.forward(self.crops, self.features)
+        aux_losses = {}
+        if not isinstance(forward_out, (tuple, list)) or len(forward_out) < 3:
+            raise RuntimeError("Model forward must return at least (logits, weights_max, weights_org).")
+
+        self.output, self.weights_max, self.weights_org = forward_out[:3]
+        if len(forward_out) >= 4 and isinstance(forward_out[3], dict):
+            aux_losses = forward_out[3]
 
         if self.use_amp:
             self.output = self.output.float()
@@ -233,7 +239,17 @@ class Trainer(nn.Module):
 
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
-        self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
+        self.loss_region_consistency = torch.zeros((), device=self.device)
+        if "region_consistency_loss" in aux_losses:
+            self.loss_region_consistency = aux_losses["region_consistency_loss"]
+            if self.use_amp:
+                self.loss_region_consistency = self.loss_region_consistency.float()
+
+        self.loss = (
+            0.01 * self.loss_ral
+            + 1.0 * self.loss_ce
+            + self.region_consistency_weight * self.loss_region_consistency
+        )
 
     def get_loss(self):
         loss = self.loss.data.tolist()
