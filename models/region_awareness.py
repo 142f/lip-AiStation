@@ -408,7 +408,9 @@ class ResNet(nn.Module):
         region_weights = torch.softmax(region_logits, dim=0)  # (R, B)
         out = (fused_parts * region_weights.unsqueeze(-1)).sum(dim=0)  # (B, C)
 
-        local_region = fused_parts[:, :, : self.local_dim]  # (R, B, local_dim)
+        # Keep teacher target learnable on the global projection branch while
+        # blocking gradients from the teacher path into local fused features.
+        local_region = fused_parts[:, :, : self.local_dim].detach()  # (R, B, local_dim)
         global_anchor = self.global_local_proj(feature)  # (B, local_dim)
 
         local_region_norm = F.normalize(local_region, p=2, dim=-1)
@@ -417,7 +419,7 @@ class ResNet(nn.Module):
         target_region = torch.softmax(region_sim / self.region_consistency_temp, dim=0)  # (R, B)
 
         region_weights_prob = region_weights.transpose(0, 1).clamp_min(1e-8).float()
-        target_region_prob = target_region.transpose(0, 1).detach().float()
+        target_region_prob = target_region.transpose(0, 1).float()
         region_consistency_loss = F.kl_div(
             torch.log(region_weights_prob),
             target_region_prob,
