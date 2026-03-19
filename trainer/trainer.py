@@ -139,7 +139,11 @@ class Trainer(nn.Module):
 
         self.use_amp = bool(opt.use_amp and torch.cuda.is_available())
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
-        self.region_consistency_weight = float(getattr(opt, "region_consistency_weight", 0.02))
+        self.enable_region_consistency = bool(getattr(opt, "enable_region_consistency", False))
+        base_region_consistency_weight = float(getattr(opt, "region_consistency_weight", 0.02))
+        self.region_consistency_weight = (
+            base_region_consistency_weight if self.enable_region_consistency else 0.0
+        )
 
     def _apply_freeze_policy(self):
         if self.opt.fix_encoder:
@@ -240,7 +244,7 @@ class Trainer(nn.Module):
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
         self.loss_region_consistency = torch.zeros((), device=self.device)
-        if "region_consistency_loss" in aux_losses:
+        if self.enable_region_consistency and "region_consistency_loss" in aux_losses:
             self.loss_region_consistency = aux_losses["region_consistency_loss"]
             if self.use_amp:
                 self.loss_region_consistency = self.loss_region_consistency.float()

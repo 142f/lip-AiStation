@@ -211,6 +211,7 @@ class ResNet(nn.Module):
         self.region_quality_head = nn.Linear(feat_dim, 1)
         self.global_local_proj = nn.Linear(self.global_dim, self.local_dim)
         self.region_consistency_temp = 0.5
+        self.use_region_consistency = os.getenv("REGION_USE_CONSISTENCY", "0") == "1"
         self.fc = nn.Linear(feat_dim, num_classes)
 
         # ---------------------------
@@ -408,23 +409,25 @@ class ResNet(nn.Module):
         region_weights = torch.softmax(region_logits, dim=0)  # (R, B)
         out = (fused_parts * region_weights.unsqueeze(-1)).sum(dim=0)  # (B, C)
 
-        # Keep teacher target learnable on the global projection branch while
-        # blocking gradients from the teacher path into local fused features.
-        local_region = fused_parts[:, :, : self.local_dim].detach()  # (R, B, local_dim)
-        global_anchor = self.global_local_proj(feature)  # (B, local_dim)
+        region_consistency_loss = fused_parts.new_zeros(())
+        if self.use_region_consistency:
+            # Keep teacher target learnable on the global projection branch while
+            # blocking gradients from the teacher path into local fused features.
+            local_region = fused_parts[:, :, : self.local_dim].detach()  # (R, B, local_dim)
+            global_anchor = self.global_local_proj(feature)  # (B, local_dim)
 
-        local_region_norm = F.normalize(local_region, p=2, dim=-1)
-        global_anchor_norm = F.normalize(global_anchor, p=2, dim=-1)
-        region_sim = (local_region_norm * global_anchor_norm.unsqueeze(0)).sum(dim=-1)  # (R, B)
-        target_region = torch.softmax(region_sim / self.region_consistency_temp, dim=0)  # (R, B)
+            local_region_norm = F.normalize(local_region, p=2, dim=-1)
+            global_anchor_norm = F.normalize(global_anchor, p=2, dim=-1)
+            region_sim = (local_region_norm * global_anchor_norm.unsqueeze(0)).sum(dim=-1)  # (R, B)
+            target_region = torch.softmax(region_sim / self.region_consistency_temp, dim=0)  # (R, B)
 
-        region_weights_prob = region_weights.transpose(0, 1).clamp_min(1e-8).float()
-        target_region_prob = target_region.transpose(0, 1).float()
-        region_consistency_loss = F.kl_div(
-            torch.log(region_weights_prob),
-            target_region_prob,
-            reduction="batchmean",
-        )
+            region_weights_prob = region_weights.transpose(0, 1).clamp_min(1e-8).float()
+            target_region_prob = target_region.transpose(0, 1).float()
+            region_consistency_loss = F.kl_div(
+                torch.log(region_weights_prob),
+                target_region_prob,
+                reduction="batchmean",
+            )
 
         # ---------------------------
         # Step 10: 分类层

@@ -110,6 +110,12 @@ class BaseOptions:
         add("class_bal", "ON" if opt.class_bal else "OFF", "applied in data.create_dataloader")
         add("no_innov", "ON" if opt.no_innov else "OFF", "injected to env, consumed in models/LipFD.py")
         add("no_region_innov", "ON" if opt.no_region_innov else "OFF", "injected to env, consumed in region_awareness")
+        if hasattr(opt, "enable_region_consistency"):
+            add(
+                "enable_region_consistency",
+                "ON" if opt.enable_region_consistency else "OFF",
+                "injected to env, consumed in region_awareness/trainer",
+            )
 
         if opt.use_aug:
             add("use_aug", "UNUSED", "flag exists but current AVLip pipeline does not consume it")
@@ -201,6 +207,7 @@ class BaseOptions:
 
         os.environ["REGION_NO_PE"] = "1" if (opt.no_region_pe or opt.no_region_innov) else "0"
         os.environ["REGION_NO_SE"] = "1" if (opt.no_region_se or opt.no_region_innov) else "0"
+        os.environ["REGION_USE_CONSISTENCY"] = "1" if getattr(opt, "enable_region_consistency", False) else "0"
 
         # additional
         # opt.classes = opt.classes.split(',')
