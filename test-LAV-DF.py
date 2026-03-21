@@ -1,4 +1,5 @@
 import argparse
+import json
 import torch
 import numpy as np
 import os
@@ -31,6 +32,102 @@ def count_images_recursive(folder):
             if suffix in {"png", "jpg", "jpeg"}:
                 total += 1
     return total
+
+
+def write_text_lines(output_path, lines):
+    with open(output_path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(f"{line}\n")
+
+
+def export_error_reports(
+    output_dir,
+    report_prefix,
+    sample_paths,
+    y_true,
+    y_prob,
+    y_pred_binary,
+    threshold,
+    save_all_predictions=False,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    prefix = str(report_prefix or "test").strip() or "test"
+
+    sample_count = int(len(y_true))
+    if len(sample_paths) < sample_count:
+        sample_paths = list(sample_paths) + [f"sample_{i}" for i in range(len(sample_paths), sample_count)]
+    elif len(sample_paths) > sample_count:
+        sample_paths = list(sample_paths[:sample_count])
+    else:
+        sample_paths = list(sample_paths)
+
+    real_as_fake = []
+    fake_as_real = []
+    all_failed = []
+    prediction_rows = []
+
+    for idx in range(sample_count):
+        true_label = int(y_true[idx])
+        pred_label = int(y_pred_binary[idx])
+        prob_fake = float(y_prob[idx])
+        image_path = sample_paths[idx]
+
+        if true_label == 0 and pred_label == 1:
+            error_type = "real_as_fake"
+            real_as_fake.append(image_path)
+            all_failed.append(image_path)
+        elif true_label == 1 and pred_label == 0:
+            error_type = "fake_as_real"
+            fake_as_real.append(image_path)
+            all_failed.append(image_path)
+        else:
+            error_type = "correct"
+
+        if save_all_predictions:
+            prediction_rows.append(
+                {
+                    "image_path": image_path,
+                    "true_label": true_label,
+                    "pred_label": pred_label,
+                    "prob_fake": prob_fake,
+                    "error_type": error_type,
+                }
+            )
+
+    real_as_fake_path = os.path.join(output_dir, f"{prefix}_misclassified_real_as_fake.txt")
+    fake_as_real_path = os.path.join(output_dir, f"{prefix}_misclassified_fake_as_real.txt")
+    all_failed_path = os.path.join(output_dir, f"{prefix}_misclassified_all.txt")
+    summary_path = os.path.join(output_dir, f"{prefix}_misclassified_summary.json")
+    pred_tsv_path = os.path.join(output_dir, f"{prefix}_predictions.tsv")
+
+    write_text_lines(real_as_fake_path, real_as_fake)
+    write_text_lines(fake_as_real_path, fake_as_real)
+    write_text_lines(all_failed_path, all_failed)
+
+    if save_all_predictions:
+        with open(pred_tsv_path, "w", encoding="utf-8") as f:
+            f.write("image_path\ttrue_label\tpred_label\tprob_fake\tthreshold\terror_type\n")
+            for row in prediction_rows:
+                f.write(
+                    f"{row['image_path']}\t{row['true_label']}\t{row['pred_label']}\t"
+                    f"{row['prob_fake']:.8f}\t{float(threshold):.8f}\t{row['error_type']}\n"
+                )
+
+    summary = {
+        "threshold": float(threshold),
+        "num_samples": sample_count,
+        "num_misclassified_total": int(len(all_failed)),
+        "num_real_as_fake": int(len(real_as_fake)),
+        "num_fake_as_real": int(len(fake_as_real)),
+        "real_as_fake_list": normalize_path_text(real_as_fake_path),
+        "fake_as_real_list": normalize_path_text(fake_as_real_path),
+        "all_failed_list": normalize_path_text(all_failed_path),
+        "predictions_tsv": normalize_path_text(pred_tsv_path) if save_all_predictions else "",
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    summary["summary_json"] = normalize_path_text(summary_path)
+    return summary
 
 
 def resolve_lavdf2_paths(opt):
@@ -101,7 +198,14 @@ def custom_collate_fn(batch):
 # ==========================================
 # 核心测试函数
 # ==========================================
-def test(model, loader, gpu_id):
+def test(
+    model,
+    loader,
+    gpu_id,
+    errors_output_dir="",
+    errors_prefix="test",
+    save_all_predictions=False,
+):
     """
     在测试集上评估模型性能
     """
@@ -109,6 +213,9 @@ def test(model, loader, gpu_id):
     model.eval()
     
     y_true, y_pred = [], []
+    sample_paths = []
+    sample_cursor = 0
+    dataset_paths = list(getattr(loader.dataset, "total_list", []))
     
     print("\n" + "="*20 + " 开始测试循环 (Testing Loop) " + "="*20)
     
@@ -159,41 +266,56 @@ def test(model, loader, gpu_id):
             y_pred.extend(pred_score.flatten().tolist())
             y_true.extend(label.flatten().tolist())
 
+            batch_size = int(label.shape[0])
+            if dataset_paths and (sample_cursor + batch_size) <= len(dataset_paths):
+                sample_paths.extend(dataset_paths[sample_cursor : sample_cursor + batch_size])
+            else:
+                sample_paths.extend([f"sample_{sample_cursor + j}" for j in range(batch_size)])
+            sample_cursor += batch_size
+
     y_true = np.array(y_true)
     y_pred_prob = np.array(y_pred)
 
     # --- 指标计算 ---
-    if len(np.unique(y_true)) < 2:
-        print("Warning: 测试集中只包含一类数据，无法计算 AUC/AP。")
-        return 0, 0, 0, 0
-
-    # AUC
-    try:
-        auc = roc_auc_score(y_true, y_pred_prob)
-    except ValueError as e:
-        print(f"Warning: 计算 AUC 时出错: {e}")
+    single_class = len(np.unique(y_true)) < 2
+    if single_class:
+        print("Warning: 测试集中只包含一类数据，AUC/AP 与 Youden 阈值将使用默认值。")
         auc = 0.0
+        ap = 0.0
+        best_threshold = 0.5
+    else:
+        # AUC
+        try:
+            auc = roc_auc_score(y_true, y_pred_prob)
+        except ValueError as e:
+            print(f"Warning: 计算 AUC 时出错: {e}")
+            auc = 0.0
 
-    # AP
-    ap = average_precision_score(y_true, y_pred_prob)
-    
-    # 寻找最佳阈值
-    fpr_curve, tpr_curve, thresholds = roc_curve(y_true, y_pred_prob)
-    j_scores = tpr_curve - fpr_curve
-    best_idx = np.argmax(j_scores)
-    best_threshold = thresholds[best_idx]
+        # AP
+        ap = average_precision_score(y_true, y_pred_prob)
+
+        # 寻找最佳阈值
+        fpr_curve, tpr_curve, thresholds = roc_curve(y_true, y_pred_prob)
+        j_scores = tpr_curve - fpr_curve
+        best_idx = np.argmax(j_scores)
+        best_threshold = thresholds[best_idx]
     
     y_pred_binary = np.where(y_pred_prob >= best_threshold, 1, 0)
     
     # ACC & Confusion Matrix
     acc = accuracy_score(y_true, y_pred_binary)
-    cm = confusion_matrix(y_true, y_pred_binary)
+    cm = confusion_matrix(y_true, y_pred_binary, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
     
     # F1
-    precisions, recalls, pr_thresholds = precision_recall_curve(y_true, y_pred_prob)
-    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
-    best_f1 = np.max(f1_scores)
+    if single_class:
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        best_f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
+    else:
+        precisions, recalls, _ = precision_recall_curve(y_true, y_pred_prob)
+        f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+        best_f1 = np.max(f1_scores)
     
     print("\n" + "#"*60)
     print(f"【最终测试报告 / Test Report】")
@@ -207,10 +329,30 @@ def test(model, loader, gpu_id):
     print(f"最佳阈值  : {best_threshold:.4f}")
     print("#"*60 + "\n")
 
+    if str(errors_output_dir).strip():
+        summary = export_error_reports(
+            output_dir=errors_output_dir,
+            report_prefix=errors_prefix,
+            sample_paths=sample_paths,
+            y_true=y_true,
+            y_prob=y_pred_prob,
+            y_pred_binary=y_pred_binary,
+            threshold=best_threshold,
+            save_all_predictions=save_all_predictions,
+        )
+        print(f"[Info] 误判清单已保存到: {normalize_path_text(errors_output_dir)}")
+        print(
+            f"[Info] 误判统计: total={summary['num_misclassified_total']} | "
+            f"real->fake={summary['num_real_as_fake']} | fake->real={summary['num_fake_as_real']}"
+        )
+        print(f"[Info] summary: {summary['summary_json']}")
+
     return auc, ap, acc, best_f1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_errors_output_dir = os.path.join(script_dir, "error_reports")
     
     # 路径参数
     parser.add_argument("--real_list_path", type=str, default="")
@@ -229,6 +371,14 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--errors_output_dir",
+        type=str,
+        default=default_errors_output_dir,
+        help="Directory to save misclassified sample lists.",
+    )
+    parser.add_argument("--errors_prefix", type=str, default="test", help="Filename prefix for misclassified reports.")
+    parser.add_argument("--save_all_predictions", action="store_true", help="Also save per-sample prediction TSV.")
     
     # 数据集兼容参数
     parser.add_argument("--data_label", type=str, default="test") 
@@ -328,4 +478,11 @@ if __name__ == "__main__":
     )
     
     # 4. 运行测试
-    test(model, loader, gpu_id=[opt.gpu])
+    test(
+        model,
+        loader,
+        gpu_id=[opt.gpu],
+        errors_output_dir=opt.errors_output_dir,
+        errors_prefix=opt.errors_prefix,
+        save_all_predictions=bool(opt.save_all_predictions),
+    )
