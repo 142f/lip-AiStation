@@ -2,516 +2,339 @@ import os
 import json
 import cv2
 import numpy as np
-
-# librosa 会触发 numba JIT；在部分 Windows 环境首次运行可能长时间卡在编译/缓存阶段。
-# 预处理任务以稳定为先，默认关闭 JIT。
-os.environ["NUMBA_DISABLE_JIT"] = "1"
-
+import subprocess
+import tempfile
 import librosa
+from librosa import feature as audio
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from librosa import feature as audio
-from pathlib import Path
-import subprocess
-import shutil
 import random
-
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 """
-LAV-DF test preprocessing
-
-目标：
-1. 从 test 目录读取 mp4
-2. 按原参考代码方式均匀抽取窗口帧
-3. 从 mp4 中临时提取音频，不保存 wav
-4. 生成 mel 频谱图
-5. 按原参考代码风格拼接 mel + 5帧图
-6. 按整视频标签保存到:
-   - 0_real
-   - 1_fake
-
-本版本额外改动：
-1. 只处理 100 个 real + 100 个 fake
-2. 每个视频输出 10 张图，最终约 2000 张
-3. 不再使用 imageio_ffmpeg.get_ffmpeg_exe()，避免卡死
-4. 优先使用你手动指定的 FFMPEG_EXE；若为空，则使用系统 PATH 中的 ffmpeg
+LAV-DF
+├── train
+├── dev
+├── test
+├── metadata.min.json
+└── README.md
 """
-
 
 ############ Custom parameter ##############
-N_EXTRACT = 10          # 每个视频输出 10 张图
-WINDOW_LEN = 5          # 每个窗口 5 帧
+N_EXTRACT = 10      # max number of extracted images from one segment
+WINDOW_LEN = 5      # frames of each window
+IMAGE_SIZE = 500
+MAX_REAL_IMAGES = 2000   # maximum number of real images
+MAX_FAKE_IMAGES = 5000   # maximum number of fake images
+MAX_VIDEO = None    # None means use all videos
+TARGET_SPLIT = "test"  # Only process this split: "train", "test", or "dev"
+RANDOM_SEED = 42    # Random seed for shuffling
+NUM_THREADS = 4     # default number of threads
 
-TARGET_REAL_VIDEOS = 100
-TARGET_FAKE_VIDEOS = 100
-RANDOM_SEED = 42
-SHUFFLE_VIDEO = True
-
-DATASET_ROOT = Path(r"E:\data\LAV-DF\LAV-DF")
-VIDEO_ROOT = DATASET_ROOT / "test"
-METADATA_PATH = DATASET_ROOT / "metadata.min.json"
-OUTPUT_ROOT = Path(r"E:\data\LAV-DF-test")
-TEMP_ROOT = Path("./temp")
-
-SAMPLE_RATE = 16000
-
-# 强烈建议你手动写死 ffmpeg.exe 路径，最稳
-# 例如：FFMPEG_EXE = r"C:\ffmpeg\bin\ffmpeg.exe"
-# 如果你已经把 ffmpeg 加到系统 PATH，也可以设为 None
-FFMPEG_EXE = None
-
-# 是否清空旧输出目录
-CLEAN_OUTPUT = False
+dataset_root = r"E:\data\LAV-DF"          # LAV-DF dataset root
+output_root = r"E:\data\LAV-DF-window4"    # fixed output directory
+metadata_file = ""                         # optional explicit metadata path
+FFMPEG_EXE = "ffmpeg"
+FFMPEG_TIMEOUT_SEC = 15
 ############################################
 
-
-def load_metadata(metadata_path):
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        items = json.load(f)
-
-    meta_map = {}
-    for item in items:
-        key = item["file"].replace("\\", "/")
-        meta_map[key] = item
-    return meta_map
-
-
-def get_video_label(meta_item):
-    """
-    严格按整视频标签处理，不做窗口级标签重判
-    original == null -> real
-    original != null -> fake
-    """
-    original = meta_item.get("original", None)
-    if original in (None, "", "null"):
-        return 0, "0_real"
-    else:
-        return 1, "1_fake"
-
-
-def validate_ffmpeg(ffmpeg_path):
-    """
-    检查 ffmpeg 是否能正常执行
-    """
-    try:
-        result = subprocess.run(
-            [ffmpeg_path, "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-            check=False
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def resolve_ffmpeg_exe():
-    """
-    优先级：
-    1. 手动指定的 FFMPEG_EXE
-    2. 环境变量 FFMPEG_EXE / IMAGEIO_FFMPEG_EXE
-    3. 系统 PATH 中的 ffmpeg
-    4. 常见 Windows 安装路径
-    """
+def resolve_dataset_and_metadata(root_dir, metadata_path=""):
+    root_dir = os.path.abspath(root_dir)
     candidates = []
+    if metadata_path:
+        explicit_meta = os.path.abspath(metadata_path)
+        candidates.append((os.path.dirname(explicit_meta), explicit_meta))
+    candidates.append((root_dir, os.path.join(root_dir, "metadata.min.json")))
+    nested_root = os.path.join(root_dir, "LAV-DF")
+    candidates.append((nested_root, os.path.join(nested_root, "metadata.min.json")))
 
-    def add_candidate(path_like):
-        if not path_like:
-            return
-        # 兼容用户把路径写成带引号的字符串
-        candidate = str(path_like).strip().strip('"').strip("'")
-        if candidate:
-            candidates.append(candidate)
+    checked = []
+    for data_root, meta_path in candidates:
+        checked.append(meta_path)
+        if os.path.isfile(meta_path):
+            return data_root, meta_path
+    checked_msg = "\n".join(f"  - {p}" for p in checked)
+    raise FileNotFoundError(f"metadata.min.json not found. Checked:\n{checked_msg}")
 
-    if FFMPEG_EXE:
-        add_candidate(FFMPEG_EXE)
+class AtomicImageCounter:
+    def __init__(self, initial_value, max_value):
+        self._value = int(initial_value)
+        self._max_value = int(max_value)
+        self._lock = threading.Lock()
 
-    env_ffmpeg = os.environ.get("FFMPEG_EXE", None)
-    if env_ffmpeg:
-        add_candidate(env_ffmpeg)
+    def has_remaining(self):
+        with self._lock:
+            return self._value < self._max_value
 
-    env_imageio_ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE", None)
-    if env_imageio_ffmpeg:
-        add_candidate(env_imageio_ffmpeg)
+    def try_acquire(self):
+        with self._lock:
+            if self._value >= self._max_value:
+                return False
+            self._value += 1
+            return True
 
-    path_ffmpeg_exe = shutil.which("ffmpeg.exe")
-    if path_ffmpeg_exe:
-        add_candidate(path_ffmpeg_exe)
+    def release(self):
+        with self._lock:
+            if self._value > 0:
+                self._value -= 1
 
-    path_ffmpeg = shutil.which("ffmpeg")
-    if path_ffmpeg:
-        add_candidate(path_ffmpeg)
+    def get(self):
+        with self._lock:
+            return self._value
 
-    if os.name == "nt":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        user_profile = os.environ.get("USERPROFILE", "")
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-
-        windows_candidates = [
-            r"C:\ffmpeg\bin\ffmpeg.exe",
-            os.path.join(program_files, "ffmpeg", "bin", "ffmpeg.exe"),
-            os.path.join(program_files_x86, "ffmpeg", "bin", "ffmpeg.exe"),
-            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-            os.path.join(user_profile, "scoop", "shims", "ffmpeg.exe"),
-            os.path.join(user_profile, "scoop", "apps", "ffmpeg", "current", "bin", "ffmpeg.exe"),
-            os.path.join(local_app_data, "Microsoft", "WinGet", "Links", "ffmpeg.exe"),
-        ]
-
-        for exe_path in windows_candidates:
-            add_candidate(exe_path)
-
-        # winget 安装通常位于该目录下的版本号子目录中
-        winget_pkg_root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
-        if winget_pkg_root.exists():
-            for exe_path in winget_pkg_root.rglob("ffmpeg.exe"):
-                if "ffmpeg" in str(exe_path).lower():
-                    add_candidate(str(exe_path))
-
-    # 去重并校验
-    checked = set()
-    for exe in candidates:
-        if exe in checked:
-            continue
-        checked.add(exe)
-
-        if Path(exe).exists() or exe.lower() == "ffmpeg" or "ffmpeg" in exe.lower():
-            if validate_ffmpeg(exe):
-                return exe
-
-    raise RuntimeError(
-        "Cannot find a valid ffmpeg executable.\n"
-        "可选修复方式:\n"
-        "1) 在脚本顶部设置 FFMPEG_EXE = r'C:\\path\\to\\ffmpeg.exe'\n"
-        "2) 在当前终端执行: $env:FFMPEG_EXE = 'C:\\path\\to\\ffmpeg.exe'\n"
-        "3) 安装并加入 PATH (Windows): winget install Gyan.FFmpeg\n"
-        "然后重开终端再运行。"
-    )
-
-
-def extract_audio_waveform_from_video(video_file, ffmpeg_exe, sample_rate=16000):
-    """
-    从 mp4 中直接提取单通道音频到内存，不保存 wav 文件
-    """
+def extract_audio(video_file, audio_path):
     cmd = [
-        ffmpeg_exe,
-        "-i", str(video_file),
-        "-f", "f32le",
-        "-acodec", "pcm_f32le",
-        "-ac", "1",
-        "-ar", str(sample_rate),
-        "-vn",
-        "-loglevel", "error",
-        "-"
+        FFMPEG_EXE, "-y", "-loglevel", "error", "-i", video_file,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path
     ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=FFMPEG_TIMEOUT_SEC)
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False
-    )
-
-    if result.returncode != 0:
-        err = result.stderr.decode("utf-8", errors="ignore")
-        raise RuntimeError(f"ffmpeg audio extraction failed: {video_file}\n{err}")
-
-    waveform = np.frombuffer(result.stdout, dtype=np.float32)
-
-    if waveform.size == 0:
-        raise RuntimeError(f"No audio extracted from video: {video_file}")
-
-    return waveform
-
-
-def get_spectrogram_from_video(video_file, temp_mel_path, ffmpeg_exe):
-    """
-    严格复刻原代码的 mel 生成/保存/再读取逻辑
-    原代码:
-        data, sr = librosa.load(audio_file)
-        mel = librosa.power_to_db(audio.melspectrogram(y=data, sr=sr), ref=np.min)
-        plt.imsave("./temp/mel.png", mel)
-        mel = plt.imread("./temp/mel.png") * 255
-    """
-    data = extract_audio_waveform_from_video(video_file, ffmpeg_exe, SAMPLE_RATE)
-    sr = SAMPLE_RATE
-
-    mel = librosa.power_to_db(audio.melspectrogram(y=data, sr=sr), ref=np.min)
-    plt.imsave(str(temp_mel_path), mel)
-
-    mel_img = plt.imread(str(temp_mel_path)) * 255
-    mel_img = mel_img.astype(np.uint8)
-    return mel_img
-
-
-def prepare_output_dirs():
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_ROOT / "0_real").mkdir(parents=True, exist_ok=True)
-    (OUTPUT_ROOT / "1_fake").mkdir(parents=True, exist_ok=True)
-    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-
-    if CLEAN_OUTPUT:
-        for folder_name in ["0_real", "1_fake"]:
-            folder = OUTPUT_ROOT / folder_name
-            for file in folder.glob("*.png"):
-                try:
-                    file.unlink()
-                except Exception:
-                    pass
-
-
-def build_candidate_lists(metadata_map):
-    """
-    从 test 目录中建立 real / fake 候选视频列表
-    """
-    video_list = sorted([p for p in VIDEO_ROOT.iterdir() if p.suffix.lower() == ".mp4"])
-
-    real_videos = []
-    fake_videos = []
-
-    for video_path in video_list:
-        rel_key = f"test/{video_path.name}".replace("\\", "/")
-        if rel_key not in metadata_map:
-            continue
-
-        meta_item = metadata_map[rel_key]
-        label_id, _ = get_video_label(meta_item)
-
-        if label_id == 0:
-            real_videos.append(video_path)
-        else:
-            fake_videos.append(video_path)
-
-    if SHUFFLE_VIDEO:
-        random.seed(RANDOM_SEED)
-        random.shuffle(real_videos)
-        random.shuffle(fake_videos)
-
-    return real_videos, fake_videos
-
-
-def process_one_video(video_path, dataset_name, temp_mel_path, ffmpeg_exe):
-    """
-    处理单个视频
-    返回:
-        success(bool), saved_count(int), error_message(str or None)
-    """
+def get_spectrogram(video_file):
+    os.makedirs("./temp", exist_ok=True)
+    temp_fd_wav, temp_wav = tempfile.mkstemp(prefix="temp_audio_", suffix=".wav", dir="./temp")
+    temp_fd_img, temp_img = tempfile.mkstemp(prefix="temp_mel_", suffix=".png", dir="./temp")
+    os.close(temp_fd_wav)
+    os.close(temp_fd_img)
     try:
-        # load video
-        video_capture = cv2.VideoCapture(str(video_path))
-        if not video_capture.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
+        extract_audio(video_file, temp_wav)
+        if not os.path.exists(temp_wav) or os.path.getsize(temp_wav) == 0:
+            return np.zeros((512, 1000, 4), dtype=np.uint8)
 
+        data, sr = librosa.load(temp_wav, sr=None)
+        if len(data) == 0:
+             return np.zeros((512, 1000, 4), dtype=np.uint8)
+             
+        mel = librosa.power_to_db(audio.melspectrogram(y=data, sr=sr), ref=np.min)
+        plt.imsave(temp_img, mel)
+        mel_img = plt.imread(temp_img) * 255
+        return mel_img.astype(np.uint8)
+    finally:
+        try:
+            if os.path.exists(temp_wav): os.remove(temp_wav)
+            if os.path.exists(temp_img): os.remove(temp_img)
+        except OSError:
+            pass
+
+def get_start_frames(start_frame, end_frame):
+    valid_num = end_frame - start_frame - WINDOW_LEN
+    if valid_num < 1:
+        return []
+    extract_num = min(N_EXTRACT, valid_num)
+    if extract_num == 1:
+        return [start_frame]
+    frame_idx = np.linspace(start_frame, end_frame - WINDOW_LEN - 1, extract_num, endpoint=True, dtype=np.int32).tolist()
+    return sorted(set([int(f) for f in frame_idx]))
+
+def read_needed_frames(video_file, frame_sequence):
+    video_capture = cv2.VideoCapture(video_file)
+    frame_set = set(frame_sequence)
+    frame_map = {}
+    current_frame = 0
+    while current_frame <= frame_sequence[-1]:
+        ret, frame = video_capture.read()
+        if not ret: break
+        if current_frame in frame_set:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+            frame = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE))
+            frame_map[current_frame] = frame
+        current_frame += 1
+    video_capture.release()
+    return frame_map
+
+def count_existing_images(save_dir):
+    if not os.path.isdir(save_dir): return 0
+    return sum(1 for _, _, files in os.walk(save_dir) for f in files if f.lower().endswith(".png"))
+
+def extract_segment(video_file, save_dir, name, t0, t1, max_images=None, counter=None):
+    if max_images is not None and max_images <= 0:
+        return 0
+    if counter is not None and not counter.has_remaining():
+        return 0
+    os.makedirs(save_dir, exist_ok=True)
+    try:
+        video_capture = cv2.VideoCapture(video_file)
         fps = video_capture.get(cv2.CAP_PROP_FPS)
         frame_count = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if frame_count <= 0:
-            video_capture.release()
-            raise RuntimeError(f"Invalid frame count: {video_path}")
-
-        # select N_EXTRACT starting points from frames
-        max_start = frame_count - WINDOW_LEN - 1
-        if max_start < 0:
-            max_start = 0
-
-        if max_start == 0:
-            frame_idx = [0] * N_EXTRACT
-        else:
-            # 这里不能用 np.uint8，否则帧数 >255 时会溢出
-            frame_idx = np.linspace(
-                0,
-                max_start,
-                N_EXTRACT,
-                endpoint=True
-            ).astype(np.int32).tolist()
-
-        frame_idx.sort()
-
-        # selected frames
-        frame_sequence = [i for num in frame_idx for i in range(num, num + WINDOW_LEN)]
-
-        frame_list = []
-        current_frame = 0
-        last_needed = frame_sequence[-1] if len(frame_sequence) > 0 else 0
-
-        while current_frame <= last_needed:
-            ret, frame = video_capture.read()
-            if not ret:
-                print(f"Error in reading frame {video_path.name}: {current_frame}")
-                break
-
-            if current_frame in frame_sequence:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-                frame = cv2.resize(frame, (500, 500))
-                frame_list.append(frame)
-
-            current_frame += 1
-
         video_capture.release()
 
-        # 如果因为短视频或读取问题导致帧不足，补齐
-        needed_len = len(frame_sequence)
-        if len(frame_list) < needed_len:
-            if len(frame_list) == 0:
-                pad_frame = np.zeros((500, 500, 4), dtype=np.uint8)
-            else:
-                pad_frame = frame_list[-1].copy()
+        if fps <= 0 or frame_count <= 0: return 0
 
-            while len(frame_list) < needed_len:
-                frame_list.append(pad_frame.copy())
+        start_frame = max(0, int(np.floor(t0 * fps)))
+        end_frame = min(frame_count, int(np.ceil(t1 * fps)))
+        start_frames = get_start_frames(start_frame, end_frame)
+        if not start_frames: return 0
 
-        # load audio from mp4 and create mel spectrogram
-        name = video_path.stem
+        frame_sequence = [i for num in start_frames for i in range(num, num + WINDOW_LEN)]
+        frame_map = read_needed_frames(video_file, frame_sequence)
+        
+        mel = get_spectrogram(video_file)
+        mapping = mel.shape[1] / max(frame_count, 1)
+
         group = 0
+        for start in start_frames:
+            if max_images is not None and group >= max_images:
+                break
+            if counter is not None and not counter.has_remaining():
+                break
 
-        mel = get_spectrogram_from_video(video_path, temp_mel_path, ffmpeg_exe)
+            frames = []
+            ok = True
+            for idx in range(start, start + WINDOW_LEN):
+                if idx not in frame_map:
+                    ok = False
+                    break
+                frames.append(frame_map[idx])
+            if not ok: continue
 
-        if mel.shape[1] <= 0:
-            raise RuntimeError(f"Invalid mel spectrogram width: {video_path}")
+            reserved = False
+            try:
+                begin = np.round(start * mapping)
+                end = np.round((start + WINDOW_LEN) * mapping)
+                begin = max(0, min(int(begin), mel.shape[1] - 1))
+                end = max(begin + 1, min(int(end), mel.shape[1]))
 
-        mapping = mel.shape[1] / frame_count
-        saved_count = 0
+                sub_mel = cv2.resize(mel[:, begin:end], (IMAGE_SIZE * WINDOW_LEN, IMAGE_SIZE))
+                x = np.concatenate(frames, axis=1)
+                x = np.concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
 
-        for i in range(len(frame_list)):
-            idx = i % WINDOW_LEN
-            if idx == 0:
-                try:
-                    begin = int(np.round(frame_sequence[i] * mapping))
-                    end = int(np.round((frame_sequence[i] + WINDOW_LEN) * mapping))
+                if counter is not None:
+                    if not counter.try_acquire():
+                        break
+                    reserved = True
+                
+                save_path = os.path.join(save_dir, f"{name}_{group}.png")
+                plt.imsave(save_path, x.astype(np.uint8))
+                
+                group += 1
+            except Exception as e:
+                if reserved and counter is not None:
+                    counter.release()
+                continue
 
-                    if end <= begin:
-                        end = begin + 1
-
-                    # 防止越界
-                    begin = max(0, min(begin, mel.shape[1] - 1))
-                    end = max(begin + 1, min(end, mel.shape[1]))
-
-                    sub_mel = cv2.resize(
-                        mel[:, begin:end],
-                        (500 * WINDOW_LEN, 500)
-                    )
-
-                    x = np.concatenate(frame_list[i: i + WINDOW_LEN], axis=1)
-                    x = np.concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
-
-                    save_path = OUTPUT_ROOT / dataset_name / f"{name}_{group}.png"
-                    plt.imsave(str(save_path), x)
-                    group += 1
-                    saved_count += 1
-
-                except ValueError:
-                    print(f"ValueError: {name}")
-                    continue
-
-        if saved_count == 0:
-            raise RuntimeError(f"No image saved for video: {video_path}")
-
-        return True, saved_count, None
-
+        return group
     except Exception as e:
-        return False, 0, str(e)
+        return 0
 
+def process_fake_period(item, seg_id, period, data_root, meta_dict, fake_out_dir, real_out_dir, fake_counter, real_counter):
+    if not fake_counter.has_remaining() and not real_counter.has_remaining():
+        return
+
+    video_file = os.path.join(data_root, item["file"])
+    if not os.path.exists(video_file):
+        return
+
+    try:
+        t0, t1 = period
+    except Exception:
+        return
+
+    fake_name = os.path.splitext(os.path.basename(item["file"]))[0]
+
+    # 1. Extract from Fake video
+    if fake_counter.has_remaining():
+        extract_segment(video_file, fake_out_dir, f"{fake_name}_seg{seg_id}", t0, t1, counter=fake_counter)
+
+    # 2. Extract corresponding accurate paired segments from Original Real video
+    if real_counter.has_remaining() and item["original"] is not None and item["original"] in meta_dict:
+        real_item = meta_dict[item["original"]]
+        real_file = os.path.join(data_root, real_item["file"])
+        if os.path.exists(real_file):
+            real_name = os.path.splitext(os.path.basename(real_item["file"]))[0]
+            r0 = t0 / max(item["duration"], 1e-8) * real_item["duration"]
+            r1 = t1 / max(item["duration"], 1e-8) * real_item["duration"]
+            extract_segment(real_file, real_out_dir, f"{real_name}_pair_{fake_name}_seg{seg_id}", r0, r1, counter=real_counter)
+
+def process_full_real_video(item, data_root, real_out_dir, real_counter):
+    if not real_counter.has_remaining():
+        return
+
+    video_file = os.path.join(data_root, item["file"])
+    if not os.path.exists(video_file):
+        return
+
+    name = os.path.splitext(os.path.basename(item["file"]))[0]
+    extract_segment(video_file, real_out_dir, name, 0.0, item["duration"], counter=real_counter)
 
 def run():
-    prepare_output_dirs()
+    data_root, meta_path = resolve_dataset_and_metadata(dataset_root, metadata_file)
+    print(f"[Info] Setting Up... Saving to {TARGET_SPLIT} folder. Max {MAX_REAL_IMAGES} real / {MAX_FAKE_IMAGES} fake images.")
 
-    ffmpeg_exe = resolve_ffmpeg_exe()
-    print(f"Using ffmpeg: {ffmpeg_exe}")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
 
-    metadata_map = load_metadata(METADATA_PATH)
+    meta_dict = {item["file"]: item for item in meta}
+    real_list = [item for item in meta if item["n_fakes"] == 0 and item.get("split") == TARGET_SPLIT]
+    fake_list = [item for item in meta if item["n_fakes"] > 0 and item.get("split") == TARGET_SPLIT]
 
-    real_candidates, fake_candidates = build_candidate_lists(metadata_map)
+    # Set random seed and shuffle lists
+    random.seed(RANDOM_SEED)
+    random.shuffle(real_list)
+    random.shuffle(fake_list)
 
-    print(f"Found real candidate videos: {len(real_candidates)}")
-    print(f"Found fake candidate videos: {len(fake_candidates)}")
+    if MAX_VIDEO is not None:
+        real_list = real_list[:MAX_VIDEO]
+        fake_list = fake_list[:MAX_VIDEO]
 
-    if len(real_candidates) < TARGET_REAL_VIDEOS:
-        raise RuntimeError(
-            f"Not enough real videos. Need {TARGET_REAL_VIDEOS}, but only found {len(real_candidates)}"
-        )
-    if len(fake_candidates) < TARGET_FAKE_VIDEOS:
-        raise RuntimeError(
-            f"Not enough fake videos. Need {TARGET_FAKE_VIDEOS}, but only found {len(fake_candidates)}"
-        )
+    real_out_dir = os.path.join(output_root, TARGET_SPLIT, "0_real")
+    fake_out_dir = os.path.join(output_root, TARGET_SPLIT, "1_fake")
+    
+    saved_real = count_existing_images(real_out_dir)
+    saved_fake = count_existing_images(fake_out_dir)
+    real_counter = AtomicImageCounter(saved_real, MAX_REAL_IMAGES)
+    fake_counter = AtomicImageCounter(saved_fake, MAX_FAKE_IMAGES)
 
-    temp_mel_path = TEMP_ROOT / "mel.png"
+    print(f"[Info] existing real images: {saved_real}/{MAX_REAL_IMAGES}")
+    print(f"[Info] existing fake images: {saved_fake}/{MAX_FAKE_IMAGES}")
+    print(f"[Info] using {NUM_THREADS} threads")
 
-    success_real_videos = 0
-    success_fake_videos = 0
-    saved_real_images = 0
-    saved_fake_images = 0
-    failed_list = []
+    if fake_counter.has_remaining() or real_counter.has_remaining():
+        print("Handling 1_fake (only fake periods) AND extracting their real pairs first...")
+        fake_tasks = [
+            (item, seg_id, period)
+            for item in fake_list
+            for seg_id, period in enumerate(item.get("fake_periods", []))
+        ]
+        if fake_tasks:
+            with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+                futures = [
+                    executor.submit(
+                        process_fake_period,
+                        item,
+                        seg_id,
+                        period,
+                        data_root,
+                        meta_dict,
+                        fake_out_dir,
+                        real_out_dir,
+                        fake_counter,
+                        real_counter,
+                    )
+                    for item, seg_id, period in fake_tasks
+                ]
+                for _ in tqdm(as_completed(futures), total=len(futures), desc="fake/pair segments"):
+                    pass
 
-    print("Start processing real videos...")
-    real_pbar = tqdm(real_candidates, total=len(real_candidates))
-    for video_path in real_pbar:
-        if success_real_videos >= TARGET_REAL_VIDEOS:
-            break
+    # Fill remaining Real images if limit is not reached yet
+    if real_counter.has_remaining():
+        print("Handling 0_real (full real videos) to fill remaining quota...")
+        with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+            futures = [
+                executor.submit(process_full_real_video, item, data_root, real_out_dir, real_counter)
+                for item in real_list
+            ]
+            for _ in tqdm(as_completed(futures), total=len(futures), desc="full real videos"):
+                pass
 
-        ok, saved_cnt, err = process_one_video(
-            video_path=video_path,
-            dataset_name="0_real",
-            temp_mel_path=temp_mel_path,
-            ffmpeg_exe=ffmpeg_exe
-        )
+    saved_real = real_counter.get()
+    saved_fake = fake_counter.get()
 
-        if ok:
-            success_real_videos += 1
-            saved_real_images += saved_cnt
-            real_pbar.set_description(
-                f"real videos={success_real_videos}/{TARGET_REAL_VIDEOS}, images={saved_real_images}"
-            )
-        else:
-            failed_list.append((video_path.name, err))
-
-    print("Start processing fake videos...")
-    fake_pbar = tqdm(fake_candidates, total=len(fake_candidates))
-    for video_path in fake_pbar:
-        if success_fake_videos >= TARGET_FAKE_VIDEOS:
-            break
-
-        ok, saved_cnt, err = process_one_video(
-            video_path=video_path,
-            dataset_name="1_fake",
-            temp_mel_path=temp_mel_path,
-            ffmpeg_exe=ffmpeg_exe
-        )
-
-        if ok:
-            success_fake_videos += 1
-            saved_fake_images += saved_cnt
-            fake_pbar.set_description(
-                f"fake videos={success_fake_videos}/{TARGET_FAKE_VIDEOS}, images={saved_fake_images}"
-            )
-        else:
-            failed_list.append((video_path.name, err))
-
-    total_videos = success_real_videos + success_fake_videos
-    total_images = saved_real_images + saved_fake_images
-
-    print("\nFinished.")
-    print(f"Processed real videos : {success_real_videos}")
-    print(f"Processed fake videos : {success_fake_videos}")
-    print(f"Processed total videos: {total_videos}")
-    print(f"Saved real images     : {saved_real_images}")
-    print(f"Saved fake images     : {saved_fake_images}")
-    print(f"Saved total images    : {total_images}")
-
-    if success_real_videos < TARGET_REAL_VIDEOS:
-        print(
-            f"[WARN] real successful videos less than target: {success_real_videos}/{TARGET_REAL_VIDEOS}"
-        )
-    if success_fake_videos < TARGET_FAKE_VIDEOS:
-        print(
-            f"[WARN] fake successful videos less than target: {success_fake_videos}/{TARGET_FAKE_VIDEOS}"
-        )
-
-    if failed_list:
-        print(f"\nFailed videos: {len(failed_list)}")
-        for item in failed_list[:20]:
-            print("[ERROR]", item[0], "->", item[1])
-
+    print(f"\n[Info] Finished. Extracted {saved_real} real images and {saved_fake} fake images.")
 
 if __name__ == "__main__":
-    run()
+    os.makedirs(output_root, exist_ok=True)
+    os.makedirs("./temp", exist_ok=True)
+    try:
+        run()
+    except KeyboardInterrupt:
+        print("\n[Info] Interrupted by user.")

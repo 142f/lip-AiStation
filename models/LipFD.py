@@ -163,8 +163,10 @@ class LipFD(nn.Module):
             if self.use_modality_bias and self.modality_bias is not None:
                 bias_audio = self.modality_bias[0].view(1, 1, -1).float()
                 bias_video = self.modality_bias[1].view(1, 1, -1).float()
-                x[:, 1:1 + split_idx, :] = x[:, 1:1 + split_idx, :] + bias_audio
-                x[:, 1 + split_idx:, :]  = x[:, 1 + split_idx:, :] + bias_video
+                x_cls = x[:, :1, :]
+                x_audio = x[:, 1:1 + split_idx, :] + bias_audio
+                x_video = x[:, 1 + split_idx:, :] + bias_video
+                x = torch.cat([x_cls, x_audio, x_video], dim=1)
 
             x = visual.ln_pre(x)
 
