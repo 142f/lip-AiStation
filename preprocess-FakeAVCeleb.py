@@ -21,7 +21,7 @@ FakeAVCeleb preprocessing script
 
 ############ Custom parameters ##############
 DATASET_ROOT = r"E:\data\FakeAVCeleb\FakeAVCeleb_v1.2\FakeAVCeleb_v1.2"
-OUTPUT_ROOT = r"E:\data\FakeAVCeleb-test"
+OUTPUT_ROOT = r"E:\data\FakeAVCeleb-test-mb"
 METADATA_CSV = os.path.join(DATASET_ROOT, "meta_data.csv")
 
 N_EXTRACT = 10       # number of temporal windows per video
@@ -29,6 +29,10 @@ WINDOW_LEN = 5       # frames per window
 IMG_SIZE = 500       # resize each frame to IMG_SIZE x IMG_SIZE
 AUDIO_SR = 16000     # unified audio sampling rate
 OVERWRITE = False    # skip already processed videos when False
+
+# 纯视觉任务下排除 RF（RealVideo-FakeAudio）
+# True: 不纳入 RF；False: 保留 RF（会被标成 fake，保持旧行为）
+EXCLUDE_RF_IN_VISUAL = True
 
 # mel parameters
 MEL_N_FFT = 400
@@ -260,9 +264,9 @@ def select_frame_sequence(frame_count: int, n_extract: int, window_len: int):
 
 def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
     """
-    Build 200-video plan:
+    Build selected-video plan:
     - RR: unique one
-    - RF: unique one
+    - RF: optional (can be excluded)
     - FR: sorted first
     - FF: sorted first
     """
@@ -293,9 +297,12 @@ def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
                     rows = rows.sort_values("_sort_key").reset_index(drop=True)
                     chosen = rows.iloc[0]
 
+                    if EXCLUDE_RF_IN_VISUAL and original_type == "RealVideo-FakeAudio":
+                        continue
+
                     video_path = resolve_video_path(dataset_root, chosen["folder"], chosen["filename"])
                     short_type = TYPE_TO_SHORT[original_type]
-                    label = "real" if original_type == "RealVideo-RealAudio" else "fake"
+                    label = "0_real" if original_type == "RealVideo-RealAudio" else "1_fake"
                     sample_name = f"{race}_{gender}_{source_id}_{short_type}".replace(" ", "_")
                     output_frame_dir = os.path.join(OUTPUT_ROOT, label, sample_name)
 
@@ -401,8 +408,8 @@ def process_one_video(video_path: str, save_dir: str):
 
 def run():
     ensure_dir(OUTPUT_ROOT)
-    ensure_dir(os.path.join(OUTPUT_ROOT, "real"))
-    ensure_dir(os.path.join(OUTPUT_ROOT, "fake"))
+    ensure_dir(os.path.join(OUTPUT_ROOT, "0_real"))
+    ensure_dir(os.path.join(OUTPUT_ROOT, "1_fake"))
     ensure_dir(TEMP_AUDIO_DIR)
 
     manifest = build_sample_plan(METADATA_CSV, DATASET_ROOT)
@@ -410,6 +417,7 @@ def run():
     manifest_path = os.path.join(OUTPUT_ROOT, "test_manifest.csv")
     manifest.to_csv(manifest_path, index=False, encoding="utf-8-sig")
     print(f"[INFO] Manifest saved to: {manifest_path}")
+    print(f"[INFO] Exclude RealVideo-FakeAudio: {EXCLUDE_RF_IN_VISUAL}")
     print(f"[INFO] Planned samples: {len(manifest)}")
     print("[INFO] Label counts:", manifest["label"].value_counts().to_dict())
     print("[INFO] Type counts:", manifest["original_type"].value_counts().to_dict())
