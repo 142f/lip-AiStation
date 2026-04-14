@@ -8,7 +8,6 @@ os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
 
 _DLL_DIR_HANDLES = []
 
-
 def _setup_nvidia_dll_path():
     """将 nvidia pip 运行时的 DLL 目录注入 PATH / add_dll_directory。"""
     try:
@@ -44,7 +43,6 @@ def _setup_nvidia_dll_path():
             except Exception:
                 pass
 
-
 _setup_nvidia_dll_path()
 
 import cv2
@@ -55,7 +53,6 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import onnxruntime as ort
-from insightface.app import FaceAnalysis
 
 # =====================================================================
 # 参数配置
@@ -66,13 +63,16 @@ METADATA_CSV = os.path.join(DATASET_ROOT, "meta_data.csv")
 
 INSIGHTFACE_MODEL = "buffalo_l"
 INSIGHTFACE_DET_SIZE = (640, 640)
-FRAME_SKIP = 1  # 设为 1，逐帧提取，不跳帧
-MAX_FRAMES_PER_VIDEO = 500
-FACE_DET_THRESHOLD = 0.2  # 降低阈值，获取更多人脸
+FRAME_SKIP = 1  
+MAX_FRAMES_PER_VIDEO = None  
+FACE_DET_THRESHOLD = 0.2  
 SAVE_FORMAT = ".jpg"
 VERBOSE = False
+FORCE_REPROCESS = False
 
-# FakeAVCeleb 选择逻辑参数
+LABEL_MODE = "visual"
+EXCLUDE_RF_IN_VISUAL = True
+
 SOURCE_SPLIT = {
     "African": {
         "men": ["id00478", "id00781", "id00987", "id01170", "id01179"],
@@ -109,6 +109,17 @@ TYPE_ORDER = [
     "FakeVideo-RealAudio",
     "FakeVideo-FakeAudio",
 ]
+
+def derive_binary_labels(original_type: str) -> dict:
+    visual_fake = original_type in {"FakeVideo-RealAudio", "FakeVideo-FakeAudio"}
+    audio_fake = original_type in {"RealVideo-FakeAudio", "FakeVideo-FakeAudio"}
+    any_fake = original_type != "RealVideo-RealAudio"
+
+    return {
+        "visual": int(visual_fake),
+        "audio": int(audio_fake),
+        "any": int(any_fake),
+    }
 
 # =====================================================================
 # FakeAVCeleb 数据集解析逻辑
@@ -158,8 +169,15 @@ def resolve_video_path(dataset_root: str, folder: str, filename: str) -> str:
     raise FileNotFoundError(f"Cannot resolve video path for folder={folder!r}, filename={filename!r}")
 
 def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
+    if LABEL_MODE not in {"visual", "audio", "any"}:
+        raise ValueError(f"Unsupported LABEL_MODE={LABEL_MODE!r}, expected one of ['visual', 'audio', 'any']")
+
     df = pd.read_csv(metadata_csv)
     df = normalize_metadata(df)
+    
+    # [优化] 引入哈希聚合映射，将 O(N^2) 级的大表扫描布尔索引转为 O(1) 的字典查询
+    grouped_df = dict(tuple(df.groupby(['source', 'race', 'gender', 'type'])))
+    
     records = []
     sample_idx = 1
 
@@ -167,42 +185,47 @@ def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
         for gender, source_ids in gender_map.items():
             for source_id in source_ids:
                 for original_type in TYPE_ORDER:
-                    rows = df[
-                        (df["source"] == source_id)
-                        & (df["race"] == race)
-                        & (df["gender"] == gender)
-                        & (df["type"] == original_type)
-                    ].copy()
-
-                    if rows.empty:
+                    
+                    # 极速 O(1) 数据拉取
+                    rows = grouped_df.get((source_id, race, gender, original_type))
+                    if rows is None or rows.empty:
                         raise ValueError(f"No metadata row found for {source_id}, {race}, {gender}, {original_type}")
 
+                    rows = rows.copy()
                     rows["_sort_key"] = rows["filename"].astype(str) + "|" + rows["folder"].astype(str)
                     rows = rows.sort_values("_sort_key").reset_index(drop=True)
                     chosen = rows.iloc[0]
 
                     video_path = resolve_video_path(dataset_root, chosen["folder"], chosen["filename"])
-                    label_dir = "0_real" if original_type == "RealVideo-RealAudio" else "1_fake"
-                    label_val = 0 if label_dir == "0_real" else 1
+
+                    if LABEL_MODE == "visual" and EXCLUDE_RF_IN_VISUAL and original_type == "RealVideo-FakeAudio":
+                        continue
+
+                    labels = derive_binary_labels(original_type)
+                    label_val = labels[LABEL_MODE]
+                    label_dir = "1_fake" if label_val == 1 else "0_real"
                     
-                    # 使用与原脚本一致的命名，或者直接用 filename
                     v_name = f"{race}_{gender}_{source_id}_{TYPE_TO_SHORT[original_type]}.mp4".replace(" ", "_")
 
                     records.append({
+                        "sample_id": f"S{sample_idx:04d}",
                         "video_path": video_path,
                         "v_name": v_name,
                         "label_val": label_val,
-                        "out_dir": os.path.join(OUTPUT_ROOT, label_dir)
+                        "out_dir": os.path.join(OUTPUT_ROOT, label_dir),
+                        "original_type": original_type,
+                        "label_mode": LABEL_MODE,
+                        "visual_label": labels["visual"],
+                        "audio_label": labels["audio"],
+                        "any_label": labels["any"],
                     })
                     sample_idx += 1
 
     return pd.DataFrame(records)
 
-
 # =====================================================================
 # InsightFace 预处理逻辑
 # =====================================================================
-
 def safe_imwrite(file_path, img):
     try:
         ext = os.path.splitext(file_path)[1] or SAVE_FORMAT
@@ -211,31 +234,114 @@ def safe_imwrite(file_path, img):
             with open(file_path, "wb") as f:
                 f.write(im_buf_arr.tobytes())
             return True
+        if VERBOSE:
+            print(f"[WARN] cv2.imencode 失败: {file_path}")
         return False
+    except Exception as e:
+        if VERBOSE:
+            print(f"[WARN] 图片写入异常 {file_path}: {e}")
+        return False
+
+def is_processed_video_complete(json_path: str, v_out_dir: str) -> bool:
+    if not os.path.exists(json_path):
+        return False
+
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
     except Exception:
         return False
 
+    frames = metadata.get("frames")
+    if not isinstance(frames, list) or len(frames) == 0:
+        return False
+
+    # [优化] 将 O(N) 级别基于磁盘的 os.path.exists 扫描，转为基于内存哈希表的 O(1) 检索
+    try:
+        existing_files = set(os.listdir(v_out_dir))
+    except OSError:
+        return False
+
+    for item in frames:
+        file_path = item.get("file_path") if isinstance(item, dict) else None
+        if not file_path or file_path not in existing_files:
+            return False
+
+    return True
+
+def _build_face_payload(face):
+    """
+    序列化 InsightFace 结果。
+    [优化] 启用纯粹的 Numpy C 级别向量化操作，剔除低效的 Python 显式类型转换循环。
+    """
+    bbox = getattr(face, "bbox", None)
+    bbox_list = np.round(bbox, 2).tolist() if bbox is not None else [0.0, 0.0, 0.0, 0.0]
+
+    payload = {
+        "bbox": bbox_list,
+        "det_score": round(float(getattr(face, "det_score", 0.0)), 4),
+        "kps_5": None,
+        "kps_106": None,
+    }
+
+    kps_5_obj = getattr(face, "kps", None)
+    if kps_5_obj is not None:
+        payload["kps_5"] = np.round(kps_5_obj, 2).tolist()
+
+    kps_106_obj = getattr(face, "landmark_2d_106", None)
+    if kps_106_obj is not None:
+        payload["kps_106"] = np.round(kps_106_obj, 2).tolist()
+
+    return payload
+
 class SafeVideoCapture:
     def __init__(self, path):
-        self.path = path
+        self.path = str(path)
         self.temp_path = None
         self.cap = None
-        if not path.isascii():
+
+    def __enter__(self):
+        if not self.path.isascii():
             fd, self.temp_path = tempfile.mkstemp(suffix='.mp4')
             os.close(fd)
-            shutil.copy2(path, self.temp_path)
+            os.remove(self.temp_path)
+            try:
+                os.link(self.path, self.temp_path)
+            except OSError:
+                shutil.copy2(self.path, self.temp_path)
             self.cap = cv2.VideoCapture(self.temp_path)
         else:
-            self.cap = cv2.VideoCapture(path)
+            self.cap = cv2.VideoCapture(self.path)
+        return self
 
-    def isOpened(self): return self.cap.isOpened() if self.cap else False
-    def get(self, prop_id): return self.cap.get(prop_id) if self.cap else 0
-    def read(self): return self.cap.read() if self.cap else (False, None)
     def release(self):
-        if self.cap: self.cap.release()
+        """[优化] 统一资源回收出口，消除职责冗余并采取防御性重置，防止野指针。"""
+        if self.cap:
+            self.cap.release()
+            self.cap = None 
         if self.temp_path and os.path.exists(self.temp_path):
-            try: os.remove(self.temp_path)
-            except: pass
+            try:
+                os.remove(self.temp_path)
+            except OSError:
+                pass
+            self.temp_path = None
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+    def isOpened(self):
+        return self.cap.isOpened() if self.cap else False
+
+    def get(self, prop_id):
+        return self.cap.get(prop_id) if self.cap else 0
+
+    def grab(self):
+        return self.cap.grab() if self.cap else False
+
+    def retrieve(self):
+        return self.cap.retrieve() if self.cap else (False, None)
+
 
 global_app = None
 
@@ -244,7 +350,6 @@ def init_worker():
     import logging
     logging.getLogger('insightface').setLevel(logging.ERROR)
 
-    # 先预加载 CUDA/cuDNN 依赖，适配 pip 安装的 nvidia-* 运行时包
     try:
         ort.preload_dlls()
     except Exception as e:
@@ -267,7 +372,6 @@ def init_worker():
                         and probe_session.get_providers()[0] == 'CUDAExecutionProvider'
                     )
                 else:
-                    # 首次运行模型尚未下载时，先按 CUDA 路径走，后续由 InsightFace 实际校验
                     cuda_ok = True
             except Exception as e:
                 print(f"[WARN] CUDA provider 探测失败，回退 CPU: {e}")
@@ -290,95 +394,123 @@ def init_worker():
         providers = ['CPUExecutionProvider']
         ctx_id = -1
 
+    try:
+        from insightface.app import FaceAnalysis
+    except Exception as e:
+        print(f"[ERROR] 无法导入 insightface: {e}")
+        print("请确认在当前虚拟环境中已安装 insightface, onnxruntime 以及 albumentations 等依赖。")
+        raise
+
     global_app = FaceAnalysis(name=INSIGHTFACE_MODEL, providers=providers)
     global_app.prepare(ctx_id=ctx_id, det_size=INSIGHTFACE_DET_SIZE)
     print(f"[InsightFace] 初始化完毕，运行设备: {'GPU (CUDA)' if ctx_id == 0 else 'CPU'}")
 
 
-def process_single_video(task_args):
-    v_path, v_name, label_val, out_dir = task_args
+def process_single_video(task_dict: dict):
+    v_path = task_dict['video_path']
+    v_name = task_dict['v_name']
+    label_val = task_dict['label_val']
+    out_dir = task_dict['out_dir']
+    original_type = task_dict.get('original_type', 'unknown')
+    visual_label = task_dict.get('visual_label')
+    audio_label = task_dict.get('audio_label')
+    any_label = task_dict.get('any_label')
+
     v_stem = os.path.splitext(v_name)[0]
     v_out_dir = os.path.join(out_dir, v_stem)
     json_path = os.path.join(v_out_dir, 'metadata.json')
 
-    if os.path.exists(json_path): return True
+    if not FORCE_REPROCESS and is_processed_video_complete(json_path, v_out_dir):
+        return True
+
+    if os.path.isdir(v_out_dir):
+        shutil.rmtree(v_out_dir, ignore_errors=True)
 
     os.makedirs(v_out_dir, exist_ok=True)
-    cap = SafeVideoCapture(v_path)
-    if not cap.isOpened(): return False
+    with SafeVideoCapture(v_path) as cap:
+        if not cap.isOpened():
+            return False
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames_meta = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if fps <= 0 or total_frames <= 0:
-        cap.release()
-        return False
+        metadata = {
+            "video_info": {
+                "video_name": v_name,
+                "label": label_val,
+                "fps": round(fps, 4),
+                "total_frames": total_frames_meta,
+                "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                "frame_skip": FRAME_SKIP,
+                "face_det_threshold": FACE_DET_THRESHOLD,
+                "original_type": original_type,
+                "label_mode": LABEL_MODE,
+                "visual_label": visual_label,
+                "audio_label": audio_label,
+                "any_label": any_label,
+            },
+            "frames": []
+        }
 
-    metadata = {
-        "video_info": {
-            "video_name": v_name, "label": label_val,
-            "fps": round(fps, 4), "total_frames": total_frames,
-            "width": width, "height": height
-        },
-        "frames": []
-    }
+        frame_idx, saved_count, face_hit_count = 0, 0, 0
 
-    frame_idx, saved_count = 0, 0
+        while True:
+            if MAX_FRAMES_PER_VIDEO is not None and saved_count >= MAX_FRAMES_PER_VIDEO:
+                break
 
-    while True:
-        ret, frame = cap.read()
-        if not ret or saved_count >= MAX_FRAMES_PER_VIDEO: break
-        
-        if frame_idx % FRAME_SKIP != 0:
-            frame_idx += 1
-            continue
+            if not cap.grab():
+                break
 
-        faces = global_app.get(frame)
-        if faces:
-            valid_faces = [f for f in faces if getattr(f, 'det_score', 0) >= FACE_DET_THRESHOLD]
-            if not valid_faces:
+            if frame_idx % FRAME_SKIP != 0:
                 frame_idx += 1
                 continue
 
-            best_face = max(valid_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-            
-            kps_5 = best_face.kps.tolist()
-            kps_106 = best_face.landmark_2d_106.tolist() if getattr(best_face, 'landmark_2d_106', None) is not None else None
+            ret, frame = cap.retrieve()
+            if not ret or frame is None:
+                break
 
-            if kps_106 is None:
-                frame_idx += 1
-                continue
+            face_payload = None
+            try:
+                faces = global_app.get(frame)
+                if faces:
+                    valid_faces = [f for f in faces if getattr(f, 'det_score', 0) >= FACE_DET_THRESHOLD]
+                    if valid_faces:
+                        best_face = max(valid_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                        face_payload = _build_face_payload(best_face)
+            except Exception as e:
+                if VERBOSE:
+                    print(f"[WARN] 人脸检测异常 frame={frame_idx}: {e}")
 
             img_name = f"frame_{frame_idx:06d}{SAVE_FORMAT}"
             img_path = os.path.join(v_out_dir, img_name)
 
-            if not safe_imwrite(img_path, frame):
-                frame_idx += 1
-                continue
+            if safe_imwrite(img_path, frame):
+                metadata["frames"].append({
+                    "file_path": img_name,
+                    "frame_idx": frame_idx,
+                    "has_face": face_payload is not None,
+                    "face": face_payload,
+                })
+                saved_count += 1
+                if face_payload is not None:
+                    face_hit_count += 1
 
-            metadata["frames"].append({
-                "file_path": img_name,
-                "frame_idx": frame_idx,
-                "face": {
-                    "bbox": [round(v, 2) for v in best_face.bbox.tolist()],
-                    "det_score": round(float(best_face.det_score), 4),
-                    "kps_5": [[round(x, 2), round(y, 2)] for x, y in kps_5],
-                    "kps_106": [[round(x, 2), round(y, 2)] for x, y in kps_106]
-                }
-            })
-            saved_count += 1
-        frame_idx += 1
+            frame_idx += 1
 
-    cap.release()
+    metadata["video_info"]["saved_frames"] = saved_count
+    metadata["video_info"]["face_frames"] = face_hit_count
 
     if metadata["frames"]:
+        tmp_json_path = json_path + ".tmp"
         try:
-            with open(json_path, 'w', encoding='utf-8') as f:
+            with open(tmp_json_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_json_path, json_path)
             return True
         except Exception:
+            if os.path.exists(tmp_json_path):
+                os.remove(tmp_json_path)
             return False
     else:
         try: shutil.rmtree(v_out_dir, ignore_errors=True)
@@ -390,9 +522,12 @@ def process_single_video(task_args):
 # =====================================================================
 def run():
     print("=" * 60)
-    print("🚀 融合版 - FakeAVCeleb 特选视频 -> InsightFace 预处理")
+    print("🚀 融合版 - FakeAVCeleb 特选视频 -> InsightFace 预处理 (终极版)")
     print(f"[配置] 视频源: {DATASET_ROOT}")
     print(f"[配置] 输出至: {OUTPUT_ROOT}")
+    print(f"[配置] 标签模式: {LABEL_MODE}")
+    if LABEL_MODE == "visual":
+        print(f"[配置] 视觉任务排除 RF: {EXCLUDE_RF_IN_VISUAL}")
     print("=" * 60)
 
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
@@ -403,15 +538,17 @@ def run():
     plan_df = build_sample_plan(METADATA_CSV, DATASET_ROOT)
     task_queue = plan_df.to_dict('records')
     print(f"计划处理视频数: {len(task_queue)}")
+    if len(plan_df) > 0:
+        print("标签分布:", plan_df["label_val"].value_counts().to_dict())
+        print("类型分布:", plan_df["original_type"].value_counts().to_dict())
 
     print("[2/2] 初始化 InsightFace 并执行处理...")
     init_worker()
 
     success_count, fail_count = 0, 0
     with tqdm(total=len(task_queue), desc="处理进度") as pbar:
-        for t in task_queue:
-            task_args = (t['video_path'], t['v_name'], t['label_val'], t['out_dir'])
-            if process_single_video(task_args):
+        for task_dict in task_queue:
+            if process_single_video(task_dict):
                 success_count += 1
             else:
                 fail_count += 1

@@ -1,252 +1,269 @@
 import argparse
-import json
-import os
-
 import torch
+import numpy as np
+import os
 import torch.utils.data
-
-from evaluation.binary import evaluate_fixed_threshold, nested_crops_collate, run_binary_inference
-from evaluation.runtime import load_checkpoint, set_ablation_env
 from models import build_model
 
+# ==========================================
+# 数据集导入模块
+# ==========================================
+# 注意：如果您的 AVLip 定义在 data/__init__.py，请改为 from data import AVLip
+# 如果定义在 data/datasets.py，请保持如下：
 try:
     from data.datasets import AVLip
 except ImportError:
     from data import AVLip
 
-
-def _write_text_lines(output_path, lines):
-    with open(output_path, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(f"{line}\n")
+from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve, roc_auc_score, precision_recall_curve
+from tqdm import tqdm
 
 
-def export_error_reports(
-    output_dir,
-    report_prefix,
-    sample_paths,
-    y_true,
-    y_prob,
-    threshold,
-    save_all_predictions=False,
-):
-    os.makedirs(output_dir, exist_ok=True)
-    prefix = str(report_prefix or "test").strip() or "test"
-
-    y_pred_binary = (y_prob >= float(threshold)).astype(int)
-    sample_count = int(len(y_true))
-
-    if len(sample_paths) < sample_count:
-        sample_paths = list(sample_paths) + [f"sample_{i}" for i in range(len(sample_paths), sample_count)]
-    elif len(sample_paths) > sample_count:
-        sample_paths = list(sample_paths[:sample_count])
-    else:
-        sample_paths = list(sample_paths)
-
-    real_as_fake = []
-    fake_as_real = []
-    all_failed = []
-
-    prediction_tsv_path = os.path.join(output_dir, f"{prefix}_predictions.tsv")
-    if save_all_predictions:
-        with open(prediction_tsv_path, "w", encoding="utf-8") as f:
-            f.write("image_path\ttrue_label\tpred_label\tprob_fake\tthreshold\terror_type\n")
-            for idx in range(sample_count):
-                true_label = int(y_true[idx])
-                pred_label = int(y_pred_binary[idx])
-                prob_fake = float(y_prob[idx])
-                image_path = sample_paths[idx]
-
-                if true_label == 0 and pred_label == 1:
-                    error_type = "real_as_fake"
-                    real_as_fake.append(image_path)
-                    all_failed.append(image_path)
-                elif true_label == 1 and pred_label == 0:
-                    error_type = "fake_as_real"
-                    fake_as_real.append(image_path)
-                    all_failed.append(image_path)
-                else:
-                    error_type = "correct"
-
-                f.write(
-                    f"{image_path}\t{true_label}\t{pred_label}\t{prob_fake:.8f}\t"
-                    f"{float(threshold):.8f}\t{error_type}\n"
-                )
-    else:
-        for idx in range(sample_count):
-            true_label = int(y_true[idx])
-            pred_label = int(y_pred_binary[idx])
-            image_path = sample_paths[idx]
-            if true_label == 0 and pred_label == 1:
-                real_as_fake.append(image_path)
-                all_failed.append(image_path)
-            elif true_label == 1 and pred_label == 0:
-                fake_as_real.append(image_path)
-                all_failed.append(image_path)
-
-    real_as_fake_path = os.path.join(output_dir, f"{prefix}_misclassified_real_as_fake.txt")
-    fake_as_real_path = os.path.join(output_dir, f"{prefix}_misclassified_fake_as_real.txt")
-    all_failed_path = os.path.join(output_dir, f"{prefix}_misclassified_all.txt")
-    summary_path = os.path.join(output_dir, f"{prefix}_misclassified_summary.json")
-
-    _write_text_lines(real_as_fake_path, real_as_fake)
-    _write_text_lines(fake_as_real_path, fake_as_real)
-    _write_text_lines(all_failed_path, all_failed)
-
-    summary = {
-        "threshold": float(threshold),
-        "num_samples": sample_count,
-        "num_misclassified_total": int(len(all_failed)),
-        "num_real_as_fake": int(len(real_as_fake)),
-        "num_fake_as_real": int(len(fake_as_real)),
-        "real_as_fake_list": real_as_fake_path,
-        "fake_as_real_list": fake_as_real_path,
-        "all_failed_list": all_failed_path,
-        "predictions_tsv": prediction_tsv_path if save_all_predictions else "",
-    }
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-
-    summary["summary_json"] = summary_path
-    return summary
+# ==========================================
+# 自定义 collate_fn 处理嵌套 List 结构
+# ==========================================
+def custom_collate_fn(batch):
+    """
+    自定义 collate 函数，正确处理 AVLip 返回的嵌套 List 结构
+    batch: List of (img, crops, label)
+           其中 crops 是 List[List[Tensor]]，形状为 [3个尺度][5个区域]
+    """
+    imgs = torch.stack([item[0] for item in batch])  # (B, C, H, W)
+    labels = torch.tensor([item[2] for item in batch])  # (B,)
+    
+    # 处理 crops：将 [B][3][5] 转换为 [3][5][B, C, H, W]
+    # 即：每个尺度、每个区域的所有 batch 样本堆叠在一起
+    num_scales = len(batch[0][1])  # 3
+    num_regions = len(batch[0][1][0])  # 5
+    
+    crops_batched = []
+    for scale_idx in range(num_scales):
+        scale_crops = []
+        for region_idx in range(num_regions):
+            # 收集所有 batch 中同一尺度、同一区域的 tensor
+            region_tensors = [item[1][scale_idx][region_idx] for item in batch]
+            scale_crops.append(torch.stack(region_tensors))  # (B, C, H, W)
+        crops_batched.append(scale_crops)
+    
+    return imgs, crops_batched, labels
 
 
-def test(
-    model,
-    loader,
-    gpu_id,
-    threshold=0.5,
-    errors_output_dir="",
-    errors_prefix="test",
-    save_all_predictions=False,
-):
+# ==========================================
+# 核心测试函数
+# ==========================================
+def test(model, loader, gpu_id):
+    """
+    在测试集上评估模型性能，包含鲁棒性异常处理与高阶指标计算
+    """
     device = torch.device(f"cuda:{gpu_id[0]}" if torch.cuda.is_available() else "cpu")
-    y_true, y_prob = run_binary_inference(
-        model=model,
-        loader=loader,
-        device=device,
-        desc="Testing",
-        leave=True,
-    )
+    model.eval()
+    
+    y_true, y_pred = [], []
+    
+    print("\n" + "="*20 + " 开始测试循环 (Testing Loop) " + "="*20)
+    
+    with torch.no_grad():
+        # --- [GPU 归一化准备] ---
+        # 移到循环外，避免每个 batch 重复创建 tensor
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        
+        def process(tensor):
+            # [鲁棒性修复] 增加 dtype 检查
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.float().div_(255.0)
+            return (tensor - mean) / std
 
-    metrics = evaluate_fixed_threshold(y_true, y_prob, threshold=threshold)
-    if metrics["single_class"]:
-        print("Warning: test set has one class only. AUC/AP are undefined.")
+        for i, (img, raw_crops, label) in enumerate(tqdm(loader, desc="Testing", leave=True)):
+            # 1. 接收数据
+            img = img.to(device, non_blocking=True)
+            
+            # 2. 全局输入归一化 (与 validate.py 保持同步)
+            # 数据集返回的是 [0, 1] 浮点型张量
+            if img.dtype == torch.uint8:
+                img = img.float().div_(255.0)
+            img_tens = img.sub(mean).div(std)
+            
+            # 3. 处理人脸裁剪区域 (Crops)
+            # raw_crops 是通过 custom_collate_fn 转换得到的 List[List[Tensor]]
+            # 数据集已经完成了 crop 的归一化，直接转移至 GPU
+            crops_tens = []
+            for scale_list in raw_crops:
+                processed_scale = []
+                for crop_batch in scale_list:
+                    c = crop_batch.to(device, non_blocking=True)
+                    processed_scale.append(c)
+                crops_tens.append(processed_scale)
+            
+            # 4. 模型推理
+            # 注意：get_features 返回的 tensor 已经在 model 所在的 device 上
+            features = model.get_features(img_tens)
+            # model.forward 返回 (logits, weights_max, weights_org)
+            logits = model(crops_tens, features)[0]
+            
+            # 计算概率
+            probs = torch.softmax(logits, dim=1)
+            pred_score = probs[:, 1]  # 取 Fake 类的概率作为风险得分
+            
+            y_pred.extend(pred_score.flatten().tolist())
+            y_true.extend(label.flatten().tolist())
 
-    print("\n" + "#" * 60)
-    print("Final Test Report")
-    print(f"Samples    : {len(y_true)}")
-    print(f"Threshold  : {metrics['threshold']:.4f} (fixed)")
-    print(
-        f"ConfMatrix : [TN: {metrics['tn']}  FP: {metrics['fp']} | "
-        f"FN: {metrics['fn']}  TP: {metrics['tp']}]"
-    )
+    y_true = np.array(y_true)
+    y_pred_prob = np.array(y_pred)
+
+    # --- 指标计算与边界防护 ---
+    if len(np.unique(y_true)) < 2:
+        print("Warning: 测试集中只包含一类数据，无法计算交叉指标 (AUC/AP/FPR/FNR)。")
+        # 为保持返回值结构一致性，全部返回 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # AUC
+    try:
+        auc = roc_auc_score(y_true, y_pred_prob)
+    except ValueError as e:
+        print(f"Warning: 计算 AUC 时出错: {e}")
+        auc = 0.0
+
+    # AP (Average Precision)
+    ap = average_precision_score(y_true, y_pred_prob)
+    
+    # 寻找尤登指数 (Youden's J statistic) 对应的最佳阈值
+    fpr_curve, tpr_curve, thresholds = roc_curve(y_true, y_pred_prob)
+    j_scores = tpr_curve - fpr_curve
+    best_idx = np.argmax(j_scores)
+    best_threshold = thresholds[best_idx]
+    
+    # 基于最佳阈值进行二值化预测
+    y_pred_binary = np.where(y_pred_prob >= best_threshold, 1, 0)
+    
+    # ACC & Confusion Matrix
+    acc = accuracy_score(y_true, y_pred_binary)
+    # 【鲁棒性拦截】显式声明 labels=[0,1]，防止单一预测导致矩阵坍缩为 1x1，引发解包崩溃
+    cm = confusion_matrix(y_true, y_pred_binary, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    
+    # 【新增指标计算与除零防护】
+    # 防止分母为 0 导致系统告警崩溃。如果分母为 0，意味着对应的真实样本不存在，此时该比率在业务上定义为 0
+    fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+    fnr = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+    
+    # F1 Score
+    precisions, recalls, pr_thresholds = precision_recall_curve(y_true, y_pred_prob)
+    # 增加 1e-10 防止分母为 0
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    best_f1 = np.max(f1_scores)
+    
+    print("\n" + "#"*60)
+    print(f"【最终测试报告 / Test Report】")
+    print(f"数据量   : {len(y_true)} 样本")
+    print(f"混淆矩阵 : [TN: {tn}  FP: {fp} | FN: {fn}  TP: {tp}]")
     print("-" * 30)
-    print(f"AUC        : {metrics['auc']:.4f}")
-    print(f"AP         : {metrics['ap']:.4f}")
-    print(f"ACC        : {metrics['acc']:.4f}")
-    print(f"F1         : {metrics['f1']:.4f}")
-    print("#" * 60 + "\n")
+    print(f"AUC       : {auc:.4f}")
+    print(f"AP        : {ap:.4f}")
+    print(f"ACC       : {acc:.4f}")
+    print(f"Best F1   : {best_f1:.4f}")
+    print("-" * 30)
+    print(f"FPR (误报): {fpr:.4f}  <- 假阳性率: 真实负例被预测为正例的比例")
+    print(f"FNR (漏报): {fnr:.4f}  <- 假阴性率: 真实正例被预测为负例的比例")
+    print(f"最佳阈值  : {best_threshold:.4f}")
+    print("#"*60 + "\n")
 
-    if str(errors_output_dir).strip():
-        sample_paths = list(getattr(loader.dataset, "total_list", []))
-        summary = export_error_reports(
-            output_dir=errors_output_dir,
-            report_prefix=errors_prefix,
-            sample_paths=sample_paths,
-            y_true=y_true,
-            y_prob=y_prob,
-            threshold=float(threshold),
-            save_all_predictions=bool(save_all_predictions),
-        )
-        print(f"[Info] Misclassified reports saved to: {errors_output_dir}")
-        print(
-            f"[Info] Misclassified: total={summary['num_misclassified_total']} | "
-            f"real->fake={summary['num_real_as_fake']} | fake->real={summary['num_fake_as_real']}"
-        )
-        print(f"[Info] Summary file: {summary['summary_json']}")
-
-    return (
-        metrics["auc"],
-        metrics["ap"],
-        metrics["acc"],
-        metrics["f1"],
-        metrics["threshold"],
-        metrics["tn"],
-        metrics["fp"],
-        metrics["fn"],
-        metrics["tp"],
-    )
+    # 返回所有核心指标以便外部监控或日志使用
+    return auc, ap, acc, best_f1, fpr, fnr
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
+    
+    # 路径参数
     parser.add_argument("--real_list_path", type=str, required=True)
     parser.add_argument("--fake_list_path", type=str, required=True)
     parser.add_argument("--ckpt", type=str, required=True, help="Path to best_model.pth")
-
+    
+    # 运行参数
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14")
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--threshold", type=float, default=0.5, help="Fixed threshold for ACC/F1")
-    parser.add_argument("--allow_partial_load", action="store_true", help="Allow partial checkpoint loading")
-    parser.add_argument("--errors_output_dir", type=str, default="", help="Directory to save misclassified sample lists.")
-    parser.add_argument("--errors_prefix", type=str, default="test", help="Filename prefix for misclassified reports.")
-    parser.add_argument("--save_all_predictions", action="store_true", help="Also save per-sample prediction TSV.")
-
-    parser.add_argument("--data_label", type=str, default="test")
-    parser.add_argument("--fix_backbone", action="store_true")
-    parser.add_argument("--fix_encoder", action="store_true")
+    
+    # 数据集兼容参数
+    parser.add_argument("--data_label", type=str, default="val") 
+    parser.add_argument("--num_classes", type=int, default=2) 
+    parser.add_argument("--fix_backbone", action='store_true')
+    parser.add_argument("--fix_encoder", action='store_true')
     parser.add_argument("--name", type=str, default="test_experiment")
 
-    parser.add_argument("--no_innov", action="store_true")
-    parser.add_argument("--no_modality_bias", action="store_true")
-    parser.add_argument("--no_attn_bias", action="store_true")
-    parser.add_argument("--no_se_fusion", action="store_true")
-    parser.add_argument("--no_residual_cls", action="store_true")
-    parser.add_argument("--no_region_innov", action="store_true")
-    parser.add_argument("--no_region_pe", action="store_true")
-    parser.add_argument("--no_region_se", action="store_true")
-
     opt = parser.parse_args()
-    set_ablation_env(opt)
 
+    # 设置设备
     device = torch.device(f"cuda:{opt.gpu}" if torch.cuda.is_available() else "cpu")
-    print(f"[Info] Device: {device}")
+    print(f"[Info] 使用设备: {device}")
 
+    # 1. 构建模型
+    print(f"[Info] 构建模型: {opt.arch}")
     model = build_model(opt.arch)
     model.to(device)
 
-    if not os.path.exists(opt.ckpt):
-        raise FileNotFoundError(f"Checkpoint not found: {opt.ckpt}")
+    # 2. 加载权重 (【核心修复】解决丢失键问题)
+    if os.path.exists(opt.ckpt):
+        print(f"[Info] 正在加载权重: {opt.ckpt}")
+        checkpoint = torch.load(opt.ckpt, map_location="cpu")
+        
+        state_dict = None
+        # 优先加载 EMA
+        if "model_ema" in checkpoint:
+            state_dict = checkpoint["model_ema"]
+            print(f"   -> 发现 EMA 权重，优先加载")
+        elif "model" in checkpoint:
+            state_dict = checkpoint["model"]
+            print(f"   -> 加载标准 Model 权重")
+        else:
+            state_dict = checkpoint
+            print(f"   -> 加载 Raw State Dict")
 
-    print(f"[Info] Loading checkpoint: {opt.ckpt}")
-    info = load_checkpoint(model, opt.ckpt, allow_partial_load=opt.allow_partial_load, prefer_ema=True)
-    print(f"[Info] Checkpoint source: {info['source']}")
+        # 【核心修复】去除 'module.' 和 '_orig_mod.' 前缀 (针对多卡训练或 torch.compile 的情况)
+        # 使用循环去除所有可能的前缀组合 (如 module._orig_mod. 或 _orig_mod.module.)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k
+            while name.startswith('module.') or name.startswith('_orig_mod.'):
+                if name.startswith('module.'):
+                    name = name[7:]
+                elif name.startswith('_orig_mod.'):
+                    name = name[10:]
+            new_state_dict[name] = v
+        state_dict = new_state_dict
 
+        # 加载并检查
+        msg = model.load_state_dict(state_dict, strict=False)
+        print(f"[Info] 权重加载结果: 丢失键 {len(msg.missing_keys)} | 多余键 {len(msg.unexpected_keys)}")
+        
+        if len(msg.missing_keys) > 0:
+            print(f"   !!! 警告: 依然有丢失键，请检查 arch 是否匹配，或前 5 个丢失键: {msg.missing_keys[:5]}")
+
+    else:
+        print(f"[Error] 找不到权重文件: {opt.ckpt}")
+        exit()
+
+    # 3. 准备数据
+    print(f"[Info] 初始化数据集...")
     dataset = AVLip(opt)
+    
     if len(dataset) == 0:
-        raise RuntimeError("Dataset is empty. Check real/fake paths.")
-
-    print(f"[Info] Test samples: {len(dataset)}")
-
+        print(f"[Error] 数据集为空！请检查路径是否正确。")
+        exit()
+        
+    print(f"[Info] 测试集样本数: {len(dataset)}")
+    
     loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=opt.batch_size,
-        shuffle=False,
+        dataset, 
+        batch_size=opt.batch_size, 
+        shuffle=False, 
         num_workers=opt.workers,
         pin_memory=True,
-        collate_fn=nested_crops_collate,
+        collate_fn=custom_collate_fn  # 【关键修复】使用自定义 collate 处理嵌套列表
     )
-
-    test(
-        model,
-        loader,
-        gpu_id=[opt.gpu],
-        threshold=float(opt.threshold),
-        errors_output_dir=opt.errors_output_dir,
-        errors_prefix=opt.errors_prefix,
-        save_all_predictions=bool(opt.save_all_predictions),
-    )
+    
+    # 4. 运行测试
+    # 解包增加接收 fpr 和 fnr
+    test_results = test(model, loader, gpu_id=[opt.gpu])
