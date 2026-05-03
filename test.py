@@ -2,7 +2,9 @@ import argparse
 import torch
 import numpy as np
 import os
+import re
 import torch.utils.data
+import utils
 from models import build_model
 
 # ==========================================
@@ -46,6 +48,337 @@ def custom_collate_fn(batch):
         crops_batched.append(scale_crops)
     
     return imgs, crops_batched, labels
+
+
+LABEL_DIR_NAMES = {"0_real", "1_fake", "real", "fake"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+FRAME_FILE_RE = re.compile(r"^(?:group|frame)_\d+$", re.IGNORECASE)
+LAV_REAL_PAIR_RE = re.compile(r"^(?P<pair>.+?_pair_.+?)_seg\d+_\d+$", re.IGNORECASE)
+LAV_FAKE_RE = re.compile(r"^(?P<video>.+?)_seg\d+_\d+$", re.IGNORECASE)
+TRAILING_FRAME_RE = re.compile(r"^(?P<video>.+)_\d+$")
+VIDEO_AGG_METHODS = ("mean", "max", "top3_mean", "top5_mean", "median")
+
+
+def get_sorted_image_list(path):
+    """
+    test.py 专用图片列表读取：
+    - 支持 .png/.jpg/.jpeg 的大小写变体
+    - 目录和文件名排序，保证预测顺序与视频聚合顺序稳定
+    """
+    image_list = []
+    for root, dirs, files in os.walk(str(path).replace("\x00", "")):
+        dirs.sort()
+        for filename in sorted(files):
+            if os.path.splitext(filename)[1].lower() in IMAGE_EXTENSIONS:
+                image_list.append(os.path.join(root, filename))
+    return image_list
+
+
+def count_images_recursive(path):
+    return len(get_sorted_image_list(path)) if path else 0
+
+
+def _clean_path_arg(path):
+    return str(path or "").strip().strip('"').strip("'")
+
+
+def _find_label_dir(root, names):
+    for name in names:
+        candidate = os.path.join(root, name)
+        if os.path.isdir(candidate):
+            return candidate
+    if os.path.isdir(root):
+        wanted = {name.lower() for name in names}
+        for child in sorted(os.listdir(root)):
+            candidate = os.path.join(root, child)
+            if child.lower() in wanted and os.path.isdir(candidate):
+                return candidate
+    return ""
+
+
+def resolve_test_paths(opt):
+    """Resolve old real/fake inputs and preprocess.py output roots.
+
+    Supported layouts:
+    - --real_list_path <root>/0_real --fake_list_path <root>/1_fake
+    - --data_root <root> where <root>/0_real and <root>/1_fake exist
+    - --data_root <root> where <root>/test/0_real and <root>/test/1_fake exist
+    - --real_list_path <root> with no --fake_list_path, if root contains both labels
+    """
+    real_path = _clean_path_arg(getattr(opt, "real_list_path", ""))
+    fake_path = _clean_path_arg(getattr(opt, "fake_list_path", ""))
+    data_root = _clean_path_arg(getattr(opt, "data_root", ""))
+
+    if real_path and not fake_path and os.path.isdir(real_path):
+        maybe_real = _find_label_dir(real_path, ("0_real", "real"))
+        maybe_fake = _find_label_dir(real_path, ("1_fake", "fake"))
+        if maybe_real and maybe_fake:
+            data_root = real_path
+            real_path = ""
+
+    if data_root and (not real_path or not fake_path):
+        root = os.path.abspath(os.path.normpath(data_root))
+        split_root = os.path.join(root, "test") if os.path.isdir(os.path.join(root, "test")) else root
+        if not real_path:
+            real_path = _find_label_dir(split_root, ("0_real", "real"))
+        if not fake_path:
+            fake_path = _find_label_dir(split_root, ("1_fake", "fake"))
+
+    if not real_path or not fake_path:
+        raise ValueError(
+            "Provide --real_list_path and --fake_list_path, or provide --data_root "
+            "pointing to a preprocess.py output folder that contains 0_real and 1_fake."
+        )
+
+    real_path = os.path.abspath(os.path.normpath(real_path))
+    fake_path = os.path.abspath(os.path.normpath(fake_path))
+
+    if not os.path.isdir(real_path):
+        raise FileNotFoundError(f"real_list_path not found: {real_path}")
+    if not os.path.isdir(fake_path):
+        raise FileNotFoundError(f"fake_list_path not found: {fake_path}")
+
+    return real_path, fake_path
+
+
+def _split_path_parts(path):
+    normalized = os.path.normpath(str(path))
+    drive, tail = os.path.splitdrive(normalized)
+    parts = [part for part in tail.split(os.sep) if part]
+    if drive:
+        parts.insert(0, drive)
+    return normalized, parts
+
+
+def _label_dir_index(parts):
+    for idx in range(len(parts) - 2, -1, -1):
+        if parts[idx].lower() in LABEL_DIR_NAMES:
+            return idx
+    return None
+
+
+def _make_video_key(parts, label_idx, sample_name):
+    if label_idx is None:
+        return os.path.normpath(sample_name)
+    key_parts = parts[: label_idx + 1]
+    if key_parts and key_parts[0].endswith(":"):
+        return os.path.normpath(os.path.join(key_parts[0] + os.sep, *key_parts[1:], sample_name))
+    return os.path.normpath(os.path.join(*key_parts, sample_name))
+
+
+def extract_video_key(frame_path):
+    """
+    从帧路径中提取视频级 key，兼容当前三类测试集：
+    1) test-pro: 0_real/2514_0.png -> 0_real/2514
+    2) FakeAVCeleb: 0_real/African_men_id00478_RR/group_000.png -> 0_real/African_men_id00478_RR
+    3) LAV-DF: 1_fake/000173_seg0_0.png -> 1_fake/000173
+       LAV-DF real pair: 0_real/000171_pair_000173_seg0_0.png -> 0_real/000171_pair_000173
+
+    key 中保留类别目录，避免 real/fake 同名视频被错误合并。
+    """
+    normalized, parts = _split_path_parts(frame_path)
+    label_idx = _label_dir_index(parts)
+    stem = os.path.splitext(parts[-1])[0]
+
+    # 目录式样本：FakeAVCeleb 和 InsightFace 预处理输出常见为 sample_dir/group_000.png 或 frame_000000.jpg。
+    if FRAME_FILE_RE.match(stem) and len(parts) >= 2:
+        parent = parts[-2]
+        return _make_video_key(parts, label_idx, parent)
+
+    # LAV-DF real 对照样本，保留 real/fake pair，避免同一 real 被不同 fake pair 合并。
+    lav_real_match = LAV_REAL_PAIR_RE.match(stem)
+    if lav_real_match:
+        return _make_video_key(parts, label_idx, lav_real_match.group("pair"))
+
+    # LAV-DF fake 样本：同一个 fake video 的多个 seg 合并成视频级。
+    lav_fake_match = LAV_FAKE_RE.match(stem)
+    if lav_fake_match:
+        return _make_video_key(parts, label_idx, lav_fake_match.group("video"))
+
+    # test-pro 和通用平铺帧：xxx_0.png / xxx_001.jpg -> xxx。
+    trailing_match = TRAILING_FRAME_RE.match(stem)
+    if trailing_match:
+        return _make_video_key(parts, label_idx, trailing_match.group("video"))
+
+    return normalized
+
+
+def compute_binary_metrics(y_true, y_pred_prob):
+    """
+    使用 Youden 最佳阈值计算二分类指标。
+    """
+    y_true = np.asarray(y_true)
+    y_pred_prob = np.asarray(y_pred_prob)
+
+    if len(np.unique(y_true)) < 2:
+        return None
+
+    try:
+        auc = roc_auc_score(y_true, y_pred_prob)
+    except ValueError as e:
+        print(f"Warning: 计算 AUC 时出错: {e}")
+        auc = 0.0
+
+    ap = average_precision_score(y_true, y_pred_prob)
+
+    fpr_curve, tpr_curve, thresholds = roc_curve(y_true, y_pred_prob)
+    j_scores = tpr_curve - fpr_curve
+    best_idx = np.argmax(j_scores)
+    best_threshold = thresholds[best_idx]
+
+    y_pred_binary = np.where(y_pred_prob >= best_threshold, 1, 0)
+    acc = accuracy_score(y_true, y_pred_binary)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred_binary, labels=[0, 1]).ravel()
+
+    fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+    fnr = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+
+    precisions, recalls, _ = precision_recall_curve(y_true, y_pred_prob)
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    best_f1 = np.max(f1_scores)
+
+    return {
+        "auc": auc,
+        "ap": ap,
+        "acc": acc,
+        "best_f1": best_f1,
+        "fpr": fpr,
+        "fnr": fnr,
+        "threshold": best_threshold,
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
+
+
+def build_video_groups(y_true, y_pred_prob, sample_paths):
+    """
+    将帧级预测按视频聚合成分组。
+    """
+    if sample_paths is None or len(sample_paths) != len(y_true):
+        return None, 0
+
+    video_groups = {}
+    for frame_path, label, prob in zip(sample_paths, y_true, y_pred_prob):
+        video_key = extract_video_key(frame_path)
+        if video_key not in video_groups:
+            video_groups[video_key] = {"labels": [], "probs": []}
+        video_groups[video_key]["labels"].append(int(label))
+        video_groups[video_key]["probs"].append(float(prob))
+
+    inconsistent_label_count = 0
+    for group in video_groups.values():
+        labels = np.asarray(group["labels"], dtype=np.int64)
+        if len(np.unique(labels)) > 1:
+            inconsistent_label_count += 1
+
+    return video_groups, inconsistent_label_count
+
+
+def aggregate_video_score(probs, method):
+    probs = np.asarray(probs, dtype=np.float64)
+    if probs.size == 0:
+        return 0.0
+
+    if method == "mean":
+        return float(np.mean(probs))
+    if method == "max":
+        return float(np.max(probs))
+    if method == "median":
+        return float(np.median(probs))
+    if method.startswith("top") and method.endswith("_mean"):
+        k_text = method[3:-5]
+        k = int(k_text)
+        k = max(1, min(k, probs.size))
+        topk = np.partition(probs, -k)[-k:]
+        return float(np.mean(topk))
+
+    raise ValueError(f"Unknown video aggregation method: {method}")
+
+
+def build_video_level_arrays(video_groups, agg_method="mean"):
+    """
+    将视频分组转换为视频级标签和预测分数。
+    视频标签使用同一视频内的多数标签，视频分数由 agg_method 控制。
+    """
+    if video_groups is None:
+        return None, None
+
+    video_true = []
+    video_pred_prob = []
+
+    for group in video_groups.values():
+        labels = np.asarray(group["labels"], dtype=np.int64)
+        label_counts = np.bincount(labels, minlength=2)
+        video_true.append(int(np.argmax(label_counts)))
+        video_pred_prob.append(aggregate_video_score(group["probs"], agg_method))
+
+    return np.asarray(video_true), np.asarray(video_pred_prob)
+
+
+def print_video_report(video_groups, inconsistent_label_count, main_agg_method="top3_mean"):
+    if video_groups is None:
+        print("[Warning] 无法生成视频级结果：dataset.total_list 与帧级预测数量不一致。")
+        return None
+
+    frame_counts = [len(group["probs"]) for group in video_groups.values()]
+    all_metrics = {}
+    all_arrays = {}
+
+    for method in VIDEO_AGG_METHODS:
+        video_true, video_pred_prob = build_video_level_arrays(video_groups, method)
+        all_arrays[method] = (video_true, video_pred_prob)
+        if len(np.unique(video_true)) < 2:
+            all_metrics[method] = None
+        else:
+            all_metrics[method] = compute_binary_metrics(video_true, video_pred_prob)
+
+    video_true, video_pred_prob = all_arrays[main_agg_method]
+    if len(np.unique(video_true)) < 2:
+        print("[Warning] 视频级数据中只包含一类，无法计算视频级交叉指标 (AUC/AP/FPR/FNR)。")
+        return None
+
+    metrics = all_metrics[main_agg_method]
+    if metrics is None:
+        return None
+
+    print("\n" + "#"*60)
+    print(f"【视频级测试报告 / Video-level Test Report】")
+    print(f"视频数   : {len(video_true)} 个")
+    print(f"主聚合   : {main_agg_method}(fake_prob)")
+    print(f"每视频帧数: min {min(frame_counts)} | mean {np.mean(frame_counts):.2f} | max {max(frame_counts)}")
+    if inconsistent_label_count > 0:
+        print(f"标签警告 : {inconsistent_label_count} 个视频内出现了混合标签，已使用多数标签")
+    print(f"混淆矩阵 : [TN: {metrics['tn']}  FP: {metrics['fp']} | FN: {metrics['fn']}  TP: {metrics['tp']}]")
+    print("-" * 30)
+    print(f"AUC       : {metrics['auc']:.4f}")
+    print(f"AP        : {metrics['ap']:.4f}")
+    print(f"ACC       : {metrics['acc']:.4f}")
+    print(f"Best F1   : {metrics['best_f1']:.4f}")
+    print("-" * 30)
+    print(f"FPR (误报): {metrics['fpr']:.4f}  <- 视频级假阳性率")
+    print(f"FNR (漏报): {metrics['fnr']:.4f}  <- 视频级假阴性率")
+    print(f"最佳阈值  : {metrics['threshold']:.4f}")
+    print("#"*60 + "\n")
+
+    print("【视频级聚合方式对比 / Video Aggregation Comparison】")
+    print(f"{'Agg':<10} {'AUC':>8} {'AP':>8} {'ACC':>8} {'BestF1':>8} {'FPR':>8} {'FNR':>8} {'TH':>8}")
+    print("-" * 74)
+    for method in VIDEO_AGG_METHODS:
+        item = all_metrics[method]
+        if item is None:
+            print(f"{method:<10} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8}")
+            continue
+        print(
+            f"{method:<10} "
+            f"{item['auc']:>8.4f} {item['ap']:>8.4f} {item['acc']:>8.4f} "
+            f"{item['best_f1']:>8.4f} {item['fpr']:>8.4f} {item['fnr']:>8.4f} "
+            f"{item['threshold']:>8.4f}"
+        )
+    print("")
+
+    return metrics
 
 
 # ==========================================
@@ -154,8 +487,8 @@ def test(model, loader, gpu_id):
     best_f1 = np.max(f1_scores)
     
     print("\n" + "#"*60)
-    print(f"【最终测试报告 / Test Report】")
-    print(f"数据量   : {len(y_true)} 样本")
+    print(f"【帧级测试报告 / Frame-level Test Report】")
+    print(f"帧数     : {len(y_true)} 帧")
     print(f"混淆矩阵 : [TN: {tn}  FP: {fp} | FN: {fn}  TP: {tp}]")
     print("-" * 30)
     print(f"AUC       : {auc:.4f}")
@@ -168,6 +501,10 @@ def test(model, loader, gpu_id):
     print(f"最佳阈值  : {best_threshold:.4f}")
     print("#"*60 + "\n")
 
+    sample_paths = getattr(getattr(loader, "dataset", None), "total_list", None)
+    video_groups, inconsistent_label_count = build_video_groups(y_true, y_pred_prob, sample_paths)
+    print_video_report(video_groups, inconsistent_label_count)
+
     # 返回所有核心指标以便外部监控或日志使用
     return auc, ap, acc, best_f1, fpr, fnr
 
@@ -176,8 +513,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     
     # 路径参数
-    parser.add_argument("--real_list_path", type=str, required=True)
-    parser.add_argument("--fake_list_path", type=str, required=True)
+    parser.add_argument("--real_list_path", type=str, default="")
+    parser.add_argument("--fake_list_path", type=str, default="")
+    parser.add_argument(
+        "--data_root",
+        "--preprocessed_root",
+        dest="data_root",
+        type=str,
+        default="",
+        help="preprocess.py output root. Auto uses <root>/0_real and <root>/1_fake, or <root>/test/0_real and <root>/test/1_fake.",
+    )
     parser.add_argument("--ckpt", type=str, required=True, help="Path to best_model.pth")
     
     # 运行参数
@@ -194,6 +539,19 @@ if __name__ == "__main__":
     parser.add_argument("--name", type=str, default="test_experiment")
 
     opt = parser.parse_args()
+
+    try:
+        opt.real_list_path, opt.fake_list_path = resolve_test_paths(opt)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"[Error] {e}")
+        exit()
+
+    print(f"[Info] real_list_path: {opt.real_list_path}")
+    print(f"[Info] fake_list_path: {opt.fake_list_path}")
+    print(
+        f"[Info] images(real/fake): "
+        f"{count_images_recursive(opt.real_list_path)}/{count_images_recursive(opt.fake_list_path)}"
+    )
 
     # 设置设备
     device = torch.device(f"cuda:{opt.gpu}" if torch.cuda.is_available() else "cpu")
@@ -247,6 +605,8 @@ if __name__ == "__main__":
 
     # 3. 准备数据
     print(f"[Info] 初始化数据集...")
+    # 只在 test.py 内适配测试集图片命名，不修改 utils.py 的全局实现。
+    utils.get_list = get_sorted_image_list
     dataset = AVLip(opt)
     
     if len(dataset) == 0:
