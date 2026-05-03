@@ -2,10 +2,8 @@ import torch
 import torch.nn as nn
 from .clip import clip
 import os
-try:
-    import open_clip
-except Exception:
-    open_clip = None
+import sys
+import open_clip
 from .region_awareness import get_backbone, SELayerVec
 
 # 设置 HuggingFace 镜像
@@ -17,10 +15,10 @@ class LipFD(nn.Module):
         self.name = name
 
         # =================================================================
-        # [配置控制] 统一从环境变量读取消融配置
-        # 避免与 options/base_options.py 的注入逻辑不一致
+        # [配置控制] 直接从命令行参数检测消融实验配置
+        # 这样就不需要在 train.py/validate.py 中设置环境变量了
         # =================================================================
-        self.no_innov = (os.getenv("LIPFD_NO_INNOV", "0") == "1")
+        self.no_innov = "--no_innov" in sys.argv
         
         # 打印消融状态，方便调试
         if self.no_innov:
@@ -31,7 +29,7 @@ class LipFD(nn.Module):
             self.use_se_fusion     = False
             self.use_residual_cls  = False
         else:
-            print(f"[LipFD] 完整模式开启 (Full Mode)")
+            #print(f"[LipFD] 完整模式开启 (Full Mode)")
             self.use_modality_bias = (os.getenv("LIPFD_NO_MODALITY_BIAS", "0") != "1")
             self.use_attn_bias     = (os.getenv("LIPFD_NO_ATTN_BIAS", "0") != "1")
             self.use_se_fusion     = (os.getenv("LIPFD_NO_SE_FUSION", "0") != "1")
@@ -45,18 +43,13 @@ class LipFD(nn.Module):
 
         # --- 2. 加载 CLIP / DFN 模型 ---
         if name.startswith("DFN:"):
-            if open_clip is None:
-                raise ImportError(
-                    "DFN backbone requires `open_clip` but it is not available. "
-                    "Please install a working open-clip package."
-                )
             print(f"[LipFD] 正在加载 Apple DFN 模型: {name}")
             self.encoder, _, self.preprocess = open_clip.create_model_and_transforms(
                 'ViT-L-14', pretrained='dfn2b', device='cpu'
             )
         else:
             clean_name = name.replace("CLIP:", "")
-            print(f"[LipFD] 正在加载 OpenAI CLIP 模型: {clean_name}")
+            #print(f"[LipFD] 正在加载 OpenAI CLIP 模型: {clean_name}")
             self.encoder, self.preprocess = clip.load(clean_name, device="cpu")
 
         self.backbone = get_backbone(pretrained=True)
@@ -69,7 +62,7 @@ class LipFD(nn.Module):
 
             if not self.no_innov:
                 # 【正常模式】初始化所有创新模块参数
-                print("[LipFD] 初始化创新模块参数...")
+                #print("[LipFD] 初始化创新模块参数...")
                 
                 # 策略 1: 模态偏置
                 self.modality_bias = nn.Parameter(torch.zeros(2, self.vit_width))
@@ -163,10 +156,8 @@ class LipFD(nn.Module):
             if self.use_modality_bias and self.modality_bias is not None:
                 bias_audio = self.modality_bias[0].view(1, 1, -1).float()
                 bias_video = self.modality_bias[1].view(1, 1, -1).float()
-                x_cls = x[:, :1, :]
-                x_audio = x[:, 1:1 + split_idx, :] + bias_audio
-                x_video = x[:, 1 + split_idx:, :] + bias_video
-                x = torch.cat([x_cls, x_audio, x_video], dim=1)
+                x[:, 1:1 + split_idx, :] = x[:, 1:1 + split_idx, :] + bias_audio
+                x[:, 1 + split_idx:, :]  = x[:, 1 + split_idx:, :] + bias_video
 
             x = visual.ln_pre(x)
 

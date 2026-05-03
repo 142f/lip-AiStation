@@ -20,7 +20,7 @@ class BaseOptions:
         # ===================================================================
         # 2. 模型与训练策略参数 (Model and Training Strategy Arguments)
         # ===================================================================
-        parser.add_argument("--arch", type=str, default="DFN:ViT-L/14", help="Model architecture. See models/__init__.py for options.")
+        parser.add_argument("--arch", type=str, default="CLIP:ViT-L/14", help="Model architecture. See models/__init__.py for options.")
         parser.add_argument("--batch_size", type=int, default=8, help="Input batch size for training.")
         parser.add_argument("--fix_backbone", action="store_true", help="If specified, freezes the backbone weights during training.")
         parser.add_argument("--fix_encoder", action="store_true",help="If specified, freezes the encoder weights during training.")
@@ -31,7 +31,6 @@ class BaseOptions:
         # ===================================================================
         parser.add_argument("--name", type=str, default="experiment_name", help="Name of the experiment. Determines where to store samples and models.")
         parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="Directory where models are saved.")
-        parser.add_argument("--allow_partial_load", action="store_true", help="Allow checkpoint partial loading with missing/unexpected keys.")
 
         # ===================================================================
         # 4. 硬件与环境参数 (Hardware and Environment Arguments)
@@ -99,55 +98,6 @@ class BaseOptions:
 
         return parser.parse_args()
 
-    def _config_effectiveness_lines(self, opt):
-        lines = []
-
-        def add(flag, status, note):
-            lines.append(f"{flag:>25}: {status:<12} ({note})")
-
-        add("fix_backbone", "ON" if opt.fix_backbone else "OFF", "applied in trainer._apply_freeze_policy")
-        add("fix_encoder", "ON" if opt.fix_encoder else "OFF", "applied in trainer._apply_freeze_policy")
-        add("class_bal", "ON" if opt.class_bal else "OFF", "applied in data.create_dataloader")
-        add("no_innov", "ON" if opt.no_innov else "OFF", "injected to env, consumed in models/LipFD.py")
-        add("no_region_innov", "ON" if opt.no_region_innov else "OFF", "injected to env, consumed in region_awareness")
-        if hasattr(opt, "enable_region_consistency"):
-            add(
-                "enable_region_consistency",
-                "ON" if opt.enable_region_consistency else "OFF",
-                "injected to env, consumed in region_awareness/trainer",
-            )
-
-        if opt.use_aug:
-            add("use_aug", "UNUSED", "flag exists but current AVLip pipeline does not consume it")
-        else:
-            add("use_aug", "OFF", "not enabled")
-
-        if opt.spec_aug:
-            add("spec_aug", "UNUSED", "flag exists but current AVLip pipeline does not consume it")
-        else:
-            add("spec_aug", "OFF", "not enabled")
-
-        if opt.spec_aug:
-            add(
-                "spec_num_masks/time/freq",
-                "UNUSED",
-                "spec params are currently not consumed by dataset pipeline",
-            )
-        else:
-            add(
-                "spec_num_masks/time/freq",
-                "IGNORED",
-                "effective only when --spec_aug is truly wired and enabled",
-            )
-
-        return lines
-
-    def _print_config_effectiveness_warnings(self, opt):
-        if getattr(opt, "use_aug", False):
-            print("[ConfigCheck] --use_aug is set, but AVLip currently has no augmentation branch; flag has no effect.")
-        if getattr(opt, "spec_aug", False):
-            print("[ConfigCheck] --spec_aug is set, but AVLip currently does not apply SpecAugment; flag has no effect.")
-
     def print_options(self, opt):
         message = ""
         message += "----------------- Options ---------------\n"
@@ -161,9 +111,6 @@ class BaseOptions:
         # Print Env Var for verification
         no_innov = os.environ.get("LIPFD_NO_INNOV", "Unknown")
         message += f"{'[Env] NO_INNOV':>25}: {no_innov}\n"
-        message += "------------- Effective Config -----------\n"
-        for line in self._config_effectiveness_lines(opt):
-            message += f"{line}\n"
 
         message += "----------------- End -------------------"
         print(message)
@@ -186,6 +133,9 @@ class BaseOptions:
             suffix = ("_" + opt.suffix.format(**vars(opt))) if opt.suffix != "" else ""
             opt.name = opt.name + suffix
 
+        if print_options:
+            self.print_options(opt)
+
         # set gpu ids
         str_ids = opt.gpu_ids.split(",")
         opt.gpu_ids = []
@@ -207,7 +157,6 @@ class BaseOptions:
 
         os.environ["REGION_NO_PE"] = "1" if (opt.no_region_pe or opt.no_region_innov) else "0"
         os.environ["REGION_NO_SE"] = "1" if (opt.no_region_se or opt.no_region_innov) else "0"
-        os.environ["REGION_USE_CONSISTENCY"] = "1" if getattr(opt, "enable_region_consistency", False) else "0"
 
         # additional
         # opt.classes = opt.classes.split(',')
@@ -219,11 +168,6 @@ class BaseOptions:
             opt.jpg_qual = list(range(opt.jpg_qual[0], opt.jpg_qual[1] + 1))
         elif len(opt.jpg_qual) > 2:
             raise ValueError("Shouldn't have more than 2 values for --jpg_qual.")
-
-        self._print_config_effectiveness_warnings(opt)
-
-        if print_options:
-            self.print_options(opt)
 
         self.opt = opt
         return self.opt

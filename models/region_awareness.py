@@ -3,7 +3,7 @@ from torch import Tensor
 import torch.nn as nn
 import os
 from typing import Type, Any, Callable, Union, List, Optional
-import torch.nn.functional as F
+from torch.nn.functional import softmax
 
 try:
     from torch.hub import load_state_dict_from_url
@@ -204,15 +204,8 @@ class ResNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         ## 融合了局部细节特征与全局语义特征
         # [修改] 去掉 Sigmoid，直接输出 logits，配合后续 softmax 使用
-        self.local_dim = 512 * block.expansion
-        self.global_dim = 768
-        feat_dim = self.local_dim + self.global_dim
-        self.get_weight = nn.Linear(feat_dim, 1)
-        self.region_quality_head = nn.Linear(feat_dim, 1)
-        self.global_local_proj = nn.Linear(self.global_dim, self.local_dim)
-        self.region_consistency_temp = 0.5
-        self.use_region_consistency = os.getenv("REGION_USE_CONSISTENCY", "0") == "1"
-        self.fc = nn.Linear(feat_dim, num_classes)
+        self.get_weight = nn.Linear(512 * block.expansion + 768, 1)
+        self.fc = nn.Linear(512 * block.expansion + 768, num_classes)
 
         # ---------------------------
         # [关键修改] 自动从环境变量读取消融配置
@@ -233,7 +226,7 @@ class ResNet(nn.Module):
         # ---------------------------
         self.num_scales = 3
         self.num_regions = 5
-        feat_dim = self.local_dim + self.global_dim
+        feat_dim = 512 * block.expansion + 768
         
         # [控制] 始终初始化位置编码与门控系数（保证模型结构一致，避免加载权重报错）
         # 即使 with_pe=False，这些参数也会存在（但不参与计算/更新）
@@ -403,31 +396,7 @@ class ResNet(nn.Module):
         # ---------------------------
         # Step 9: 区域聚合（平均所有区域特征）
         # ---------------------------
-        region_logits = self.region_quality_head(
-            fused_parts.contiguous().view(-1, feat_dim)
-        ).view(num_regions, batch_size)  # (R, B)
-        region_weights = torch.softmax(region_logits, dim=0)  # (R, B)
-        out = (fused_parts * region_weights.unsqueeze(-1)).sum(dim=0)  # (B, C)
-
-        region_consistency_loss = fused_parts.new_zeros(())
-        if self.use_region_consistency:
-            # Keep teacher target learnable on the global projection branch while
-            # blocking gradients from the teacher path into local fused features.
-            local_region = fused_parts[:, :, : self.local_dim].detach()  # (R, B, local_dim)
-            global_anchor = self.global_local_proj(feature)  # (B, local_dim)
-
-            local_region_norm = F.normalize(local_region, p=2, dim=-1)
-            global_anchor_norm = F.normalize(global_anchor, p=2, dim=-1)
-            region_sim = (local_region_norm * global_anchor_norm.unsqueeze(0)).sum(dim=-1)  # (R, B)
-            target_region = torch.softmax(region_sim / self.region_consistency_temp, dim=0)  # (R, B)
-
-            region_weights_prob = region_weights.transpose(0, 1).clamp_min(1e-8).float()
-            target_region_prob = target_region.transpose(0, 1).float()
-            region_consistency_loss = F.kl_div(
-                torch.log(region_weights_prob),
-                target_region_prob,
-                reduction="batchmean",
-            )
+        out = fused_parts.sum(dim=0).div(fused_parts.shape[0])  # (B, C)
 
         # ---------------------------
         # Step 10: 分类层
@@ -443,10 +412,7 @@ class ResNet(nn.Module):
         # ---------------------------
         # Step 12: 返回三元组（保持兼容）
         # ---------------------------
-        aux = {
-            "region_consistency_loss": region_consistency_loss,
-        }
-        return pred_score, weights_max, weights_org, aux
+        return pred_score, weights_max, weights_org
 
     def forward(self, x, feature):
         return self._forward_impl(x, feature)
@@ -509,5 +475,5 @@ if __name__ == '__main__':
         for j in range(5):
             data[i].append(torch.rand((10, 3, 224, 224)))
     feature = torch.rand((10, 768))
-    pred_score, weights_max, weights_org, aux = model(data, feature)
+    pred_score, weights_max, weights_org = model(data, feature)
     pass

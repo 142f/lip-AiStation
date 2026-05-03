@@ -1,12 +1,11 @@
 import os
-import re
-
 import torch
 import torch.nn as nn
+from models import build_model, get_loss
+# [新增] 引入调度器组件
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from models import build_model, get_loss
-
+# [新增] 引入 timm 的 EMA 模块
 try:
     from timm.utils import ModelEmaV2
 except ImportError:
@@ -14,65 +13,39 @@ except ImportError:
     print("Please install it using: pip install timm")
     ModelEmaV2 = None
 
-
-def _strip_state_dict_prefixes(state_dict):
-    cleaned = {}
-    for key, value in state_dict.items():
-        name = key
-        while name.startswith("module.") or name.startswith("_orig_mod."):
-            if name.startswith("module."):
-                name = name[7:]
-            elif name.startswith("_orig_mod."):
-                name = name[10:]
-        cleaned[name] = value
-    return cleaned
-
-
-def _extract_model_state(checkpoint):
-    if isinstance(checkpoint, dict):
-        if "model" in checkpoint and isinstance(checkpoint["model"], dict):
-            return checkpoint["model"]
-        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
-            return checkpoint["state_dict"]
-    if isinstance(checkpoint, dict):
-        return checkpoint
-    raise TypeError("Unsupported checkpoint format for model weights.")
-
-
-def _parse_epoch_from_path(path):
-    filename = os.path.basename(path)
-    # Supports names like model_epoch_29.pth or epoch29.pth
-    m = re.search(r"epoch[_-]?(\d+)", filename)
-    if m is None:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
 class Trainer(nn.Module):
     def __init__(self, opt):
         super().__init__()
         self.opt = opt
         self.total_steps = 0
-        self.update_steps = 0
         self.save_dir = os.path.join(opt.checkpoints_dir, opt.name)
-        self.step_bias = 0
-
         self.device = (
-            torch.device(f"cuda:{opt.gpu_ids[0]}") if opt.gpu_ids else torch.device("cpu")
+            torch.device("cuda:{}".format(opt.gpu_ids[0]))
+            if opt.gpu_ids
+            else torch.device("cpu")
         )
-
         self.model = build_model(opt.arch)
 
+        self.step_bias = (
+            0
+            if not opt.fine_tune
+            else int(opt.pretrained_model.split("_")[-1].split(".")[0]) + 1
+        )
         if opt.fine_tune:
-            self._load_pretrained(opt.pretrained_model)
+            state_dict = torch.load(opt.pretrained_model, map_location="cpu")
+            self.model.load_state_dict(state_dict["model"], strict=False)
+            self.total_steps = state_dict.get("total_steps", 0)
+            print(f"Model loaded @ {opt.pretrained_model.split('/')[-1]}")
 
-        self._apply_freeze_policy()
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        if not params:
-            raise RuntimeError("No trainable parameters left after freeze policy.")
+        if opt.fix_encoder:
+            for name, p in self.model.named_parameters():
+                if name.split(".")[0] in ["encoder"]:
+                    p.requires_grad = False
+                else:
+                    p.requires_grad = True
+            params = filter(lambda p: p.requires_grad, self.model.parameters())
+        else:
+            params = self.model.parameters()
 
         if opt.optim == "adamw":
             self.optimizer = torch.optim.AdamW(
@@ -90,257 +63,281 @@ class Trainer(nn.Module):
             )
         elif opt.optim == "sgd":
             self.optimizer = torch.optim.SGD(
-                params,
-                lr=opt.lr,
-                momentum=0.9,
-                weight_decay=opt.weight_decay,
+                params, lr=opt.lr, momentum=0.9, weight_decay=opt.weight_decay
             )
         else:
             raise ValueError("optim should be [sgd, adam, adamw]")
 
+        # ============================
+        # LR Scheduler: Warmup + CosineAnnealingLR (NO restart)
+        #
+        # 关键点（配合本项目“epoch 末尾 step 一次”的用法）：
+        # 1) lr 会在“下一轮 epoch 开始时”生效（因为 step() 放在 epoch 末尾）。
+        # 2) SequentialLR 在 last_epoch 命中 milestone 时会切换到下一个 scheduler，并调用 next_scheduler.step(0)，
+        #    因此命中 milestone 的那一次不会再推进 warmup_scheduler。
+        # 3) 约定 warmup_epochs=N 表示 warmup 覆盖前 N 个 epoch。
+        #    为了让第 N 个 warmup epoch 能到达 base lr（而不是延后到第 N+1 个），
+        #    LinearLR.total_iters 应该设置为 N-1（当 N>=2）。当 N==1 时用 total_iters=1。
+        # ============================
         self.scheduler = None
         if opt.cosine_annealing:
             warmup_epochs = max(int(getattr(opt, "warmup_epochs", 0)), 0)
-            warmup_epochs = min(warmup_epochs, int(getattr(opt, "epoch", warmup_epochs)))
+            warmup_epochs = min(warmup_epochs, int(getattr(opt, "epoch", warmup_epochs)))  # ✅ 防止 warmup > 总epoch
             eta_min = float(getattr(opt, "eta_min", 1e-6))
 
             cosine_epochs = max(opt.epoch - warmup_epochs, 1)
-            t_max = max(cosine_epochs - 1, 1)
-            main_scheduler = CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=eta_min)
+            T_max = max(cosine_epochs - 1, 1)
+
+            main_scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max, eta_min=eta_min)
 
             if warmup_epochs > 0:
+                # ✅ 关键修正：让 warmup 在切换到 cosine 之前就达到 base_lr，避免切换瞬间上跳
                 warmup_total_iters = max(warmup_epochs - 1, 1)
                 warmup_scheduler = LinearLR(
                     self.optimizer,
                     start_factor=0.001,
                     end_factor=1.0,
-                    total_iters=warmup_total_iters,
+                    total_iters=warmup_total_iters
                 )
                 self.scheduler = SequentialLR(
                     self.optimizer,
                     schedulers=[warmup_scheduler, main_scheduler],
-                    milestones=[warmup_epochs],
+                    milestones=[warmup_epochs]
                 )
             else:
                 self.scheduler = main_scheduler
+        else:
+            self.scheduler = None
 
         self.criterion = get_loss().to(self.device)
         self.criterion1 = nn.CrossEntropyLoss(label_smoothing=0.1)
 
+        # 确保模型先移动到 GPU
         self.model.to(self.device)
-
+        
+        # -----------------------------------------------------------
+        # [新增] EMA 初始化
+        # -----------------------------------------------------------
         self.model_ema = None
         if self.opt.use_ema and ModelEmaV2 is not None:
+            # decay: 衰减率。0.999 是通用值。
+            # 如果你的 Batch Size 很小(8)，这个值非常重要，它能平滑掉梯度的剧烈抖动。
             self.model_ema = ModelEmaV2(self.model, decay=self.opt.ema_decay, device=self.device)
             print(f"[Info] Model EMA initialized with decay {self.opt.ema_decay}")
-
-        self.accumulation_steps = max(1, int(opt.accumulation_steps))
+        
+        # 梯度累积相关参数
+        self.accumulation_steps = opt.accumulation_steps
         self.accumulation_count = 0
+        self.update_steps = 0
+        
+        # -------------------------------------------------------
+        # [AMP 修改 1] 初始化混合精度组件
+        # -------------------------------------------------------
+        self.use_amp = opt.use_amp and torch.cuda.is_available()
+        if self.use_amp:
+            # 初始化梯度缩放器，用于防止 FP16 下梯度的下溢出
+            self.scaler = torch.cuda.amp.GradScaler()
+            self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        self.use_amp = bool(opt.use_amp and torch.cuda.is_available())
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
-        self.enable_region_consistency = bool(getattr(opt, "enable_region_consistency", False))
-        base_region_consistency_weight = float(getattr(opt, "region_consistency_weight", 0.02))
-        self.region_consistency_weight = (
-            base_region_consistency_weight if self.enable_region_consistency else 0.0
-        )
+    def set_input(self, input):
+        # 1. 接收数据
+        x = input[0].to(self.device, non_blocking=True)
+        self.label = input[2].to(self.device, non_blocking=True).long()
+        
+        # 2. 初始化归一化参数
+        if not hasattr(self, 'mean_tensor'):
+             self.mean_tensor = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
+             self.std_tensor = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
 
-    def _apply_freeze_policy(self):
-        if self.opt.fix_encoder:
-            for name, p in self.model.named_parameters():
-                p.requires_grad = not name.startswith("encoder.")
-
-        if getattr(self.opt, "fix_backbone", False):
-            backbone = getattr(self.model, "backbone", None)
-            if backbone is None:
-                print("[Warning] --fix_backbone is set but model has no `backbone` attribute.")
-            else:
-                for p in backbone.parameters():
-                    p.requires_grad = False
-
-    def _load_pretrained(self, ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
-        model_state = _extract_model_state(checkpoint)
-        model_state = _strip_state_dict_prefixes(model_state)
-
-        missing, unexpected = self.model.load_state_dict(model_state, strict=False)
-        if missing or unexpected:
-            details = (
-                f"missing={len(missing)} unexpected={len(unexpected)}. "
-                f"missing_head={missing[:8]} unexpected_head={unexpected[:8]}"
-            )
-            if getattr(self.opt, "allow_partial_load", False):
-                print(f"[Warning] Partial checkpoint load allowed: {details}")
-            else:
-                raise RuntimeError(
-                    "Checkpoint/model mismatch detected. "
-                    "Use matching --arch/ablation config, or pass --allow_partial_load to override. "
-                    + details
-                )
-
-        if isinstance(checkpoint, dict):
-            self.total_steps = int(checkpoint.get("total_steps", 0) or 0)
-            self.update_steps = int(checkpoint.get("update_steps", 0) or 0)
-
-        parsed_epoch = _parse_epoch_from_path(ckpt_path)
-        self.step_bias = (parsed_epoch + 1) if parsed_epoch is not None else 0
-
-        print(f"Model loaded @ {os.path.basename(ckpt_path)}")
-
-    @staticmethod
-    def _unwrap_model(model):
-        return model._orig_mod if hasattr(model, "_orig_mod") else model
-
-    def _state_dict_for_save(self, model):
-        base = self._unwrap_model(model)
-        return _strip_state_dict_prefixes(base.state_dict())
-
-    def set_input(self, input_data):
-        x = input_data[0].to(self.device, non_blocking=True)
-        self.label = input_data[2].to(self.device, non_blocking=True).long()
-
-        if not hasattr(self, "mean_tensor"):
-            self.mean_tensor = torch.tensor(
-                [0.48145466, 0.4578275, 0.40821073], device=self.device
-            ).view(1, 3, 1, 1)
-            self.std_tensor = torch.tensor(
-                [0.26862954, 0.26130258, 0.27577711], device=self.device
-            ).view(1, 3, 1, 1)
-
+        # 3. 处理 Global Input - 在GPU上进行归一化以提高效率
+        # 如果是uint8，先转换为float32并除以255
         if x.dtype == torch.uint8:
             x = x.float().div_(255.0)
-
+        # 如果已经是float32(0-1)，不需要额外处理
+        
+        # 保存原始数据（用于可能的调试）
         self.input_raw = x
+        
+        # 归一化
         self.input = x.sub_(self.mean_tensor).div_(self.std_tensor)
 
+        # 4. 处理 Crops
+        # input[1] 是 list of list of tensors
         self.crops = []
-        raw_crops = input_data[1]
+        
+        raw_crops = input[1] # List[List[Tensor]]
+        
         for scale_list in raw_crops:
             processed_scale = []
             for crop_batch in scale_list:
-                processed_scale.append(crop_batch.to(self.device, non_blocking=True))
+                # crop_batch is (B, 3, 224, 224) Float Normalized (from CPU)
+                c = crop_batch.to(self.device, non_blocking=True)
+                # [Hybrid Strategy] Crops are already normalized on CPU to preserve precision
+                processed_scale.append(c)
             self.crops.append(processed_scale)
 
     def forward(self):
+        # -------------------------------------------------------
+        # [AMP 修改 2] 前向传播上下文管理
+        # -------------------------------------------------------
+        # 使用 autocast 自动将部分算子转为 FP16 运行
         with torch.cuda.amp.autocast(enabled=self.use_amp):
             self._forward_impl()
 
     def _forward_impl(self):
         self.get_features()
-        forward_out = self.model.forward(self.crops, self.features)
-        aux_losses = {}
-        if not isinstance(forward_out, (tuple, list)) or len(forward_out) < 3:
-            raise RuntimeError("Model forward must return at least (logits, weights_max, weights_org).")
-
-        self.output, self.weights_max, self.weights_org = forward_out[:3]
-        if len(forward_out) >= 4 and isinstance(forward_out[3], dict):
-            aux_losses = forward_out[3]
-
+        self.output, self.weights_max, self.weights_org = self.model.forward(
+            self.crops, self.features
+        )
+        
+        # -------------------------------------------------------
+        # [AMP 修改 3] 稳定性保障：计算 Loss 前强制转回 FP32
+        # -------------------------------------------------------
+        # 防止 CrossEntropyLoss 中的 exp() 计算在 FP16 下溢出导致 NaN
         if self.use_amp:
             self.output = self.output.float()
             self.weights_max = self.weights_max.float()
             self.weights_org = self.weights_org.float()
-
+        
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
-        self.loss_region_consistency = torch.zeros((), device=self.device)
-        if self.enable_region_consistency and "region_consistency_loss" in aux_losses:
-            self.loss_region_consistency = aux_losses["region_consistency_loss"]
-            if self.use_amp:
-                self.loss_region_consistency = self.loss_region_consistency.float()
-
-        self.loss = (
-            0.01 * self.loss_ral
-            + 1.0 * self.loss_ce
-            + self.region_consistency_weight * self.loss_region_consistency
-        )
+        self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
         loss = self.loss.data.tolist()
-        return loss[0] if isinstance(loss, list) else loss
+        return loss[0] if isinstance(loss, type(list())) else loss
 
     def get_individual_losses(self):
         loss_ral = self.loss_ral.data.tolist()
-        loss_ral = loss_ral[0] if isinstance(loss_ral, list) else loss_ral
+        loss_ral = loss_ral[0] if isinstance(loss_ral, type(list())) else loss_ral
         loss_ce = self.loss_ce.data.tolist()
-        loss_ce = loss_ce[0] if isinstance(loss_ce, list) else loss_ce
+        loss_ce = loss_ce[0] if isinstance(loss_ce, type(list())) else loss_ce
         return loss_ral, loss_ce
-
-    def _optimizer_step(self, grads_unscaled=False):
-        if self.use_amp:
-            if not grads_unscaled:
-                self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-
-        if self.model_ema is not None:
-            self.model_ema.update(self.model)
-
-        self.accumulation_count = 0
-        self.optimizer.zero_grad(set_to_none=True)
-        self.update_steps += 1
 
     def optimize_parameters(self):
         if self.accumulation_count == 0:
             self.optimizer.zero_grad(set_to_none=True)
-
+            
+        # -------------------------------------------------------
+        # [AMP 修改 4] 反向传播 (Backward)
+        # -------------------------------------------------------
         loss_scaled = self.loss / self.accumulation_steps
+        
         if self.use_amp:
+            # 使用 scaler 缩放 loss，防止梯度下溢
             self.scaler.scale(loss_scaled).backward()
         else:
             loss_scaled.backward()
-
+        
         self.accumulation_count += 1
+        
+        # -------------------------------------------------------
+        # [AMP 修改 5] 参数更新 (Step)
+        # -------------------------------------------------------
         if self.accumulation_count >= self.accumulation_steps:
-            self._optimizer_step()
+            if self.use_amp:
+                # A. 先 Unscale (将梯度还原回正常数值，以便进行裁剪)
+                self.scaler.unscale_(self.optimizer)
+                
+                # B. 再 Clip (对正常数值的梯度进行裁剪，防止梯度爆炸)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # C. 最后 Step (如果梯度中有 Inf/NaN，scaler 会自动跳过 step)
+                self.scaler.step(self.optimizer)
+                
+                # D. 更新 Scaler 因子 (准备下一次迭代)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            # [新增] EMA 更新：只有在参数真正 update 后才更新 EMA
+            # -------------------------------------------------------
+            if self.model_ema is not None:
+                self.model_ema.update(self.model)
+
+            self.accumulation_count = 0
+            self.optimizer.zero_grad(set_to_none=True)
+            self.update_steps += 1
+            
+            # if self.scheduler is not None:
+            #     self.scheduler.step()
 
     def get_features(self):
         self.features = self.model.get_features(self.input)
 
     def eval(self):
         self.model.eval()
+        # 注意：EMA模型不需要手动eval，它始终处于评估模式
 
     def test(self):
         with torch.no_grad():
             self.forward()
 
     def save_networks(self, save_filename, save_optimizer=False):
+        """
+        保存模型权重。
+        Args:
+            save_filename: 文件名
+            save_optimizer: 是否保存优化器状态（默认False，以节省空间）
+        """
         save_path = os.path.join(self.save_dir, save_filename)
         os.makedirs(self.save_dir, exist_ok=True)
 
+        # 1. 基础部分：始终保存模型参数
         state_dict = {
-            "model": self._state_dict_for_save(self.model),
+            "model": self.model.state_dict(),
             "total_steps": self.total_steps,
             "update_steps": self.update_steps,
         }
+        
+        # 2. EMA 部分：这是最宝贵的推理权重，必须保存
+        if hasattr(self, 'model_ema') and self.model_ema is not None:
+            state_dict["model_ema"] = self.model_ema.module.state_dict()
 
-        if self.model_ema is not None:
-            state_dict["model_ema"] = self._state_dict_for_save(self.model_ema.module)
-
+        # 3. 优化器部分：体积巨大(3GB+)，仅在需要断点续训时才保存
         if save_optimizer:
             state_dict["optimizer"] = self.optimizer.state_dict()
             if self.use_amp:
                 state_dict["scaler"] = self.scaler.state_dict()
 
         torch.save(state_dict, save_path)
+        # print(f"[Info] Saved model to {save_path} (Optimizer: {'Yes' if save_optimizer else 'No'})")
 
     def step_remainder_gradients(self):
-        """Flush remainder grads at epoch end when accumulation is incomplete."""
-        if self.accumulation_count <= 0:
-            return
+        """处理 Epoch 结束时未满足累积步数的剩余梯度"""
+        if self.accumulation_count > 0:
+            # [修正] 调整梯度比例：因为之前是按 accumulation_steps 平均的，现在只有 accumulation_count 个样本
+            # 需要乘以 accumulation_steps / accumulation_count 恢复正确的平均值
+            scale_factor = self.accumulation_steps / self.accumulation_count
 
-        scale_factor = self.accumulation_steps / self.accumulation_count
+            if self.use_amp:
+    # -------------------------------------------------------
+    # [AMP 修改 6] 处理剩余梯度的更新逻辑
+    # -------------------------------------------------------
+                self.scaler.unscale_(self.optimizer)
+                
+                # [新增] 修正梯度幅度
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(scale_factor)
 
-        if self.use_amp:
-            self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # [新增] 修正梯度幅度 (非 AMP 模式也需要)
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(scale_factor)
 
-        for param in self.model.parameters():
-            if param.grad is not None:
-                param.grad.mul_(scale_factor)
-
-        self._optimizer_step(grads_unscaled=self.use_amp)
-        print(f"Debug: Updates remaining gradients at step {self.update_steps}")
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            
+            # [新增] 记得这里也要更新 EMA
+            if self.model_ema is not None:
+                self.model_ema.update(self.model)
+            
+            self.optimizer.zero_grad(set_to_none=True)
+            self.accumulation_count = 0
+            self.update_steps += 1
+            print(f"Debug: Updates remaining gradients at step {self.update_steps}")
