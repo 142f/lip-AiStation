@@ -74,6 +74,73 @@ def get_sorted_image_list(path):
     return image_list
 
 
+def count_images_recursive(path):
+    return len(get_sorted_image_list(path)) if path else 0
+
+
+def _clean_path_arg(path):
+    return str(path or "").strip().strip('"').strip("'")
+
+
+def _find_label_dir(root, names):
+    for name in names:
+        candidate = os.path.join(root, name)
+        if os.path.isdir(candidate):
+            return candidate
+    if os.path.isdir(root):
+        wanted = {name.lower() for name in names}
+        for child in sorted(os.listdir(root)):
+            candidate = os.path.join(root, child)
+            if child.lower() in wanted and os.path.isdir(candidate):
+                return candidate
+    return ""
+
+
+def resolve_test_paths(opt):
+    """Resolve old real/fake inputs and preprocess.py output roots.
+
+    Supported layouts:
+    - --real_list_path <root>/0_real --fake_list_path <root>/1_fake
+    - --data_root <root> where <root>/0_real and <root>/1_fake exist
+    - --data_root <root> where <root>/test/0_real and <root>/test/1_fake exist
+    - --real_list_path <root> with no --fake_list_path, if root contains both labels
+    """
+    real_path = _clean_path_arg(getattr(opt, "real_list_path", ""))
+    fake_path = _clean_path_arg(getattr(opt, "fake_list_path", ""))
+    data_root = _clean_path_arg(getattr(opt, "data_root", ""))
+
+    if real_path and not fake_path and os.path.isdir(real_path):
+        maybe_real = _find_label_dir(real_path, ("0_real", "real"))
+        maybe_fake = _find_label_dir(real_path, ("1_fake", "fake"))
+        if maybe_real and maybe_fake:
+            data_root = real_path
+            real_path = ""
+
+    if data_root and (not real_path or not fake_path):
+        root = os.path.abspath(os.path.normpath(data_root))
+        split_root = os.path.join(root, "test") if os.path.isdir(os.path.join(root, "test")) else root
+        if not real_path:
+            real_path = _find_label_dir(split_root, ("0_real", "real"))
+        if not fake_path:
+            fake_path = _find_label_dir(split_root, ("1_fake", "fake"))
+
+    if not real_path or not fake_path:
+        raise ValueError(
+            "Provide --real_list_path and --fake_list_path, or provide --data_root "
+            "pointing to a preprocess.py output folder that contains 0_real and 1_fake."
+        )
+
+    real_path = os.path.abspath(os.path.normpath(real_path))
+    fake_path = os.path.abspath(os.path.normpath(fake_path))
+
+    if not os.path.isdir(real_path):
+        raise FileNotFoundError(f"real_list_path not found: {real_path}")
+    if not os.path.isdir(fake_path):
+        raise FileNotFoundError(f"fake_list_path not found: {fake_path}")
+
+    return real_path, fake_path
+
+
 def _split_path_parts(path):
     normalized = os.path.normpath(str(path))
     drive, tail = os.path.splitdrive(normalized)
@@ -446,8 +513,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     
     # 路径参数
-    parser.add_argument("--real_list_path", type=str, required=True)
-    parser.add_argument("--fake_list_path", type=str, required=True)
+    parser.add_argument("--real_list_path", type=str, default="")
+    parser.add_argument("--fake_list_path", type=str, default="")
+    parser.add_argument(
+        "--data_root",
+        "--preprocessed_root",
+        dest="data_root",
+        type=str,
+        default="",
+        help="preprocess.py output root. Auto uses <root>/0_real and <root>/1_fake, or <root>/test/0_real and <root>/test/1_fake.",
+    )
     parser.add_argument("--ckpt", type=str, required=True, help="Path to best_model.pth")
     
     # 运行参数
@@ -464,6 +539,19 @@ if __name__ == "__main__":
     parser.add_argument("--name", type=str, default="test_experiment")
 
     opt = parser.parse_args()
+
+    try:
+        opt.real_list_path, opt.fake_list_path = resolve_test_paths(opt)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"[Error] {e}")
+        exit()
+
+    print(f"[Info] real_list_path: {opt.real_list_path}")
+    print(f"[Info] fake_list_path: {opt.fake_list_path}")
+    print(
+        f"[Info] images(real/fake): "
+        f"{count_images_recursive(opt.real_list_path)}/{count_images_recursive(opt.fake_list_path)}"
+    )
 
     # 设置设备
     device = torch.device(f"cuda:{opt.gpu}" if torch.cuda.is_available() else "cpu")

@@ -17,9 +17,10 @@ cpu-diff.py
 # 虚拟环境
 venv/
 .venv/
+.venv2/
 env/
 ENV/
-
+wheelhouse_torch_cu118/  
 # IDE/编辑器配置
 .vscode/
 .idea/
