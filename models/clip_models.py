@@ -3,7 +3,17 @@ from PIL import Image
 import torch.nn as nn
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-import open_clip
+
+
+def _get_open_clip():
+    try:
+        import open_clip
+    except ImportError as exc:
+        raise ImportError(
+            "open-clip-torch is required for DFN:* backbones. "
+            "Install a compatible open-clip-torch package or use a CLIP:* backbone."
+        ) from exc
+    return open_clip
 
 
 CHANNELS = {
@@ -18,6 +28,7 @@ class CLIPModel(nn.Module):
         super(CLIPModel, self).__init__()
 
         if name.startswith("DFN:"):
+            open_clip = _get_open_clip()
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(
                 'ViT-L-14', 
                 pretrained='dfn2b', 
@@ -36,4 +47,3 @@ class CLIPModel(nn.Module):
         if return_feature:
             return features
         return self.fc(features)
-

@@ -1,0 +1,45 @@
+# lip-AiStation requirements for the target server environment
+#
+# Target server pins supplied by the deployment environment are kept where this
+# repository actually imports or needs the package. Non-project server packages
+# such as Flask, opennsfw2, hydra-core, gdown, ipython and psutil are intentionally
+# not listed here.
+#
+# Do not install onnxruntime together with onnxruntime-gpu.
+
+# Project runtime
+torch==2.7.1
+torchvision==0.22.1
+numpy==1.24.3
+scipy==1.15.3
+scikit-learn==1.3.1
+Pillow==9.5.0
+opencv-python-headless==4.8.0.74
+matplotlib==3.8.0
+tqdm==4.65.0
+
+# CLIP / model helpers used by lip-AiStation
+ftfy==6.1.1
+regex==2026.4.4
+open-clip-torch==2.24.0
+huggingface-hub==1.13.0
+timm==0.5.4
+kornia==0.6.8
+transformers==5.7.0
+
+# ONNX / InsightFace preprocessing stack from the target server
+onnx==1.14.0
+onnxruntime-gpu==1.15.0
+tensorflow==2.15.0
+protobuf==4.23.4
+insightface==0.7.3
+albumentations==1.3.1
+scikit-image==0.20.0
+imageio==2.9.0
+moviepy==1.0.3
+
+# Audio preprocessing and FakeAVCeleb helpers used by repository scripts
+librosa==0.10.1
+soundfile==0.13.1
+soxr==0.5.0.post1
+pandas==2.3.3

@@ -3,11 +3,21 @@ import torch.nn as nn
 from .clip import clip
 import os
 import sys
-import open_clip
 from .region_awareness import get_backbone, SELayerVec
 
 # 设置 HuggingFace 镜像
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+
+def _get_open_clip():
+    try:
+        import open_clip
+    except ImportError as exc:
+        raise ImportError(
+            "open-clip-torch is required for DFN:* backbones. "
+            "Install a compatible open-clip-torch package or use a CLIP:* backbone."
+        ) from exc
+    return open_clip
 
 class LipFD(nn.Module):
     def __init__(self, name, num_classes=1):
@@ -43,6 +53,7 @@ class LipFD(nn.Module):
 
         # --- 2. 加载 CLIP / DFN 模型 ---
         if name.startswith("DFN:"):
+            open_clip = _get_open_clip()
             print(f"[LipFD] 正在加载 Apple DFN 模型: {name}")
             self.encoder, _, self.preprocess = open_clip.create_model_and_transforms(
                 'ViT-L-14', pretrained='dfn2b', device='cpu'
