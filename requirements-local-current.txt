@@ -1,6 +1,6 @@
 # Core runtime dependencies
-torch==2.7.1
-torchvision==0.22.1
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu
 numpy==1.26.4
 opencv-python==4.8.1.78
 opencv-contrib-python==4.8.1.78
@@ -16,3 +16,6 @@ matplotlib==3.8.0
 soundfile==0.13.1
 soxr==0.5.0.post1
 dlib==19.24.1
+
+setuptools==69.5.1
+wheel==0.43.0

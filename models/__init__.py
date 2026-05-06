@@ -1,6 +1,3 @@
-from .clip_models import CLIPModel
-from .LipFD import LipFD, RALoss
-
 VALID_NAMES = [
     "CLIP:ViT-B/32",
     "CLIP:ViT-B/16",
@@ -12,6 +9,7 @@ VALID_NAMES = [
 
 def get_model(name):
     assert name in VALID_NAMES
+    from .clip_models import CLIPModel
     if name.startswith("CLIP:"):
         return CLIPModel(name[5:])
     elif name.startswith("DFN:"):
@@ -22,6 +20,7 @@ def get_model(name):
 
 def build_model(transformer_name):
     assert transformer_name in VALID_NAMES
+    from .LipFD import LipFD
     if transformer_name.startswith("CLIP:") or transformer_name.startswith("DFN:"):
         return LipFD(transformer_name)
     else:
@@ -29,4 +28,5 @@ def build_model(transformer_name):
 
 
 def get_loss():
+    from .LipFD import RALoss
     return RALoss()

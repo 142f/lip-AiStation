@@ -9,7 +9,6 @@ import torch
 import utils
 from data.datasets import AVLip
 from models import build_model
-from preprocess import infer_label_name, process_video_file
 from test import aggregate_video_score, custom_collate_fn, get_sorted_image_list
 
 
@@ -158,7 +157,7 @@ def main():
     args = parse_args()
 
     video_name = os.path.splitext(os.path.basename(args.video_file))[0]
-    dataset_name = infer_label_name(args.video_file, args.audio_file, args.label)
+    dataset_name = args.label
 
     work_root = os.path.abspath(args.output_root)
     video_output_dir = os.path.abspath(args.preprocessed_dir) if args.preprocessed_dir else ""
@@ -176,20 +175,23 @@ def main():
     os.makedirs(args.temp_dir, exist_ok=True)
     os.makedirs(output_label_dir, exist_ok=True)
 
-    preprocess_args = SimpleNamespace(
-        n_extract=10,
-        window_len=5,
-        temp_dir=args.temp_dir,
-        output_video_dir=video_output_dir,
-    )
-    saved_count, video_output_dir = process_video_file(
-        args.video_file,
-        args.audio_file,
-        output_label_dir,
-        preprocess_args,
-    )
-    if saved_count <= 0:
-        raise RuntimeError(f"Preprocess produced no image windows: {video_output_dir}")
+    if not os.path.isdir(video_output_dir) or not os.listdir(video_output_dir):
+        from preprocess import process_video_file
+
+        preprocess_args = SimpleNamespace(
+            n_extract=10,
+            window_len=5,
+            temp_dir=args.temp_dir,
+            output_video_dir=video_output_dir,
+        )
+        saved_count, video_output_dir = process_video_file(
+            args.video_file,
+            args.audio_file,
+            output_label_dir,
+            preprocess_args,
+        )
+        if saved_count <= 0:
+            raise RuntimeError(f"Preprocess produced no image windows: {video_output_dir}")
 
     utils.get_list = get_sorted_image_list
     dataset_opt = build_dataset_options(work_root, dataset_name, video_output_dir)

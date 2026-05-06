@@ -144,7 +144,11 @@ class BaseOptions:
             if id >= 0:
                 opt.gpu_ids.append(id)
         if len(opt.gpu_ids) > 0:
-            torch.cuda.set_device(opt.gpu_ids[0])
+            if torch.cuda.is_available():
+                torch.cuda.set_device(opt.gpu_ids[0])
+            else:
+                print("[Warn] CUDA is not available. Falling back to CPU.")
+                opt.gpu_ids = []
 
         # =================================================================
         # [修复方案] 将参数注入环境变量，确保 LipFD 能读到
