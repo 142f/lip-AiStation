@@ -4,6 +4,7 @@ import torch.nn as nn
 import os
 from typing import Type, Any, Callable, Union, List, Optional
 from torch.nn.functional import softmax
+from .offline_paths import torch_checkpoint_dir
 
 try:
     from torch.hub import load_state_dict_from_url
@@ -429,7 +430,13 @@ def _get_backbone(
     model = ResNet(block, layers, num_classes=2, **kwargs)
 
     if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[arch], progress=progress)
+        model_dir = torch_checkpoint_dir()
+        os.makedirs(model_dir, exist_ok=True)
+        state_dict = load_state_dict_from_url(
+            model_urls[arch],
+            model_dir=model_dir,
+            progress=progress,
+        )
 
         # ==========================================================
         # ✅ 最稳加载：只加载 key 存在且 shape 完全一致的参数

@@ -2,6 +2,7 @@ from .clip import clip
 from PIL import Image
 import torch.nn as nn
 import os
+from .offline_paths import dfn_pretrained
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 
@@ -31,7 +32,7 @@ class CLIPModel(nn.Module):
             open_clip = _get_open_clip()
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(
                 'ViT-L-14', 
-                pretrained='dfn2b', 
+                pretrained=dfn_pretrained(), 
                 device='cpu'
             )
         else:

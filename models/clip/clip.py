@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
+from ..offline_paths import clip_root
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -108,7 +109,8 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         Whether to load the optimized JIT model or more hackable non-JIT model (default).
 
     download_root: str
-        path to download the model files; by default, it uses "~/.cache/clip"
+        path to download the model files; by default, it uses
+        "checkpoints/pretrained/clip" under the project root.
 
     Returns
     -------
@@ -119,7 +121,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
     """
     if name in _MODELS:
-        model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
+        model_path = _download(_MODELS[name], download_root or clip_root())
     elif os.path.isfile(name):
         model_path = name
     else:

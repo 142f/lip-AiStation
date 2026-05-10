@@ -4,6 +4,7 @@ from .clip import clip
 import os
 import sys
 from .region_awareness import get_backbone, SELayerVec
+from .offline_paths import dfn_pretrained
 
 # 设置 HuggingFace 镜像
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -56,14 +57,15 @@ class LipFD(nn.Module):
             open_clip = _get_open_clip()
             print(f"[LipFD] 正在加载 Apple DFN 模型: {name}")
             self.encoder, _, self.preprocess = open_clip.create_model_and_transforms(
-                'ViT-L-14', pretrained='dfn2b', device='cpu'
+                'ViT-L-14', pretrained=dfn_pretrained(), device='cpu'
             )
         else:
             clean_name = name.replace("CLIP:", "")
             #print(f"[LipFD] 正在加载 OpenAI CLIP 模型: {clean_name}")
             self.encoder, self.preprocess = clip.load(clean_name, device="cpu")
 
-        self.backbone = get_backbone(pretrained=True)
+        backbone_pretrained = os.environ.get("LIPFD_BACKBONE_PRETRAINED", "1") == "1"
+        self.backbone = get_backbone(pretrained=backbone_pretrained)
 
         # --- 3. 策略组件初始化 (核心修改：物理隔离) ---
         if hasattr(self.encoder, 'visual') and hasattr(self.encoder.visual, 'transformer'):

@@ -21,7 +21,7 @@ FakeAVCeleb preprocessing script
 
 ############ Custom parameters ##############
 DATASET_ROOT = r"E:\data\FakeAVCeleb\FakeAVCeleb_v1.2\FakeAVCeleb_v1.2"
-OUTPUT_ROOT = r"E:\data\FakeAVCeleb-test-mb"
+OUTPUT_ROOT = r"E:\data\FakeAVCeleb-test-mb-服务器"
 METADATA_CSV = os.path.join(DATASET_ROOT, "meta_data.csv")
 
 N_EXTRACT = 10       # number of temporal windows per video
@@ -83,9 +83,28 @@ TYPE_ORDER = [
     "FakeVideo-FakeAudio",
 ]
 
+# Only keep RR plus FR faceswap for the selected 50 source IDs.
+INCLUDE_TYPES = {
+    "RealVideo-RealAudio",
+    "FakeVideo-RealAudio",
+}
+
+METHOD_FILTERS = {
+    "FakeVideo-RealAudio": {"faceswap"},
+}
+
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+def imwrite_unicode(path: str, image: np.ndarray) -> bool:
+    ext = os.path.splitext(path)[1] or ".png"
+    ok, buf = cv2.imencode(ext, image)
+    if not ok:
+        return False
+    buf.tofile(path)
+    return os.path.exists(path)
 
 
 def safe_remove(path: str):
@@ -265,10 +284,8 @@ def select_frame_sequence(frame_count: int, n_extract: int, window_len: int):
 def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
     """
     Build selected-video plan:
-    - RR: unique one
-    - RF: optional (can be excluded)
-    - FR: sorted first
-    - FF: sorted first
+    - RR: unique one for each of the 50 source IDs
+    - FR: keep only faceswap for the same source IDs when available
     """
     df = pd.read_csv(metadata_csv)
     df = normalize_metadata(df)
@@ -280,6 +297,9 @@ def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
         for gender, source_ids in gender_map.items():
             for source_id in source_ids:
                 for original_type in TYPE_ORDER:
+                    if original_type not in INCLUDE_TYPES:
+                        continue
+
                     rows = df[
                         (df["source"] == source_id)
                         & (df["race"] == race)
@@ -287,7 +307,13 @@ def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
                         & (df["type"] == original_type)
                     ].copy()
 
+                    allowed_methods = METHOD_FILTERS.get(original_type)
+                    if allowed_methods:
+                        rows = rows[rows["method"].isin(allowed_methods)].copy()
+
                     if rows.empty:
+                        if original_type == "FakeVideo-RealAudio":
+                            continue
                         raise ValueError(
                             f"No metadata row found for source={source_id}, race={race}, "
                             f"gender={gender}, type={original_type}"
@@ -319,7 +345,7 @@ def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
                             "source_id": source_id,
                             "method": chosen["method"],
                             "category": chosen["category"],
-                            "selected_rule": "unique" if original_type in {"RealVideo-RealAudio", "RealVideo-FakeAudio"} else "sorted_first",
+                            "selected_rule": "unique" if original_type == "RealVideo-RealAudio" else "sorted_first_filtered_method",
                             "video_path": video_path,
                             "output_frame_dir": output_frame_dir,
                             "filename": chosen["filename"],
@@ -395,7 +421,9 @@ def process_one_video(video_path: str, save_dir: str):
             x = np.concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
 
             out_path = os.path.join(save_dir, f"group_{group:03d}.png")
-            cv2.imwrite(out_path, cv2.cvtColor(x, cv2.COLOR_RGB2BGR))
+            write_ok = imwrite_unicode(out_path, cv2.cvtColor(x, cv2.COLOR_RGB2BGR))
+            if not write_ok:
+                raise RuntimeError(f"Failed to save image: {out_path}")
             saved_files.append(out_path)
             group += 1
 
