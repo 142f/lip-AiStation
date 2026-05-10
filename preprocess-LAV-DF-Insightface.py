@@ -24,6 +24,7 @@ OUTPUT_ROOT/
 
 import os
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+from models.offline_paths import insightface_root
 
 import json
 import math
@@ -728,6 +729,7 @@ def init_worker():
 
     face_analysis_kwargs = {
         "name": INSIGHTFACE_MODEL,
+        "root": insightface_root(),
         "providers": providers,
     }
     if INSIGHTFACE_ALLOWED_MODULES:

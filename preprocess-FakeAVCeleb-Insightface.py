@@ -5,6 +5,7 @@ r"""
 
 import os
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
+from models.offline_paths import insightface_root
 
 _DLL_DIR_HANDLES = []
 
@@ -359,7 +360,7 @@ def init_worker():
         available_providers = ort.get_available_providers()
         if 'CUDAExecutionProvider' in available_providers:
             cuda_ok = False
-            probe_model = os.path.expanduser(rf"~/.insightface/models/{INSIGHTFACE_MODEL}/det_10g.onnx")
+            probe_model = os.path.join(insightface_root(), "models", INSIGHTFACE_MODEL, "det_10g.onnx")
 
             try:
                 if os.path.exists(probe_model):
@@ -401,7 +402,7 @@ def init_worker():
         print("请确认在当前虚拟环境中已安装 insightface, onnxruntime 以及 albumentations 等依赖。")
         raise
 
-    global_app = FaceAnalysis(name=INSIGHTFACE_MODEL, providers=providers)
+    global_app = FaceAnalysis(name=INSIGHTFACE_MODEL, root=insightface_root(), providers=providers)
     global_app.prepare(ctx_id=ctx_id, det_size=INSIGHTFACE_DET_SIZE)
     print(f"[InsightFace] 初始化完毕，运行设备: {'GPU (CUDA)' if ctx_id == 0 else 'CPU'}")
 

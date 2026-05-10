@@ -5,6 +5,7 @@ InsightFace快速测试脚本
 
 import os
 import sys
+from models.offline_paths import insightface_root
 
 def test_insightface():
     """测试InsightFace是否可用"""
@@ -44,7 +45,7 @@ def test_insightface():
     print("\n[测试3] 初始化FaceAnalysis...")
     try:
         ctx_id = 0 if use_cuda else -1
-        app = FaceAnalysis(name='buffalo_l')
+        app = FaceAnalysis(name='buffalo_l', root=insightface_root())
         app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         print("✓ FaceAnalysis初始化成功")
         print(f"  模型: buffalo_l")

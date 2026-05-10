@@ -26,6 +26,7 @@ print("[系统] 正在预热底层 C++ 科学计算库...")
 import torch
 import cv2
 from insightface.app import FaceAnalysis
+from models.offline_paths import insightface_root
 print("[系统] 底层计算库预热完毕！")
 
 import json
@@ -140,6 +141,7 @@ def init_worker():
 
     global_app = FaceAnalysis(
         name=INSIGHTFACE_MODEL,
+        root=insightface_root(),
         providers=providers
     )
     global_app.prepare(ctx_id=ctx_id, det_size=INSIGHTFACE_DET_SIZE)

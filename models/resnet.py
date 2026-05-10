@@ -1,7 +1,9 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
+import os
 from typing import Type, Any, Callable, Union, List, Optional
+from .offline_paths import torch_checkpoint_dir
 
 try:
     from torch.hub import load_state_dict_from_url
@@ -277,7 +279,13 @@ def _resnet(
 ) -> ResNet:
     model = ResNet(block, layers, **kwargs)
     if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[arch], progress=progress)
+        model_dir = torch_checkpoint_dir()
+        os.makedirs(model_dir, exist_ok=True)
+        state_dict = load_state_dict_from_url(
+            model_urls[arch],
+            model_dir=model_dir,
+            progress=progress,
+        )
         model.load_state_dict(state_dict)
     return model
 
