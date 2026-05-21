@@ -236,9 +236,15 @@ class ResNet(nn.Module):
         )
         nn.init.normal_(self.positional_encoding, std=0.02)
         self.pe_alpha = nn.Parameter(torch.tensor(0.0))
+        if not self.with_pe:
+            self.positional_encoding.requires_grad_(False)
+            self.pe_alpha.requires_grad_(False)
         
         # [控制] 始终初始化 SE 模块（保证模型结构一致）
         self.se_layer = SELayerVec(feat_dim, reduction=16)
+        if not self.with_se:
+            for p in self.se_layer.parameters():
+                p.requires_grad_(False)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
