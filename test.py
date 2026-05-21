@@ -537,8 +537,35 @@ if __name__ == "__main__":
     parser.add_argument("--fix_backbone", action='store_true')
     parser.add_argument("--fix_encoder", action='store_true')
     parser.add_argument("--name", type=str, default="test_experiment")
+    parser.add_argument("--no_innov", action="store_true", help="[Ablation] Master switch: Baseline Mode")
+    parser.add_argument("--no_modality_bias", action="store_true", help="[Ablation] Disable modality embedding")
+    parser.add_argument("--no_attn_bias", action="store_true", help="[Ablation] Disable attention bias")
+    parser.add_argument("--no_se_fusion", action="store_true", help="[Ablation] Disable SE fusion")
+    parser.add_argument("--no_residual_cls", action="store_true", help="[Ablation] Disable residual CLS")
+    parser.add_argument("--no_region_innov", action="store_true", help="[Region] Disable PE and SE")
+    parser.add_argument("--no_region_pe", action="store_true", help="[Region] Disable positional encoding")
+    parser.add_argument("--no_region_se", action="store_true", help="[Region] Disable SE attention")
 
     opt = parser.parse_args()
+
+    os.environ["LIPFD_NO_INNOV"] = "1" if opt.no_innov else "0"
+    os.environ["LIPFD_NO_MODALITY_BIAS"] = "1" if opt.no_modality_bias else "0"
+    os.environ["LIPFD_NO_ATTN_BIAS"] = "1" if opt.no_attn_bias else "0"
+    os.environ["LIPFD_NO_SE_FUSION"] = "1" if opt.no_se_fusion else "0"
+    os.environ["LIPFD_NO_RESIDUAL_CLS"] = "1" if opt.no_residual_cls else "0"
+    os.environ["REGION_NO_PE"] = "1" if (opt.no_region_pe or opt.no_region_innov) else "0"
+    os.environ["REGION_NO_SE"] = "1" if (opt.no_region_se or opt.no_region_innov) else "0"
+
+    print(
+        "[Info] Ablation flags: "
+        f"no_innov={opt.no_innov}, "
+        f"no_modality_bias={opt.no_modality_bias}, "
+        f"no_attn_bias={opt.no_attn_bias}, "
+        f"no_se_fusion={opt.no_se_fusion}, "
+        f"no_residual_cls={opt.no_residual_cls}, "
+        f"no_region_pe={os.environ['REGION_NO_PE'] == '1'}, "
+        f"no_region_se={os.environ['REGION_NO_SE'] == '1'}"
+    )
 
     try:
         opt.real_list_path, opt.fake_list_path = resolve_test_paths(opt)
