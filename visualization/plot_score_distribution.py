@@ -10,26 +10,29 @@ import numpy as np
 REQUIRED_COLUMNS = {"label", "video_score"}
 
 
-def set_paper_style():
-    """设置更适合论文排版的 Matplotlib 风格。"""
+def set_paper_style(dpi: int = 600, font_scale: float = 1.0) -> None:
+    """设置更适合论文排版的 Matplotlib 全局风格。"""
+    base = float(font_scale)
     plt.rcParams.update({
         "font.family": "serif",
         "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
         "mathtext.fontset": "stix",
 
-        "axes.linewidth": 0.75,
-        "axes.titlesize": 9.2,
-        "axes.labelsize": 8.8,
-        "xtick.labelsize": 7.8,
-        "ytick.labelsize": 7.8,
-        "legend.fontsize": 8.6,
+        "axes.linewidth": 0.70,
+        "axes.titlesize": 8.2 * base,
+        "axes.labelsize": 7.8 * base,
+        "xtick.labelsize": 7.0 * base,
+        "ytick.labelsize": 7.0 * base,
+        "legend.fontsize": 7.6 * base,
 
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
         "svg.fonttype": "none",
 
-        "savefig.dpi": 600,
+        "savefig.dpi": dpi,
         "savefig.bbox": "tight",
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
     })
 
 
@@ -54,16 +57,24 @@ def normalize_title(raw_title):
         "w/o_rae": "w/o RAE",
         "without_rae": "w/o RAE",
 
-        "region_pe_se_ablation": "w/o Region PE/SE",
-        "wo_region_pe_se": "w/o Region PE/SE",
-        "w/o_region_pe_se": "w/o Region PE/SE",
-        "without_region_pe_se": "w/o Region PE/SE",
-        "w/o_region_pe+se": "w/o Region PE/SE",
+        # 兼容旧实验目录名，但论文图中统一显示为 w/o SRAC。
+        # 这里的 region_pe_se_ablation 实际对应关闭 SRAC 中的尺度--区域身份编码与 SE 重标定，
+        # 不是完整移除 RAE。
+        "region_pe_se_ablation": "w/o SRAC",
+        "wo_region_pe_se": "w/o SRAC",
+        "w/o_region_pe_se": "w/o SRAC",
+        "without_region_pe_se": "w/o SRAC",
+        "w/o_region_pe+se": "w/o SRAC",
+        "w/o_region_pe/se": "w/o SRAC",
+        "wo_srac": "w/o SRAC",
+        "w/o_srac": "w/o SRAC",
+        "without_srac": "w/o SRAC",
+        "srac_ablation": "w/o SRAC",
 
         "full_model": "Full MB-ViT",
         "full": "Full MB-ViT",
         "full_mbvit": "Full MB-ViT",
-        "full_mbv-it": "Full MB-ViT",
+        "full_mbv_it": "Full MB-ViT",
         "mb-vit": "Full MB-ViT",
         "mbvit": "Full MB-ViT",
     }
@@ -151,7 +162,7 @@ def smooth_histogram(values, bins):
 
     smoothed = np.convolve(hist, kernel, mode="same")
 
-    # 卷积边界会轻微改变面积，这里重新归一化，保证仍可解释为密度曲线
+    # 卷积边界会轻微改变面积，这里重新归一化，保证仍可解释为密度曲线。
     bin_width = bins[1] - bins[0]
     area = np.sum(smoothed) * bin_width
     if area > 0:
@@ -184,7 +195,7 @@ def compute_auc(labels, scores):
         while j + 1 < len(scores) and sorted_scores[j + 1] == sorted_scores[i]:
             j += 1
 
-        # rank 从 1 开始；相同分数取平均 rank
+        # rank 从 1 开始；相同分数取平均 rank。
         avg_rank = (i + 1 + j + 1) / 2.0
         ranks[order[i:j + 1]] = avg_rank
         i = j + 1
@@ -252,16 +263,20 @@ def format_metric(value):
     return f"{value:.3f}"
 
 
-def get_layout(num_items):
-    """根据模型数量自动选择子图布局。"""
+def get_layout(num_items, fig_width=None, fig_height=None):
+    """根据模型数量自动选择更紧凑的论文图布局。"""
     if num_items == 1:
-        return 1, 1, (3.20, 2.35)
+        default = (3.20, 2.05)
+        return 1, 1, (fig_width or default[0], fig_height or default[1])
     if num_items == 2:
-        return 1, 2, (6.10, 2.35)
+        default = (5.80, 2.05)
+        return 1, 2, (fig_width or default[0], fig_height or default[1])
     if num_items == 3:
-        return 1, 3, (7.10, 2.25)
+        default = (7.20, 2.18)
+        return 1, 3, (fig_width or default[0], fig_height or default[1])
     if num_items == 4:
-        return 2, 2, (6.80, 4.80)
+        default = (6.60, 4.30)
+        return 2, 2, (fig_width or default[0], fig_height or default[1])
     raise ValueError("主文图最多建议展示 4 个模型。")
 
 
@@ -283,6 +298,79 @@ def build_metric_text(labels, scores, metric_mode):
     raise ValueError(f"未知的指标显示模式: {metric_mode}")
 
 
+def get_layout_params(rows):
+    """返回紧凑排版参数。
+
+    说明：
+    - legend 和全局 x 轴标题不以整张画布中心为准，而是以子图绘图区中心为准；
+    - 这样可以避免左侧 y 轴标题占用边距后，图例和横轴标题看起来偏左。
+    """
+    if rows == 1:
+        left = 0.075
+        right = 0.995
+        bottom = 0.245
+        top = 0.720
+        return {
+            "left": left,
+            "right": right,
+            "bottom": bottom,
+            "top": top,
+            "wspace": 0.300,
+            "hspace": None,
+            "plot_center": (left + right) / 2.0,
+            "legend_y": 0.965,
+            "xlabel_y": 0.052,
+            "ylabel_x": 0.014,
+        }
+
+    left = 0.085
+    right = 0.995
+    bottom = 0.105
+    top = 0.855
+    return {
+        "left": left,
+        "right": right,
+        "bottom": bottom,
+        "top": top,
+        "wspace": 0.280,
+        "hspace": 0.430,
+        "plot_center": (left + right) / 2.0,
+        "legend_y": 0.985,
+        "xlabel_y": 0.025,
+        "ylabel_x": 0.018,
+    }
+
+
+def apply_compact_layout(fig, rows):
+    """压缩无效留白，并让全局坐标标题相对绘图区居中。"""
+    params = get_layout_params(rows)
+
+    adjust_kwargs = {
+        "left": params["left"],
+        "right": params["right"],
+        "bottom": params["bottom"],
+        "top": params["top"],
+        "wspace": params["wspace"],
+    }
+    if params["hspace"] is not None:
+        adjust_kwargs["hspace"] = params["hspace"]
+
+    fig.subplots_adjust(**adjust_kwargs)
+    fig.supxlabel(
+        "Predicted fake probability",
+        fontsize=8.0,
+        x=params["plot_center"],
+        y=params["xlabel_y"],
+        ha="center",
+    )
+    fig.supylabel(
+        "Density",
+        fontsize=8.0,
+        x=params["ylabel_x"],
+        ha="center",
+    )
+
+
 def plot_score_distribution(
     csv_paths,
     output_prefix,
@@ -293,9 +381,12 @@ def plot_score_distribution(
     show_threshold=False,
     dpi=600,
     formats=("pdf", "png", "svg"),
+    fig_width=None,
+    fig_height=None,
+    font_scale=1.0,
 ):
     """绘制多个模型的视频级 Real/Fake 分数分布图。"""
-    set_paper_style()
+    set_paper_style(dpi=dpi, font_scale=font_scale)
 
     if len(csv_paths) == 0:
         raise ValueError("至少需要提供一个 video_scores CSV 文件。")
@@ -322,7 +413,7 @@ def plot_score_distribution(
     bins = np.linspace(0.0, 1.0, bins_count)
     centers = (bins[:-1] + bins[1:]) / 2.0
 
-    rows, cols, figsize = get_layout(len(items))
+    rows, cols, figsize = get_layout(len(items), fig_width=fig_width, fig_height=fig_height)
 
     fig, axes = plt.subplots(
         rows,
@@ -334,9 +425,9 @@ def plot_score_distribution(
     )
     axes = np.asarray(axes).reshape(-1)
 
-    # 色盲友好配色；同时使用线型区分，便于黑白打印
-    real_color = "#0072B2"
-    fake_color = "#D55E00"
+    # 色盲友好且适合打印的低饱和配色；线型用于辅助区分。
+    real_color = "#1F77B4"
+    fake_color = "#C95C0A"
 
     for ax_idx, ax in enumerate(axes):
         if ax_idx >= len(items):
@@ -357,7 +448,7 @@ def plot_score_distribution(
             centers,
             real_density,
             color=real_color,
-            linewidth=1.55,
+            linewidth=1.35,
             linestyle="-",
             label="Real",
         )
@@ -365,7 +456,7 @@ def plot_score_distribution(
             centers,
             real_density,
             color=real_color,
-            alpha=0.12,
+            alpha=0.09,
             linewidth=0,
         )
 
@@ -373,7 +464,7 @@ def plot_score_distribution(
             centers,
             fake_density,
             color=fake_color,
-            linewidth=1.55,
+            linewidth=1.35,
             linestyle="--",
             label="Fake",
         )
@@ -381,48 +472,54 @@ def plot_score_distribution(
             centers,
             fake_density,
             color=fake_color,
-            alpha=0.12,
+            alpha=0.08,
             linewidth=0,
         )
 
         if show_threshold:
             ax.axvline(
                 threshold,
-                color="0.25",
+                color="0.35",
                 linestyle=":",
-                linewidth=0.9,
+                linewidth=0.80,
                 zorder=0,
             )
 
         panel_label = f"({string.ascii_lowercase[ax_idx]})"
-        ax.set_title(f"{panel_label} {item['title']}", pad=4)
+        ax.set_title(f"{panel_label} {item['title']}", pad=3.0)
 
         ax.set_xlim(0.0, 1.0)
-        ax.grid(True, linestyle=":", linewidth=0.45, alpha=0.38)
+        ax.set_xticks(np.linspace(0.0, 1.0, 6))
+        ax.grid(True, linestyle=":", linewidth=0.42, alpha=0.32)
+
+        ax.tick_params(axis="both", which="major", length=2.6, width=0.65, pad=1.8)
 
         for spine in ["top", "right"]:
             ax.spines[spine].set_visible(False)
+        for spine in ["left", "bottom"]:
+            ax.spines[spine].set_linewidth(0.70)
 
         metric_text = build_metric_text(labels, scores, metric_mode)
         if metric_text is not None:
             ax.text(
                 0.035,
-                0.94,
+                0.93,
                 metric_text,
                 transform=ax.transAxes,
                 va="top",
                 ha="left",
-                fontsize=6.8,
-                linespacing=1.05,
+                fontsize=6.25 * font_scale,
+                linespacing=0.98,
                 bbox={
-                    "boxstyle": "round,pad=0.20",
+                    "boxstyle": "round,pad=0.16",
                     "facecolor": "white",
                     "edgecolor": "0.82",
-                    "linewidth": 0.45,
-                    "alpha": 0.88,
+                    "linewidth": 0.40,
+                    "alpha": 0.90,
                 },
             )
 
+    layout_params = get_layout_params(rows)
     handles, legend_labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
@@ -430,18 +527,13 @@ def plot_score_distribution(
         loc="upper center",
         ncol=2,
         frameon=False,
-        bbox_to_anchor=(0.5, 1.01),
-        handlelength=2.7,
-        columnspacing=1.7,
+        bbox_to_anchor=(layout_params["plot_center"], layout_params["legend_y"]),
+        handlelength=2.2,
+        columnspacing=1.25,
+        borderaxespad=0.0,
     )
 
-    fig.supxlabel("Predicted fake probability", fontsize=8.9)
-    fig.supylabel("Density", fontsize=8.9)
-
-    if rows == 1:
-        fig.tight_layout(rect=(0.02, 0.08, 1.0, 0.86), w_pad=1.15)
-    else:
-        fig.tight_layout(rect=(0.04, 0.04, 1.0, 0.91), w_pad=1.0, h_pad=1.0)
+    apply_compact_layout(fig, rows)
 
     output_prefix = Path(output_prefix)
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -449,10 +541,13 @@ def plot_score_distribution(
     saved_paths = []
     for fmt in formats:
         out_path = output_prefix.with_suffix(f".{fmt}")
-        if fmt == "png":
-            fig.savefig(out_path, dpi=dpi, facecolor="white")
-        else:
-            fig.savefig(out_path, facecolor="white")
+        fig.savefig(
+            out_path,
+            dpi=dpi if fmt == "png" else None,
+            facecolor="white",
+            bbox_inches="tight",
+            pad_inches=0.018,
+        )
         saved_paths.append(out_path)
 
     plt.close(fig)
@@ -467,7 +562,7 @@ def parse_args():
     parser.add_argument(
         "csv",
         nargs="+",
-        help="一个或多个 video_scores CSV 文件，建议顺序为 w/o BGI, w/o Region PE/SE, Full MB-ViT",
+        help="一个或多个 video_scores CSV 文件，建议顺序为 w/o BGI, w/o SRAC, Full MB-ViT",
     )
     parser.add_argument(
         "--output",
@@ -504,6 +599,24 @@ def parse_args():
         help="参考阈值线位置，默认 0.5，仅在 --show_threshold 开启时显示",
     )
     parser.add_argument(
+        "--fig_width",
+        type=float,
+        default=None,
+        help="手动指定图宽，单位 inch；不设置时按子图数量自动选择。",
+    )
+    parser.add_argument(
+        "--fig_height",
+        type=float,
+        default=None,
+        help="手动指定图高，单位 inch；不设置时按子图数量自动选择。",
+    )
+    parser.add_argument(
+        "--font_scale",
+        type=float,
+        default=1.0,
+        help="整体字体缩放系数，论文正文图建议 0.95--1.05。",
+    )
+    parser.add_argument(
         "--formats",
         nargs="+",
         default=["pdf", "png", "svg"],
@@ -534,6 +647,9 @@ def main():
             show_threshold=args.show_threshold,
             dpi=args.dpi,
             formats=tuple(args.formats),
+            fig_width=args.fig_width,
+            fig_height=args.fig_height,
+            font_scale=args.font_scale,
         )
     except Exception as exc:
         print(f"[错误] 绘图失败: {exc}")

@@ -319,31 +319,71 @@ def build_video_level_arrays(video_groups, agg_method="mean"):
 
 
 def save_score_csv(y_true, y_pred_prob, sample_paths, video_groups, opt, main_agg_method="top3_mean"):
-    """
-    保存帧级和视频级预测分数，供论文中的分数分布图使用。
-    """
-    os.makedirs(opt.vis_dir, exist_ok=True)
+    """保存帧级和视频级预测分数，供定性案例图和分数分布图使用。"""
+    vis_dir = getattr(opt, "vis_dir", "./vis_outputs/default")
+    model_name = getattr(opt, "model_name", "") or getattr(opt, "name", "model")
+    agg_method = getattr(opt, "video_agg", main_agg_method) or main_agg_method
 
-    frame_csv = os.path.join(opt.vis_dir, "frame_scores.csv")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    if sample_paths is None or len(sample_paths) != len(y_true):
+        print("[可视化] 样本路径数量与预测数量不一致，跳过 CSV 保存。")
+        return
+
+    frame_csv = os.path.join(vis_dir, "frame_scores.csv")
     with open(frame_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["sample_path", "video_key", "label", "frame_score", "model_name"])
         for path, label, score in zip(sample_paths, y_true, y_pred_prob):
             video_key = extract_video_key(path)
-            writer.writerow([path, video_key, int(label), float(score), opt.name])
+            writer.writerow([path, video_key, int(label), float(score), model_name])
 
     if video_groups is None:
-        print("[可视化] 无法保存视频级分数：样本路径数量与预测数量不一致。")
+        print("[可视化] video_groups 为空，无法保存视频级分数。")
         print(f"[可视化] 已保存帧级分数: {frame_csv}")
         return
 
-    video_true, video_pred_prob = build_video_level_arrays(video_groups, main_agg_method)
-    video_csv = os.path.join(opt.vis_dir, f"video_scores_{main_agg_method}.csv")
+    path_groups = {}
+    for path, label, score in zip(sample_paths, y_true, y_pred_prob):
+        video_key = extract_video_key(path)
+        path_groups.setdefault(video_key, []).append((path, int(label), float(score)))
+
+    video_csv = os.path.join(vis_dir, f"video_scores_{agg_method}.csv")
     with open(video_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["video_key", "label", "video_score", "agg_method", "model_name"])
-        for video_key, label, score in zip(video_groups.keys(), video_true, video_pred_prob):
-            writer.writerow([video_key, int(label), float(score), main_agg_method, opt.name])
+        writer.writerow([
+            "video_key",
+            "label",
+            "video_score",
+            "num_frames",
+            "agg_method",
+            "model_name",
+            "top_frame_paths",
+            "top_frame_scores",
+        ])
+
+        for video_key, group in video_groups.items():
+            labels = np.asarray(group["labels"], dtype=np.int64)
+            probs = np.asarray(group["probs"], dtype=np.float64)
+            label_counts = np.bincount(labels, minlength=2)
+            video_label = int(np.argmax(label_counts))
+            video_score = aggregate_video_score(probs, agg_method)
+
+            candidates = path_groups.get(video_key, [])
+            sorted_candidates = sorted(candidates, key=lambda item: item[2], reverse=True)[:3]
+            top_paths = [item[0] for item in sorted_candidates]
+            top_scores = [item[2] for item in sorted_candidates]
+
+            writer.writerow([
+                video_key,
+                video_label,
+                float(video_score),
+                int(len(probs)),
+                agg_method,
+                model_name,
+                "|".join(top_paths),
+                "|".join([f"{score:.6f}" for score in top_scores]),
+            ])
 
     print(f"[可视化] 已保存帧级分数: {frame_csv}")
     print(f"[可视化] 已保存视频级分数: {video_csv}")
@@ -535,7 +575,11 @@ def test(model, loader, gpu_id, opt=None):
 
     sample_paths = getattr(getattr(loader, "dataset", None), "total_list", None)
     video_groups, inconsistent_label_count = build_video_groups(y_true, y_pred_prob, sample_paths)
-    main_agg_method = getattr(opt, "main_agg_method", "top3_mean") if opt is not None else "top3_mean"
+    main_agg_method = (
+        (getattr(opt, "video_agg", None) or getattr(opt, "main_agg_method", "top3_mean"))
+        if opt is not None
+        else "top3_mean"
+    )
     print_video_report(video_groups, inconsistent_label_count, main_agg_method=main_agg_method)
 
     if opt is not None and (getattr(opt, "save_scores", False) or getattr(opt, "save_vis", False)):
@@ -594,9 +638,13 @@ if __name__ == "__main__":
     parser.add_argument("--save_vis", action="store_true", help="开启论文可视化数据导出")
     parser.add_argument("--vis_dir", type=str, default="./vis_outputs", help="可视化输出目录")
     parser.add_argument("--save_scores", action="store_true", help="保存帧级和视频级预测分数 CSV")
+    parser.add_argument("--model_name", type=str, default="", help="模型名称，用于 CSV 和图表标注")
+    parser.add_argument("--video_agg", type=str, default="top3_mean", choices=VIDEO_AGG_METHODS, help="视频级 fake score 聚合方式")
     parser.add_argument("--main_agg_method", type=str, default="top3_mean", choices=VIDEO_AGG_METHODS, help="视频级主聚合方法")
 
     opt = parser.parse_args()
+    if opt.video_agg == "top3_mean" and opt.main_agg_method != "top3_mean":
+        opt.video_agg = opt.main_agg_method
 
     os.environ["LIPFD_NO_INNOV"] = "1" if opt.no_innov else "0"
     os.environ["LIPFD_NO_MODALITY_BIAS"] = "1" if opt.no_modality_bias else "0"
