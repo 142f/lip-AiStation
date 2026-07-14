@@ -34,6 +34,22 @@ build/
 # 日志文件
 *.log
 
+# 图片文件忽略
+*.jpg
+*.jpeg
+*.png
+*.pdf
+*.gif
+*.bmp
+*.webp
+*.svg
+*.ico
+*.tiff
+*.tif
+*.psd
+*.raw
+
+
 # 项目特定目录忽略（新增内容）
 datasets/
 AVLips长/

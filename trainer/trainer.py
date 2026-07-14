@@ -25,6 +25,16 @@ class Trainer(nn.Module):
             else torch.device("cpu")
         )
         self.model = build_model(opt.arch)
+        print(
+            "[Info] Effective model switches: "
+            f"LipFD.no_innov={getattr(self.model, 'no_innov', 'N/A')}, "
+            f"use_modality_bias={getattr(self.model, 'use_modality_bias', 'N/A')}, "
+            f"use_attn_bias={getattr(self.model, 'use_attn_bias', 'N/A')}, "
+            f"use_se_fusion={getattr(self.model, 'use_se_fusion', 'N/A')}, "
+            f"use_residual_cls={getattr(self.model, 'use_residual_cls', 'N/A')}, "
+            f"Region.with_pe={getattr(getattr(self.model, 'backbone', None), 'with_pe', 'N/A')}, "
+            f"Region.with_se={getattr(getattr(self.model, 'backbone', None), 'with_se', 'N/A')}"
+        )
 
         self.step_bias = (
             0

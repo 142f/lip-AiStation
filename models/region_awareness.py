@@ -232,12 +232,19 @@ class ResNet(nn.Module):
         # [控制] 始终初始化位置编码与门控系数（保证模型结构一致，避免加载权重报错）
         # 即使 with_pe=False，这些参数也会存在（但不参与计算/更新）
         self.positional_encoding = nn.Parameter(
-            torch.zeros(self.num_scales * self.num_regions, feat_dim)
+            torch.empty(self.num_scales * self.num_regions, feat_dim)
         )
+        nn.init.normal_(self.positional_encoding, std=0.02)
         self.pe_alpha = nn.Parameter(torch.tensor(0.0))
+        if not self.with_pe:
+            self.positional_encoding.requires_grad_(False)
+            self.pe_alpha.requires_grad_(False)
         
         # [控制] 始终初始化 SE 模块（保证模型结构一致）
         self.se_layer = SELayerVec(feat_dim, reduction=16)
+        if not self.with_se:
+            for p in self.se_layer.parameters():
+                p.requires_grad_(False)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):

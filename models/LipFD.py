@@ -29,7 +29,10 @@ class LipFD(nn.Module):
         # [配置控制] 直接从命令行参数检测消融实验配置
         # 这样就不需要在 train.py/validate.py 中设置环境变量了
         # =================================================================
-        self.no_innov = "--no_innov" in sys.argv
+        self.no_innov = (
+            os.getenv("LIPFD_NO_INNOV", "0") == "1"
+            or "--no_innov" in sys.argv
+        )
         
         # 打印消融状态，方便调试
         if self.no_innov:
