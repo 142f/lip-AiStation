@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import torch
 
 import utils
-from data.datasets import AVLip
+from data import AVLip, avlip_collate_fn
 from models import build_model
-from test import aggregate_video_score, custom_collate_fn, get_sorted_image_list
+from test import aggregate_video_score, get_sorted_image_list
 
 
 def parse_args():
@@ -123,23 +123,14 @@ def build_dataset_options(work_root, dataset_name, video_output_dir):
 
 
 def run_inference(model, loader, device, agg_method):
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+    mean, std = utils.get_clip_normalization(device)
 
     frame_probs = []
     with torch.no_grad():
         for img, raw_crops, _label in loader:
-            img = img.to(device, non_blocking=True)
-            if img.dtype == torch.uint8:
-                img = img.float().div_(255.0)
-            img_tens = img.sub(mean).div(std)
-
-            crops_tens = []
-            for scale_list in raw_crops:
-                processed_scale = []
-                for crop_batch in scale_list:
-                    processed_scale.append(crop_batch.to(device, non_blocking=True))
-                crops_tens.append(processed_scale)
+            img_tens, crops_tens = utils.prepare_model_inputs(
+                img, raw_crops, device, mean, std
+            )
 
             features = model.get_features(img_tens)
             logits = model(crops_tens, features)[0]
@@ -202,7 +193,7 @@ def main():
         shuffle=False,
         num_workers=args.workers,
         pin_memory=torch.cuda.is_available(),
-        collate_fn=custom_collate_fn,
+        collate_fn=avlip_collate_fn,
     )
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")

@@ -1,5 +1,4 @@
 from .clip import clip 
-from PIL import Image
 import torch.nn as nn
 import os
 from .offline_paths import dfn_pretrained

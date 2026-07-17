@@ -24,6 +24,15 @@ class AVLip(Dataset):
         self.total_list = self.real_list + self.fake_list
         self.targets = [self.label_dict[path] for path in self.total_list]
 
+        # These transforms are stateless. Reuse them instead of rebuilding the
+        # same Python objects for every sample in every DataLoader worker.
+        self.normalize = transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711],
+        )
+        self.to_tensor = transforms.ToTensor()
+        self.crop_resize = transforms.Resize((224, 224))
+
     def __len__(self):
         return len(self.total_list)
 
@@ -47,11 +56,6 @@ class AVLip(Dataset):
         
         # --- [优化开始] 先在 Numpy 上裁剪，再转 Tensor ---
         
-        # 预定义 Normalize (保持不变)
-        normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                         std=[0.26862954, 0.26130258, 0.27577711])
-        to_tensor = transforms.ToTensor()
-
         # 优化逻辑：直接操作 numpy 数组进行切片，避免操作巨大的 float tensor
         # 原逻辑：img[:, 500:, i*500 : i*500 + 500] (Tensor操作)
         # 新逻辑：img_cv[500:, i*500 : i*500 + 500, :] (Numpy操作)
@@ -71,7 +75,7 @@ class AVLip(Dataset):
             patch_cv = cv2.resize(patch_cv, (224, 224), interpolation=cv2.INTER_LINEAR)
             
             # [Crops Strategy] Keep Normalization on CPU for correctness (Float precision for Scale 1/2)
-            patch_tensor = normalize(to_tensor(patch_cv))
+            patch_tensor = self.normalize(self.to_tensor(patch_cv))
             crops_list.append(patch_tensor)
 
         crops = [crops_list, [], []]
@@ -79,13 +83,11 @@ class AVLip(Dataset):
         # 后续的 crops[1] 和 crops[2] 是基于 crops[0] (也就是 Scale 0) 再次裁剪的
         # 因为 crops[0] 已经是 Tensor 了，这里用 transforms 是可以的
         crop_idx = [(28, 196), (61, 163)]
-        crop_resize = transforms.Resize((224, 224))
-        
         for i in range(len(crops[0])):
             # 注意：这里 crops[0][i] 已经是 (C, H, W) Normalized Float
             # crop_idx 同样可以直接切片
-            crops[1].append(crop_resize(crops[0][i][:, crop_idx[0][0]:crop_idx[0][1], crop_idx[0][0]:crop_idx[0][1]]))
-            crops[2].append(crop_resize(crops[0][i][:, crop_idx[1][0]:crop_idx[1][1], crop_idx[1][0]:crop_idx[1][1]]))
+            crops[1].append(self.crop_resize(crops[0][i][:, crop_idx[0][0]:crop_idx[0][1], crop_idx[0][0]:crop_idx[0][1]]))
+            crops[2].append(self.crop_resize(crops[0][i][:, crop_idx[1][0]:crop_idx[1][1], crop_idx[1][0]:crop_idx[1][1]]))
 
         # 最后处理大图 (Global Context)
         # 同样先 resize numpy 再转 tensor
@@ -93,6 +95,6 @@ class AVLip(Dataset):
         
         # [优化] 将归一化移到GPU进行，提高效率
         # 先转换为tensor，归一化将在GPU上进行
-        img = to_tensor(img_global)
+        img = self.to_tensor(img_global)
 
         return img, crops, label

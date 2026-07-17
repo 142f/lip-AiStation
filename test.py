@@ -6,6 +6,7 @@ import re
 import csv
 import torch.utils.data
 import utils
+from data import avlip_collate_fn
 from models import build_model
 
 # ==========================================
@@ -20,35 +21,6 @@ except ImportError:
 
 from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve, roc_auc_score, precision_recall_curve
 from tqdm import tqdm
-
-
-# ==========================================
-# 自定义 collate_fn 处理嵌套 List 结构
-# ==========================================
-def custom_collate_fn(batch):
-    """
-    自定义 collate 函数，正确处理 AVLip 返回的嵌套 List 结构
-    batch: List of (img, crops, label)
-           其中 crops 是 List[List[Tensor]]，形状为 [3个尺度][5个区域]
-    """
-    imgs = torch.stack([item[0] for item in batch])  # (B, C, H, W)
-    labels = torch.tensor([item[2] for item in batch])  # (B,)
-    
-    # 处理 crops：将 [B][3][5] 转换为 [3][5][B, C, H, W]
-    # 即：每个尺度、每个区域的所有 batch 样本堆叠在一起
-    num_scales = len(batch[0][1])  # 3
-    num_regions = len(batch[0][1][0])  # 5
-    
-    crops_batched = []
-    for scale_idx in range(num_scales):
-        scale_crops = []
-        for region_idx in range(num_regions):
-            # 收集所有 batch 中同一尺度、同一区域的 tensor
-            region_tensors = [item[1][scale_idx][region_idx] for item in batch]
-            scale_crops.append(torch.stack(region_tensors))  # (B, C, H, W)
-        crops_batched.append(scale_crops)
-    
-    return imgs, crops_batched, labels
 
 
 LABEL_DIR_NAMES = {"0_real", "1_fake", "real", "fake"}
@@ -73,10 +45,6 @@ def get_sorted_image_list(path):
             if os.path.splitext(filename)[1].lower() in IMAGE_EXTENSIONS:
                 image_list.append(os.path.join(root, filename))
     return image_list
-
-
-def count_images_recursive(path):
-    return len(get_sorted_image_list(path)) if path else 0
 
 
 def _clean_path_arg(path):
@@ -470,35 +438,12 @@ def test(model, loader, gpu_id, opt=None):
     with torch.no_grad():
         # --- [GPU 归一化准备] ---
         # 移到循环外，避免每个 batch 重复创建 tensor
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
-        
-        def process(tensor):
-            # [鲁棒性修复] 增加 dtype 检查
-            if tensor.dtype == torch.uint8:
-                tensor = tensor.float().div_(255.0)
-            return (tensor - mean) / std
+        mean, std = utils.get_clip_normalization(device)
 
         for i, (img, raw_crops, label) in enumerate(tqdm(loader, desc="Testing", leave=True)):
-            # 1. 接收数据
-            img = img.to(device, non_blocking=True)
-            
-            # 2. 全局输入归一化 (与 validate.py 保持同步)
-            # 数据集返回的是 [0, 1] 浮点型张量
-            if img.dtype == torch.uint8:
-                img = img.float().div_(255.0)
-            img_tens = img.sub(mean).div(std)
-            
-            # 3. 处理人脸裁剪区域 (Crops)
-            # raw_crops 是通过 custom_collate_fn 转换得到的 List[List[Tensor]]
-            # 数据集已经完成了 crop 的归一化，直接转移至 GPU
-            crops_tens = []
-            for scale_list in raw_crops:
-                processed_scale = []
-                for crop_batch in scale_list:
-                    c = crop_batch.to(device, non_blocking=True)
-                    processed_scale.append(c)
-                crops_tens.append(processed_scale)
+            img_tens, crops_tens = utils.prepare_model_inputs(
+                img, raw_crops, device, mean, std
+            )
             
             # 4. 模型推理
             # 注意：get_features 返回的 tensor 已经在 model 所在的 device 上
@@ -673,11 +618,6 @@ if __name__ == "__main__":
 
     print(f"[Info] real_list_path: {opt.real_list_path}")
     print(f"[Info] fake_list_path: {opt.fake_list_path}")
-    print(
-        f"[Info] images(real/fake): "
-        f"{count_images_recursive(opt.real_list_path)}/{count_images_recursive(opt.fake_list_path)}"
-    )
-
     # 设置设备
     device = torch.device(f"cuda:{opt.gpu}" if torch.cuda.is_available() else "cpu")
     print(f"[Info] 使用设备: {device}")
@@ -747,7 +687,11 @@ if __name__ == "__main__":
     if len(dataset) == 0:
         print(f"[Error] 数据集为空！请检查路径是否正确。")
         exit()
-        
+
+    print(
+        f"[Info] images(real/fake): "
+        f"{len(dataset.real_list)}/{len(dataset.fake_list)}"
+    )
     print(f"[Info] 测试集样本数: {len(dataset)}")
     
     loader = torch.utils.data.DataLoader(
@@ -756,7 +700,7 @@ if __name__ == "__main__":
         shuffle=False, 
         num_workers=opt.workers,
         pin_memory=True,
-        collate_fn=custom_collate_fn  # 【关键修复】使用自定义 collate 处理嵌套列表
+        collate_fn=avlip_collate_fn,
     )
     
     # 4. 运行测试
