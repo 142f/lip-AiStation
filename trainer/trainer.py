@@ -145,6 +145,7 @@ class Trainer(nn.Module):
         # [AMP 修改 1] 初始化混合精度组件
         # -------------------------------------------------------
         self.use_amp = opt.use_amp and torch.cuda.is_available()
+        self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
         if self.use_amp:
             # 初始化梯度缩放器，用于防止 FP16 下梯度的下溢出
             self.scaler = torch.cuda.amp.GradScaler()
@@ -167,7 +168,7 @@ class Trainer(nn.Module):
         # [AMP 修改 2] 前向传播上下文管理
         # -------------------------------------------------------
         # 使用 autocast 自动将部分算子转为 FP16 运行
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
             self._forward_impl()
 
     def _forward_impl(self):

@@ -61,6 +61,7 @@ class TrainOptions(BaseOptions):
         # 7. 性能分析 (Profiling)
         # ===================================================================
         parser.add_argument('--profile', action='store_true', help='Run torch.profiler to diagnose performance bottlenecks.')
+        parser.add_argument('--no_compile', action='store_true', help='Disable torch.compile (useful for debugging).')
         
         self.isTrain = True
         return parser

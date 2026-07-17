@@ -90,11 +90,11 @@ if __name__ == "__main__":
     val_opt = get_val_opt(opt) # [修改] 传入 opt
     model = Trainer(opt)
 
-    # [新增] 如果 PyTorch 版本 >= 2.0
-    if int(torch.__version__.split('.')[0]) >= 2:
-        print("Compiling model with torch.compile...")
-        # mode 可以选 'default', 'reduce-overhead', 'max-autotune' (最慢编译，最快运行)
-        model.model = torch.compile(model.model, mode='default') 
+    # [新增] 如果 PyTorch 版本 >= 2.0 且未禁用编译
+    if int(torch.__version__.split('.')[0]) >= 2 and not opt.no_compile:
+        print("Compiling model with torch.compile (mode=reduce-overhead)...")
+        # reduce-overhead: 使用 CUDA Graph 固化训练图，避免 train()/eval() 切换导致 epoch 间重编译
+        model.model = torch.compile(model.model, mode='reduce-overhead') 
 
     # 创建日志目录和文件（优化：放在项目根路径下的logs文件夹）
     log_dir = os.path.join("./logs", opt.name)
