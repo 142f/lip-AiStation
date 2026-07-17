@@ -3,7 +3,6 @@ from torch import Tensor
 import torch.nn as nn
 import os
 from typing import Type, Any, Callable, Union, List, Optional
-from torch.nn.functional import softmax
 from .offline_paths import torch_checkpoint_dir
 
 try:
@@ -309,15 +308,22 @@ class ResNet(nn.Module):
         # ---------------------------
         # 基础维度信息
         # ---------------------------
-        num_scales = len(x)           # 尺度数量
-        num_regions = len(x[0])       # 每尺度区域数
-        batch_size = x[0][0].shape[0] # 每批样本数
-
-        # ---------------------------
-        # Step 1: 拼接所有区域为一个大批次
-        # ---------------------------
-        all_images = [x[s][r] for s in range(num_scales) for r in range(num_regions)]
-        all_images = torch.cat(all_images, dim=0)  # (num_scales*num_regions*B, 3, H, W)
+        if torch.is_tensor(x):
+            if x.ndim != 6:
+                raise ValueError(
+                    "Packed crops must have shape (scales, regions, batch, channels, height, width)"
+                )
+            num_scales, num_regions, batch_size = x.shape[:3]
+            all_images = x.reshape(-1, *x.shape[3:])
+        else:
+            # Backward-compatible path for external callers using [S][R][B,C,H,W].
+            num_scales = len(x)
+            num_regions = len(x[0])
+            batch_size = x[0][0].shape[0]
+            all_images = torch.cat(
+                [x[s][r] for s in range(num_scales) for r in range(num_regions)],
+                dim=0,
+            )
 
         # ---------------------------
         # Step 2: 一次性通过 backbone 提取局部特征
@@ -369,9 +375,9 @@ class ResNet(nn.Module):
         # Step 5: 批量计算权重（支持分块防止显存溢出）
         # ---------------------------
         feat_cat_flat = feat_cat.contiguous().view(-1, feat_cat.shape[-1])  # (S*R*B, feat_cat)
-        weights_list = []
         if chunk_size and feat_cat_flat.shape[0] > chunk_size:
             # 分块计算
+            weights_list = []
             for chunk in torch.split(feat_cat_flat, chunk_size, dim=0):
                 w_chunk = self.get_weight(chunk)
                 weights_list.append(w_chunk)

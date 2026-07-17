@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 from models import build_model, get_loss
+from utils import get_clip_normalization, prepare_model_inputs
 # [新增] 引入调度器组件
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -147,44 +148,19 @@ class Trainer(nn.Module):
         if self.use_amp:
             # 初始化梯度缩放器，用于防止 FP16 下梯度的下溢出
             self.scaler = torch.cuda.amp.GradScaler()
-            self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def set_input(self, input):
-        # 1. 接收数据
-        x = input[0].to(self.device, non_blocking=True)
         self.label = input[2].to(self.device, non_blocking=True).long()
-        
-        # 2. 初始化归一化参数
+
         if not hasattr(self, 'mean_tensor'):
-             self.mean_tensor = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
-             self.std_tensor = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
+            self.mean_tensor, self.std_tensor = get_clip_normalization(self.device)
 
-        # 3. 处理 Global Input - 在GPU上进行归一化以提高效率
-        # 如果是uint8，先转换为float32并除以255
-        if x.dtype == torch.uint8:
-            x = x.float().div_(255.0)
-        # 如果已经是float32(0-1)，不需要额外处理
-        
-        # 保存原始数据（用于可能的调试）
-        self.input_raw = x
-        
-        # 归一化
-        self.input = x.sub_(self.mean_tensor).div_(self.std_tensor)
-
-        # 4. 处理 Crops
-        # input[1] 是 list of list of tensors
-        self.crops = []
-        
-        raw_crops = input[1] # List[List[Tensor]]
-        
-        for scale_list in raw_crops:
-            processed_scale = []
-            for crop_batch in scale_list:
-                # crop_batch is (B, 3, 224, 224) Float Normalized (from CPU)
-                c = crop_batch.to(self.device, non_blocking=True)
-                # [Hybrid Strategy] Crops are already normalized on CPU to preserve precision
-                processed_scale.append(c)
-            self.crops.append(processed_scale)
+        self.input, self.crops = prepare_model_inputs(
+            input[0], input[1], self.device, self.mean_tensor, self.std_tensor
+        )
+        # Preserve the historical attribute for external/debug callers. The old
+        # in-place normalization meant it referenced this normalized tensor too.
+        self.input_raw = self.input
 
     def forward(self):
         # -------------------------------------------------------

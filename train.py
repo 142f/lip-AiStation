@@ -1,6 +1,7 @@
 import time
 import sys
 import os
+from copy import copy
 import torch  # 需要显式导入 torch，否则 clip_grad_norm_ 会报错
 from datetime import datetime, timezone, timedelta
 from validate import validate
@@ -8,7 +9,7 @@ from data import create_dataloader
 from trainer.trainer import Trainer
 from options.train_options import TrainOptions
 from utils import set_seed
-from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+from torch.profiler import record_function, ProfilerActivity, tensorboard_trace_handler
 
 # 定义分析器设置
 def get_expert_profiler(log_dir="./logs/profiler_results"):
@@ -52,7 +53,9 @@ class Logger(object):
 
 
 def get_val_opt(opt): # [修改] 传入 opt 参数，避免依赖全局变量导致可能的 NameError
-    val_opt = TrainOptions().parse(print_options=False)
+    # Validation uses the same CLI configuration; reparsing it repeats argparse
+    # work and environment side effects without producing different options.
+    val_opt = copy(opt)
     val_opt.isTrain = False
     val_opt.data_label = "val"
     # val_opt.real_list_path = r"/3240608030/val/0_real"

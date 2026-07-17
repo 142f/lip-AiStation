@@ -6,6 +6,26 @@ from torch.utils.data.distributed import DistributedSampler
 from .datasets import AVLip
 
 
+def avlip_collate_fn(batch):
+    """Pack crops as one contiguous ``(S, R, B, C, H, W)`` tensor."""
+    images = torch.stack([sample[0] for sample in batch])
+    labels = torch.as_tensor([sample[2] for sample in batch])
+
+    first_crops = batch[0][1]
+    num_scales = len(first_crops)
+    num_regions = len(first_crops[0])
+    first_crop = first_crops[0][0]
+    crops = first_crop.new_empty(
+        (num_scales, num_regions, len(batch), *first_crop.shape)
+    )
+    for batch_idx, (_, sample_crops, _) in enumerate(batch):
+        for scale_idx, scale_crops in enumerate(sample_crops):
+            for region_idx, crop in enumerate(scale_crops):
+                crops[scale_idx, region_idx, batch_idx].copy_(crop)
+
+    return images, crops, labels
+
+
 def get_bal_sampler(dataset):
     targets = []
     for d in dataset.datasets:
@@ -68,5 +88,6 @@ def create_dataloader(opt, distributed=False):
         pin_memory=use_pin_memory,       # 固定内存加速 GPU 传输
         prefetch_factor=prefetch_factor, # 预加载因子，加快数据加载
         persistent_workers=(num_workers > 0),  # 保持worker进程存活
+        collate_fn=avlip_collate_fn,
     )
     return data_loader
