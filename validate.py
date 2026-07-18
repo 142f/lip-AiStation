@@ -149,7 +149,7 @@ if __name__ == "__main__":
     
     # 加载权重
     if os.path.exists(opt.ckpt):
-        state_dict = torch.load(opt.ckpt, map_location="cpu")
+        state_dict = torch.load(opt.ckpt, map_location="cpu", weights_only=False)
         # 处理可能存在的 'model' 键
         if "model_ema" in state_dict:
             state_dict = state_dict["model_ema"]
