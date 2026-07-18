@@ -151,7 +151,9 @@ if __name__ == "__main__":
     if os.path.exists(opt.ckpt):
         state_dict = torch.load(opt.ckpt, map_location="cpu")
         # 处理可能存在的 'model' 键
-        if "model" in state_dict:
+        if "model_ema" in state_dict:
+            state_dict = state_dict["model_ema"]
+        elif "model" in state_dict:
             state_dict = state_dict["model"]
 
         # 【核心修复】去除 'module.' 和 '_orig_mod.' 前缀
@@ -167,6 +169,11 @@ if __name__ == "__main__":
         state_dict = new_state_dict
         
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "Checkpoint/model mismatch during validation: "
+                f"missing={missing_keys[:5]}, unexpected={unexpected_keys[:5]}"
+            )
         print(f"Model loaded from {opt.ckpt}")
         if missing_keys:
             print(f"Missing keys (partial load): {len(missing_keys)}")

@@ -43,12 +43,18 @@ class TrainOptions(BaseOptions):
         # 4. 梯度累积参数 (Gradient Accumulation Parameters)
         # ===================================================================
         parser.add_argument('--accumulation_steps', type=int, default=4, help='Number of gradient accumulation steps. Simulates larger batch sizes.')
+        parser.add_argument(
+            '--region_checkpoint_chunk_size', type=int, default=-1,
+            help='Region activation-checkpoint chunk: -1 auto, 0 off, positive explicit.'
+        )
         
         # ===================================================================
         # 5. 微调与预训练 (Finetuning and Pretraining)
         # ===================================================================
         parser.add_argument('--fine-tune', action='store_true', help='If specified, enables finetuning from a pretrained model.')
         parser.add_argument('--pretrained_model', type=str, default='./checkpoints/experiment_name/model_epoch_29.pth', help='Path to the pretrained model for finetuning.')
+        parser.add_argument('--resume', action='store_true', help='Resume full training state from --pretrained_model.')
+        parser.add_argument('--allow_partial_load', action='store_true', help='Explicitly allow partial model loading for intentional cross-structure fine-tuning.')
         
         # ===================================================================
         # 6. 混合精度训练 (Mixed Precision Training)
@@ -61,7 +67,9 @@ class TrainOptions(BaseOptions):
         # 7. 性能分析 (Profiling)
         # ===================================================================
         parser.add_argument('--profile', action='store_true', help='Run torch.profiler to diagnose performance bottlenecks.')
-        parser.add_argument('--no_compile', action='store_true', help='Disable torch.compile (useful for debugging).')
+        parser.add_argument('--compile', action='store_true', help='Explicitly enable torch.compile (default: eager).')
+        parser.add_argument('--compile_mode', choices=['default', 'reduce-overhead'], default='default')
+        parser.add_argument('--no_compile', action='store_true', help='Deprecated compatibility flag; eager is already the default.')
         
         self.isTrain = True
         return parser

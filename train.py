@@ -58,6 +58,8 @@ def get_val_opt(opt): # [修改] 传入 opt 参数，避免依赖全局变量导
     val_opt = copy(opt)
     val_opt.isTrain = False
     val_opt.data_label = "val"
+    val_opt.class_bal = False
+    val_opt.serial_batches = True
     # val_opt.real_list_path = r"/3240608030/val/0_real"
     # val_opt.fake_list_path = r"/3240608030/val/1_fake"
 
@@ -85,16 +87,30 @@ def format_options(opt, parser):
 if __name__ == "__main__":
     train_options = TrainOptions()
     opt = train_options.parse(print_options=False)  # 禁用自动打印选项
+    if opt.batch_size <= 0 or opt.accumulation_steps <= 0:
+        raise ValueError("batch_size and accumulation_steps must be positive")
+    if opt.save_epoch_freq <= 0 or opt.loss_freq <= 0:
+        raise ValueError("save_epoch_freq and loss_freq must be positive")
+    if opt.use_aug or opt.spec_aug:
+        raise NotImplementedError(
+            "--use_aug/--spec_aug were previously accepted but are not implemented by AVLip"
+        )
     set_seed(opt.seed)
-    torch.backends.cudnn.benchmark = True 
+    # Keep the deterministic CuDNN policy selected by set_seed().
     val_opt = get_val_opt(opt) # [修改] 传入 opt
     model = Trainer(opt)
 
     # [新增] 如果 PyTorch 版本 >= 2.0 且未禁用编译
-    if int(torch.__version__.split('.')[0]) >= 2 and not opt.no_compile:
-        print("Compiling model with torch.compile (mode=reduce-overhead)...")
+    if opt.compile and not opt.no_compile:
+        if int(torch.__version__.split('.')[0]) < 2:
+            raise RuntimeError("--compile requires PyTorch >= 2.0")
+        print(f"Compiling model with torch.compile (mode={opt.compile_mode})...")
         # reduce-overhead: 使用 CUDA Graph 固化训练图，避免 train()/eval() 切换导致 epoch 间重编译
-        model.model = torch.compile(model.model, mode='reduce-overhead') 
+        model.model = torch.compile(model.model, mode=opt.compile_mode)
+        model.compile_enabled = True
+        model.compile_mode = opt.compile_mode
+    else:
+        print("[MODE] torch.compile=OFF (eager)")
 
     # 创建日志目录和文件（优化：放在项目根路径下的logs文件夹）
     log_dir = os.path.join("./logs", opt.name)
@@ -128,11 +144,11 @@ if __name__ == "__main__":
     print("Length of val  loader: %d" % (len(val_loader)))
 
     # 初始化最佳性能跟踪变量
-    best_acc = 0.0
-    best_ap = 0.0
-    best_auc = 0.0
-    best_f1  = 0.0
-    best_epoch = 0
+    best_acc = float(model.resume_best_metrics["best_acc"])
+    best_ap = float(model.resume_best_metrics["best_ap"])
+    best_auc = float(model.resume_best_metrics["best_auc"])
+    best_f1 = float(model.resume_best_metrics["best_f1"])
+    best_epoch = int(model.resume_best_metrics["best_epoch"])
 
     LOG_W = 100
 
@@ -167,7 +183,7 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # 训练循环
-    for epoch in range(opt.epoch):
+    for epoch in range(model.start_epoch, opt.epoch):
         epoch_start_time = time.time()
         epoch_id = epoch + model.step_bias
         lr_now = model.optimizer.param_groups[0]['lr'] if model.optimizer is not None else 0.0
@@ -290,7 +306,7 @@ if __name__ == "__main__":
         # [新增] 使用 EMA 模型进行验证
         # ====================================================================
         # 默认使用原始模型
-        val_model = model.model
+        val_model = model._unwrapped_model()
         
         # 如果 EMA 存在，优先使用 EMA 模型（它的泛化能力更强）
         if hasattr(model, 'model_ema') and model.model_ema is not None:
@@ -324,7 +340,7 @@ if __name__ == "__main__":
         
         # [重要修复] 先删除旧文件，再保存新文件，避免磁盘空间不足导致的数据丢失
         # 1. 先删除3个Epoch之前的模型（释放空间）
-        obsolete_epoch = current_epoch_num - 3
+        obsolete_epoch = current_epoch_num - opt.save_epoch_freq
         if obsolete_epoch >= 0:
             obsolete_path = os.path.join(model.save_dir, f"model_epoch_{obsolete_epoch}.pth")
             if os.path.exists(obsolete_path):
@@ -336,7 +352,13 @@ if __name__ == "__main__":
         
         # 2. 再保存当前Epoch的权重 (用于回溯分析)
         # save_optimizer=False 确保文件只有 1.8GB
-        model.save_networks(f"model_epoch_{current_epoch_num}.pth", save_optimizer=False)
+        if current_epoch_num % opt.save_epoch_freq == 0:
+            model.save_networks(
+                f"model_epoch_{current_epoch_num}.pth",
+                save_optimizer=False,
+                training_epoch=epoch,
+                checkpoint_index=current_epoch_num,
+            )
 
         # 3. 保存最佳模型 (覆盖更新)
         # 如果当前是最佳模型，额外存一份 best_model.pth
@@ -351,11 +373,13 @@ if __name__ == "__main__":
             print(f"[Result] 发现新的最佳模型! (Epoch {current_epoch})")
             print(f"[Result] 最佳指标: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch}")
             # 只存权重，不存优化器
-            model.save_networks("best_model.pth", save_optimizer=False)
+            model.save_networks(
+                "best_model.pth", save_optimizer=False,
+                training_epoch=epoch, checkpoint_index=current_epoch_num,
+            )
         else:
             print(f"[Status] 未破纪录 (最佳: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch})")
         # 每次覆盖写入，只占一份空间，万一崩溃了可以用它恢复
-        model.save_networks("latest_checkpoint.pth", save_optimizer=True)
 
         # ====== Epoch end ======
         # 先记录“本 epoch 训练过程中用的 lr”
@@ -370,6 +394,19 @@ if __name__ == "__main__":
 
         # step 后的是“下一 epoch 会用的 lr”
         lr_next_epoch = model.optimizer.param_groups[0]['lr']
+        model.save_networks(
+            "latest_checkpoint.pth",
+            save_optimizer=True,
+            training_epoch=epoch,
+            checkpoint_index=current_epoch_num,
+            best_metrics={
+                "best_acc": best_acc,
+                "best_ap": best_ap,
+                "best_auc": best_auc,
+                "best_f1": best_f1,
+                "best_epoch": best_epoch,
+            },
+        )
 
         # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
         china_tz = timezone(timedelta(hours=8))

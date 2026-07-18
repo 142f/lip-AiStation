@@ -3,6 +3,7 @@ from torch import Tensor
 import torch.nn as nn
 import os
 from typing import Type, Any, Callable, Union, List, Optional
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from .offline_paths import torch_checkpoint_dir
 
 try:
@@ -226,6 +227,8 @@ class ResNet(nn.Module):
         # ---------------------------
         self.num_scales = 3
         self.num_regions = 5
+        # Runtime-only memory policy; it is deliberately absent from state_dict.
+        self.checkpoint_chunk_size = 0
         feat_dim = 512 * block.expansion + 768
         
         # [控制] 始终初始化位置编码与门控系数（保证模型结构一致，避免加载权重报错）
@@ -286,6 +289,18 @@ class ResNet(nn.Module):
                                 norm_layer=norm_layer))
 
         return nn.Sequential(*layers)
+    def _extract_local_features(self, images):
+        f = self.conv1(images)
+        f = self.bn1(f)
+        f = self.relu(f)
+        f = self.maxpool(f)
+        f = self.layer1(f)
+        f = self.layer2(f)
+        f = self.layer3(f)
+        f = self.layer4(f)
+        f = self.avgpool(f)
+        return torch.flatten(f, 1)
+
     def _forward_impl(self, x, feature, chunk_size: int = 65536):
         """
         高效版前向传播（可直接替换原 _forward_impl）：
@@ -328,16 +343,29 @@ class ResNet(nn.Module):
         # ---------------------------
         # Step 2: 一次性通过 backbone 提取局部特征
         # ---------------------------
-        f = self.conv1(all_images)
-        f = self.bn1(f)
-        f = self.relu(f)
-        f = self.maxpool(f)
-        f = self.layer1(f)
-        f = self.layer2(f)
-        f = self.layer3(f)
-        f = self.layer4(f)
-        f = self.avgpool(f)
-        f = torch.flatten(f, 1)  # (num_scales*num_regions*B, feat_local)
+        checkpoint_chunk = int(getattr(self, "checkpoint_chunk_size", 0))
+        use_checkpoint = (
+            checkpoint_chunk > 0
+            and self.training
+            and torch.is_grad_enabled()
+            and all_images.shape[0] > checkpoint_chunk
+        )
+        if use_checkpoint:
+            f = torch.cat(
+                [
+                    activation_checkpoint(
+                        self._extract_local_features,
+                        image_chunk,
+                        use_reentrant=False,
+                    )
+                    for image_chunk in torch.split(
+                        all_images, checkpoint_chunk, dim=0
+                    )
+                ],
+                dim=0,
+            )
+        else:
+            f = self._extract_local_features(all_images)
 
         # ---------------------------
         # Step 3: reshape 回原结构，方便后续处理
