@@ -43,13 +43,7 @@ class AVLip(Dataset):
         # 1. 读取 (BGR)
         img_cv = cv2.imread(img_path)
         if img_cv is None:
-            # 返回全0数据防止崩溃
-            # Global: uint8 (3, 1120, 1120)
-            zero_img = torch.zeros((3, 1120, 1120), dtype=torch.uint8)
-            # Crops: Float Normalized (3, 224, 224)
-            zero_crop = torch.zeros((3, 224, 224), dtype=torch.float32)
-            crops = [[zero_crop.clone() for _ in range(5)] for _ in range(3)]
-            return zero_img, crops, label
+            raise RuntimeError(f"Failed to decode training image: {img_path}")
 
         # 2. 颜色转换 BGR -> RGB (此时还是 uint8，速度快)
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)

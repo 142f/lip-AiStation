@@ -27,11 +27,12 @@ def avlip_collate_fn(batch):
 
 
 def get_bal_sampler(dataset):
-    targets = []
-    for d in dataset.datasets:
-        targets.extend(d.targets)
-
+    targets = list(dataset.targets)
+    if not targets:
+        raise ValueError("Cannot build class-balanced sampler for an empty dataset")
     ratio = np.bincount(targets)
+    if len(ratio) < 2 or np.any(ratio == 0):
+        raise ValueError(f"Class-balanced sampling requires both classes, counts={ratio.tolist()}")
     w = 1.0 / torch.tensor(ratio, dtype=torch.float)
     sample_weights = w[targets]
     sampler = WeightedRandomSampler(
@@ -43,6 +44,11 @@ def get_bal_sampler(dataset):
 def create_dataloader(opt, distributed=False):
     shuffle = not opt.serial_batches if (opt.isTrain and not opt.class_bal) else False
     dataset = AVLip(opt)
+    if len(dataset) == 0:
+        raise ValueError(
+            f"No images found for data_label={opt.data_label}: "
+            f"real={opt.real_list_path}, fake={opt.fake_list_path}"
+        )
 
     sampler = get_bal_sampler(dataset) if opt.class_bal else None
     

@@ -669,6 +669,11 @@ if __name__ == "__main__":
 
         # 加载并检查
         msg = model.load_state_dict(state_dict, strict=False)
+        if msg.missing_keys or msg.unexpected_keys:
+            raise RuntimeError(
+                "Checkpoint/model mismatch during test: "
+                f"missing={msg.missing_keys[:5]}, unexpected={msg.unexpected_keys[:5]}"
+            )
         print(f"[Info] 权重加载结果: 丢失键 {len(msg.missing_keys)} | 多余键 {len(msg.unexpected_keys)}")
         
         if len(msg.missing_keys) > 0:
