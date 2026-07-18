@@ -68,7 +68,7 @@ def load_model(ckpt_path, arch, device):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     model = build_model(arch)
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     if isinstance(checkpoint, dict) and "model_ema" in checkpoint:
         state_dict = checkpoint["model_ema"]

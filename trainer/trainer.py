@@ -91,8 +91,7 @@ class Trainer(nn.Module):
         self.model = build_model(opt.arch)
         requested_chunk = int(getattr(opt, "region_checkpoint_chunk_size", -1))
         self.region_checkpoint_chunk_size = (
-            60 if requested_chunk < 0 and 15 * opt.batch_size > 120
-            else (0 if requested_chunk < 0 else requested_chunk)
+            0 if requested_chunk < 0 else requested_chunk
         )
         if hasattr(self.model, "backbone"):
             self.model.backbone.checkpoint_chunk_size = self.region_checkpoint_chunk_size

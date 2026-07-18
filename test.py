@@ -640,7 +640,7 @@ if __name__ == "__main__":
     # 2. 加载权重 (【核心修复】解决丢失键问题)
     if os.path.exists(opt.ckpt):
         print(f"[Info] 正在加载权重: {opt.ckpt}")
-        checkpoint = torch.load(opt.ckpt, map_location="cpu")
+        checkpoint = torch.load(opt.ckpt, map_location="cpu", weights_only=False)
         
         state_dict = None
         # 优先加载 EMA
