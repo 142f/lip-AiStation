@@ -7,22 +7,13 @@ from .datasets import AVLip
 
 
 def avlip_collate_fn(batch):
-    """Pack crops as one contiguous ``(S, R, B, C, H, W)`` tensor."""
+    """Pack crops as one contiguous ``(S, R, B, C, H, W)`` tensor.
+
+    Dataset 已返回打包好的 crops (S, R, C, H, W)，collate 只需沿 batch 维堆叠。
+    """
     images = torch.stack([sample[0] for sample in batch])
+    crops = torch.stack([sample[1] for sample in batch], dim=2)
     labels = torch.as_tensor([sample[2] for sample in batch])
-
-    first_crops = batch[0][1]
-    num_scales = len(first_crops)
-    num_regions = len(first_crops[0])
-    first_crop = first_crops[0][0]
-    crops = first_crop.new_empty(
-        (num_scales, num_regions, len(batch), *first_crop.shape)
-    )
-    for batch_idx, (_, sample_crops, _) in enumerate(batch):
-        for scale_idx, scale_crops in enumerate(sample_crops):
-            for region_idx, crop in enumerate(scale_crops):
-                crops[scale_idx, region_idx, batch_idx].copy_(crop)
-
     return images, crops, labels
 
 
@@ -83,7 +74,7 @@ def create_dataloader(opt, distributed=False):
     use_pin_memory = len(opt.gpu_ids) > 0 and torch.cuda.is_available()
     
     # 根据num_workers动态调整prefetch_factor
-    prefetch_factor = 2 if num_workers > 0 else None
+    prefetch_factor = getattr(opt, "prefetch_factor", 2) if num_workers > 0 else None
     
     data_loader = torch.utils.data.DataLoader(
         dataset,
