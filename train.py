@@ -89,8 +89,13 @@ if __name__ == "__main__":
     opt = train_options.parse(print_options=False)  # 禁用自动打印选项
     if opt.batch_size <= 0 or opt.accumulation_steps <= 0:
         raise ValueError("batch_size and accumulation_steps must be positive")
-    if opt.save_epoch_freq <= 0 or opt.loss_freq <= 0:
-        raise ValueError("save_epoch_freq and loss_freq must be positive")
+    if opt.loss_freq <= 0:
+        raise ValueError("loss_freq must be positive")
+    resume_freq = int(opt.resume_save_freq)
+    milestone_freq = int(opt.milestone_save_freq)
+    keep_milestones = int(opt.keep_milestone_checkpoints)
+    if min(resume_freq, milestone_freq, keep_milestones) <= 0:
+        raise ValueError("Checkpoint frequencies and retention must be positive")
     if opt.use_aug or opt.spec_aug:
         raise NotImplementedError(
             "--use_aug/--spec_aug were previously accepted but are not implemented by AVLip"
@@ -319,71 +324,64 @@ if __name__ == "__main__":
         rule_inner()
 
         # 只在验证性能超过历史最佳时才保存模型
-        # 保存准则按优先级排序：AUC > AP > ACC
-        is_better = False
-        # 优先比较 AUC
-        if auc > best_auc:
-            is_better = True
-        elif auc == best_auc:
-            # AUC 相同时比较 AP
-            if ap > best_ap:
-                is_better = True
-            elif ap == best_ap:
-                # AP 也相同时比较 ACC
-                if acc > best_acc:
-                    is_better = True
+        # 保持原有最佳模型判定：AUC > AP > ACC。
+        is_better = (
+            auc > best_auc
+            or (auc == best_auc and ap > best_ap)
+            or (auc == best_auc and ap == best_ap and acc > best_acc)
+        )
 
         # ====================================================================
-        # 保存策略（优化版）：分层频率 + 窗口清理 + 按需写入
+        # 保存策略（v3）：三类用途分离 + 按需触发 + 原子写入
         #
         # 三类文件：
-        #   model_epoch_{N}.pth    — 权重快照  ~1.8GB，每 save_epoch_freq 存，只保留最近 K 个
-        #   best_model.pth         — 最佳权重  ~1.8GB，仅新最佳时覆盖
-        #   latest_checkpoint.pth  — 断点续训  ~5-7GB，每 latest_save_freq 存 + 新最佳时存
-        #
-        # 优化效果（默认 save_epoch_freq=1, latest_save_freq=5, keep=3）：
-        #   100 epoch 写盘量从 ~860GB 降至 ~200GB，减少 77%
+        #   best_model.pth         — 推理权重，仅新最佳时覆盖（EMA可用时使用EMA）
+        #   model_epoch_{N}.pth    — 兼容旧微调/测试入口，每 milestone_save_freq 保存
+        #   latest_checkpoint.pth  — 断点续训  ~5-7GB，每 resume_save_freq + 首/末轮强制
         # ====================================================================
-        current_epoch_num = epoch_id
+        need_best = is_better
+        need_resume = (
+            epoch_id == 0
+            or (epoch_id + 1) % resume_freq == 0
+            or epoch == opt.epoch - 1
+        )
+        need_milestone = (
+            (epoch_id + 1) % milestone_freq == 0
+            or epoch == opt.epoch - 1
+        )
 
-        # ---- 1. 清理过期 epoch checkpoint（仅保留最近 K 个）----
-        keep_k = max(1, int(getattr(opt, 'keep_epoch_checkpoints', 3)))
-        should_save_epoch = (current_epoch_num % opt.save_epoch_freq == 0)
-        if should_save_epoch:
-            stale_epoch = current_epoch_num - opt.save_epoch_freq * keep_k
-            if stale_epoch >= 0:
-                stale_path = os.path.join(model.save_dir, f"model_epoch_{stale_epoch}.pth")
-                if os.path.exists(stale_path):
-                    try:
-                        os.remove(stale_path)
-                        print(f"[Cleanup] 已删除过期checkpoint: {os.path.basename(stale_path)}")
-                    except OSError as e:
-                        print(f"[Warning] 删除失败: {e}")
+        val_metrics = {
+            "val_auc": round(float(auc), 6),
+            "val_ap": round(float(ap), 6),
+            "val_acc": round(float(acc), 6),
+            "val_f1": round(float(f1), 6),
+        }
 
-        # ---- 2. 保存 epoch 权重快照 ----
-        if should_save_epoch:
-            model.save_networks(
-                f"model_epoch_{current_epoch_num}.pth",
-                save_optimizer=False,
-                training_epoch=epoch,
-                checkpoint_index=current_epoch_num,
-            )
-
-        # ---- 3. 保存最佳模型 ----
-        if is_better:
+        # ---- 保存最佳推理权重 ----
+        if need_best:
             best_acc = acc
             best_ap = ap
             best_auc = auc
             best_f1 = f1
-            best_epoch = current_epoch
-            print(f"[Result] 发现新的最佳模型! (Epoch {current_epoch})")
+            best_epoch = epoch_id
+            print(f"[Result] 发现新的最佳模型! (Epoch {epoch_id})")
             print(f"[Result] 最佳指标: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch}")
-            model.save_networks(
-                "best_model.pth", save_optimizer=False,
-                training_epoch=epoch, checkpoint_index=current_epoch_num,
+            model.save_inference_checkpoint(
+                os.path.join(model.save_dir, "best_model.pth"),
+                epoch=epoch_id,
+                metrics=val_metrics,
             )
         else:
             print(f"[Status] 未破纪录 (最佳: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch})")
+
+        # ---- 保存里程碑快照 ----
+        if need_milestone:
+            model.save_networks(
+                f"model_epoch_{epoch_id}.pth",
+                training_epoch=epoch,
+                checkpoint_index=epoch_id,
+            )
+            model.cleanup_milestone_checkpoints(model.save_dir, keep=keep_milestones)
 
         # ====== Epoch end ======
         lr_this_epoch = model.optimizer.param_groups[0]['lr']
@@ -397,18 +395,12 @@ if __name__ == "__main__":
 
         lr_next_epoch = model.optimizer.param_groups[0]['lr']
 
-        # ---- 4. 保存断点续训文件（仅在指定频率或新最佳时）----
-        latest_freq = max(1, int(getattr(opt, 'latest_save_freq', 5)))
-        latest_on_best = bool(getattr(opt, 'latest_on_best', False))
-        should_save_latest = (
-            (current_epoch_num % latest_freq == 0) or (is_better and latest_on_best)
-        )
-        if should_save_latest:
-            model.save_networks(
-                "latest_checkpoint.pth",
-                save_optimizer=True,
+        # ---- 保存断点续训文件 ----
+        if need_resume:
+            model.save_resume_checkpoint(
+                os.path.join(model.save_dir, "latest_checkpoint.pth"),
                 training_epoch=epoch,
-                checkpoint_index=current_epoch_num,
+                checkpoint_index=epoch_id,
                 best_metrics={
                     "best_acc": best_acc,
                     "best_ap": best_ap,

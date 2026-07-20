@@ -143,7 +143,13 @@ class Trainer(nn.Module):
         self._resume_checkpoint = None
         if opt.fine_tune or self.resume_mode:
             checkpoint = _load_checkpoint(opt.pretrained_model)
-            model_state = checkpoint.get("model", checkpoint)
+            ckpt_type = checkpoint.get("checkpoint_type", "legacy")
+            if ckpt_type == "inference":
+                model_state = checkpoint.get(
+                    "model_ema", checkpoint.get("model", checkpoint.get("state_dict"))
+                )
+            else:
+                model_state = checkpoint.get("model", checkpoint)
             if not isinstance(model_state, dict):
                 raise RuntimeError("Checkpoint does not contain a model state_dict")
             self._load_model_state(
@@ -623,20 +629,105 @@ class Trainer(nn.Module):
         with torch.no_grad():
             self.forward()
 
+    def _atomic_torch_save(self, payload, path):
+        """
+        原子保存：先写临时文件，成功后再原子替换，避免写入中断导致旧文件损坏。
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _get_inference_weights(self):
+        if self.model_ema is not None:
+            return "model_ema", self.model_ema.module.state_dict()
+        return "model", self._unwrapped_model().state_dict()
+
+    def save_inference_checkpoint(self, save_path, epoch, metrics):
+        """
+        保存轻量推理权重（仅单套 + 元数据）。
+        用于 best_model.pth。
+        """
+        weight_key, weights = self._get_inference_weights()
+        payload = {
+            "checkpoint_type": "inference",
+            "checkpoint_version": 3,
+            "weight_source": "ema" if weight_key == "model_ema" else "raw",
+            "epoch": epoch,
+            "metrics": dict(metrics),
+            weight_key: weights,
+        }
+        self._atomic_torch_save(payload, save_path)
+
+    def save_resume_checkpoint(
+        self, save_path, training_epoch, checkpoint_index, best_metrics
+    ):
+        """
+        保存完整断点续训状态（raw+EMA权重、optimizer、scheduler、scaler、RNG）。
+        仅用于 latest_checkpoint.pth。
+        """
+        if self.accumulation_count != 0:
+            raise RuntimeError("不能在未完成梯度累积时保存完整Resume状态")
+
+        payload = {
+            "checkpoint_type": "resume",
+            "checkpoint_version": 3,
+            "model": self._unwrapped_model().state_dict(),
+            "epoch": training_epoch,
+            "checkpoint_index": checkpoint_index,
+            "total_steps": self.total_steps,
+            "update_steps": self.update_steps,
+            "skipped_update_steps": self.skipped_update_steps,
+            "consecutive_skip_count": self.consecutive_skip_count,
+            "training_config": self._training_config(),
+            "best_metrics": dict(best_metrics),
+            "optimizer": self.optimizer.state_dict(),
+            "rng_state": _rng_state(),
+        }
+        if hasattr(self, 'model_ema') and self.model_ema is not None:
+            payload["model_ema"] = self.model_ema.module.state_dict()
+        if self.scheduler is not None:
+            payload["scheduler"] = self.scheduler.state_dict()
+        if self.use_amp:
+            payload["scaler"] = self.scaler.state_dict()
+        self._atomic_torch_save(payload, save_path)
+
+    def cleanup_milestone_checkpoints(self, directory, keep=2):
+        """
+        清理过期的里程碑快照，只保留最近 keep 个。
+        """
+        import glob as _glob
+        pattern = os.path.join(directory, "model_epoch_*.pth")
+        files = sorted(
+            _glob.glob(pattern),
+            key=lambda path: int(re.search(r"model_epoch_(\d+)\.pth$", path).group(1)),
+        )
+        while len(files) > keep:
+            removed = files.pop(0)
+            try:
+                os.remove(removed)
+                print(f"[Cleanup] 已删除过期里程碑: {os.path.basename(removed)}")
+            except OSError as e:
+                print(f"[Warning] 删除里程碑失败: {e}")
+
+    # ==================== 旧接口兼容层 ====================
     def save_networks(
         self, save_filename, save_optimizer=False, training_epoch=None,
         checkpoint_index=None, best_metrics=None,
     ):
         """
-        保存模型权重。
-        Args:
-            save_filename: 文件名
-            save_optimizer: 是否保存优化器状态（默认False，以节省空间）
+        兼容旧调用接口。新代码请使用 save_inference_checkpoint / save_resume_checkpoint。
         """
         save_path = os.path.join(self.save_dir, save_filename)
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # 1. 基础部分：始终保存模型参数
         state_dict = {
             "checkpoint_version": 2,
             "model": self._unwrapped_model().state_dict(),
@@ -648,12 +739,10 @@ class Trainer(nn.Module):
             "consecutive_skip_count": self.consecutive_skip_count,
             "training_config": self._training_config(),
         }
-        
-        # 2. EMA 部分：这是最宝贵的推理权重，必须保存
+
         if hasattr(self, 'model_ema') and self.model_ema is not None:
             state_dict["model_ema"] = self.model_ema.module.state_dict()
 
-        # 3. 优化器部分：体积巨大(3GB+)，仅在需要断点续训时才保存
         if save_optimizer:
             if training_epoch is None or checkpoint_index is None or best_metrics is None:
                 raise ValueError("Complete resume checkpoint requires epoch/index/best_metrics")
@@ -667,8 +756,7 @@ class Trainer(nn.Module):
             state_dict["best_metrics"] = dict(best_metrics)
             state_dict["rng_state"] = _rng_state()
 
-        torch.save(state_dict, save_path)
-        # print(f"[Info] Saved model to {save_path} (Optimizer: {'Yes' if save_optimizer else 'No'})")
+        self._atomic_torch_save(state_dict, save_path)
 
     def step_remainder_gradients(self):
         """处理 Epoch 结束时未满足累积步数的剩余梯度"""

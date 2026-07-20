@@ -37,10 +37,10 @@ class TrainOptions(BaseOptions):
         # 3. 检查点与日志 (Checkpoints and Logging)
         # ===================================================================
         parser.add_argument('--loss_freq', type=int, default=100, help='Frequency of logging loss (in steps).')
-        parser.add_argument('--save_epoch_freq', type=int, default=1, help='Frequency of saving epoch checkpoints (in epochs).')
-        parser.add_argument('--latest_save_freq', type=int, default=5, help='Frequency of saving latest_checkpoint (with optimizer) for resume. 较高的值可大幅减少磁盘IO.')
-        parser.add_argument('--keep_epoch_checkpoints', type=int, default=3, help='保留最近N个epoch checkpoint，超出自动删除。')
-        parser.add_argument('--latest_on_best', action='store_true', default=False, help='发现最佳模型时也保存latest_checkpoint（默认关闭以减少IO）。')
+        parser.add_argument('--save_epoch_freq', type=int, default=1, help='[已废弃] 请使用 --milestone_save_freq 替代。')
+        parser.add_argument('--resume_save_freq', type=int, default=10, help='断点续训文件保存频率（epoch）。每N轮保存一次完整Resume状态。')
+        parser.add_argument('--milestone_save_freq', type=int, default=20, help='里程碑快照保存频率（epoch）。每N轮保存一次轻量推理权重。')
+        parser.add_argument('--keep_milestone_checkpoints', type=int, default=2, help='磁盘上最多保留的里程碑快照数量。')
         
         # ===================================================================
         # 4. 梯度累积参数 (Gradient Accumulation Parameters)
