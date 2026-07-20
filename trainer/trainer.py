@@ -48,7 +48,16 @@ def _rng_state():
     np_state = np.random.get_state()
     state = {
         "python": random.getstate(),
-        "numpy": (np_state[0], torch.from_numpy(np_state[1].copy()), np_state[2], np_state[3], np_state[4]),
+        # torch.save does not support uint32 storage on all supported PyTorch
+        # versions. Preserve the exact MT19937 values as int64 and cast back
+        # to uint32 in _restore_rng_state().
+        "numpy": (
+            np_state[0],
+            torch.from_numpy(np_state[1].astype(np.int64, copy=True)),
+            np_state[2],
+            np_state[3],
+            np_state[4],
+        ),
         "torch": torch.get_rng_state(),
     }
     if torch.cuda.is_available():
@@ -66,6 +75,15 @@ def _restore_rng_state(state):
             raise RuntimeError("CUDA device count differs from resume checkpoint")
         torch.cuda.set_rng_state_all(state["cuda"])
 
+
+def _scheduler_geometry(total_epochs, warmup_epochs):
+    """Return the SequentialLR milestone (if any) and cosine T_max."""
+    if warmup_epochs > 0:
+        milestone = warmup_epochs - 1 if warmup_epochs >= 2 else warmup_epochs
+        return milestone, max((total_epochs - 1) - milestone, 1)
+    return None, max(total_epochs - 1, 1)
+
+
 class Trainer(nn.Module):
     def __init__(self, opt):
         super().__init__()
@@ -75,6 +93,21 @@ class Trainer(nn.Module):
         self.skipped_update_steps = 0
         self.start_epoch = 0
         self.step_bias = 0
+        self.max_consecutive_amp_skips = int(
+            getattr(opt, "max_consecutive_amp_skips", 8)
+        )
+        self.max_consecutive_nonamp_skips = int(
+            getattr(opt, "max_consecutive_nonamp_skips", 3)
+        )
+        if self.max_consecutive_amp_skips <= 0 or self.max_consecutive_nonamp_skips <= 0:
+            raise ValueError("Consecutive gradient-skip limits must be positive")
+        if opt.cosine_annealing:
+            if not 0 <= float(opt.eta_min) <= float(opt.lr):
+                raise ValueError("eta_min must satisfy 0 <= eta_min <= lr")
+            if int(opt.warmup_epochs) >= int(opt.epoch):
+                raise ValueError(
+                    "warmup_epochs must be smaller than epoch when cosine annealing is enabled"
+                )
         self.resume_mode = bool(getattr(opt, "resume", False))
         self.resume_best_metrics = {
             "best_acc": 0.0, "best_ap": 0.0, "best_auc": 0.0,
@@ -110,7 +143,13 @@ class Trainer(nn.Module):
         self._resume_checkpoint = None
         if opt.fine_tune or self.resume_mode:
             checkpoint = _load_checkpoint(opt.pretrained_model)
-            model_state = checkpoint.get("model", checkpoint)
+            ckpt_type = checkpoint.get("checkpoint_type", "legacy")
+            if ckpt_type == "inference":
+                model_state = checkpoint.get(
+                    "model_ema", checkpoint.get("model", checkpoint.get("state_dict"))
+                )
+            else:
+                model_state = checkpoint.get("model", checkpoint)
             if not isinstance(model_state, dict):
                 raise RuntimeError("Checkpoint does not contain a model state_dict")
             self._load_model_state(
@@ -173,28 +212,32 @@ class Trainer(nn.Module):
         # ============================
         # LR Scheduler: Warmup + CosineAnnealingLR (NO restart)
         #
-        # 关键点（配合本项目“epoch 末尾 step 一次”的用法）：
-        # 1) lr 会在“下一轮 epoch 开始时”生效（因为 step() 放在 epoch 末尾）。
-        # 2) SequentialLR 在 last_epoch 命中 milestone 时会切换到下一个 scheduler，并调用 next_scheduler.step(0)，
-        #    因此命中 milestone 的那一次不会再推进 warmup_scheduler。
-        # 3) 约定 warmup_epochs=N 表示 warmup 覆盖前 N 个 epoch。
-        #    为了让第 N 个 warmup epoch 能到达 base lr（而不是延后到第 N+1 个），
-        #    LinearLR.total_iters 应该设置为 N-1（当 N>=2）。当 N==1 时用 total_iters=1。
+        # 调度器在 epoch 末尾 step 一次，lr 在下一轮 epoch 开始时生效。
+        #
+        # SequentialLR 在 last_epoch 命中 milestone 时切换到下一个 scheduler，
+        # 并调用 next_scheduler.step(0)，因此命中 milestone 的那一次不会推进
+        # warmup_scheduler。
+        #
+        # 约定 warmup_epochs=N 表示 warmup 覆盖前 N 个 epoch。
+        # LinearLR.total_iters = N-1（N>=2），确保第 N 个 epoch 到达 base_lr。
+        #
+        # T_max 按 Cosine 实际开始的 epoch（即 milestone）计算：
+        #   T_max = (opt.epoch - 1) - milestone
+        # 调度器在 epoch [milestone, opt.epoch-2] 共步进 T_max 次，
+        # 最后一轮（epoch=opt.epoch-1）不步进，恰好停在 eta_min。
         # ============================
         self.scheduler = None
         if opt.cosine_annealing:
             warmup_epochs = max(int(getattr(opt, "warmup_epochs", 0)), 0)
             warmup_epochs = min(warmup_epochs, int(getattr(opt, "epoch", warmup_epochs)))  # ✅ 防止 warmup > 总epoch
             eta_min = float(getattr(opt, "eta_min", 1e-6))
-
-            cosine_epochs = max(opt.epoch - warmup_epochs, 1)
-            T_max = max(cosine_epochs - 1, 1)
-
-            main_scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max, eta_min=eta_min)
+            warmup_milestone, T_max = _scheduler_geometry(opt.epoch, warmup_epochs)
 
             if warmup_epochs > 0:
-                # ✅ 关键修正：让 warmup 在切换到 cosine 之前就达到 base_lr，避免切换瞬间上跳
                 warmup_total_iters = max(warmup_epochs - 1, 1)
+                # Cosine 从 warmup_milestone 开始，epoch [milestone, opt.epoch-2] 共步进
+                # (opt.epoch-1)-milestone 次，T_max 必须等于该步数，否则最后一轮回升。
+                main_scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max, eta_min=eta_min)
                 warmup_scheduler = LinearLR(
                     self.optimizer,
                     start_factor=0.001,
@@ -204,10 +247,10 @@ class Trainer(nn.Module):
                 self.scheduler = SequentialLR(
                     self.optimizer,
                     schedulers=[warmup_scheduler, main_scheduler],
-                    milestones=[warmup_epochs]
+                    milestones=[warmup_milestone]
                 )
             else:
-                self.scheduler = main_scheduler
+                self.scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max, eta_min=eta_min)
         else:
             self.scheduler = None
 
@@ -233,6 +276,10 @@ class Trainer(nn.Module):
         # 梯度累积相关参数
         self.accumulation_steps = opt.accumulation_steps
         self.accumulation_count = 0
+        self.consecutive_skip_count = 0
+        self._last_grad_norm = None
+        self._last_scale_before = None
+        self._last_scale_after = None
         
         # -------------------------------------------------------
         # [AMP 修改 1] 初始化混合精度组件
@@ -304,43 +351,116 @@ class Trainer(nn.Module):
         }
 
     def _restore_training_state(self, checkpoint):
-        required = {"checkpoint_version", "epoch", "optimizer", "best_metrics", "rng_state", "training_config"}
-        if self.scheduler is not None:
-            required.add("scheduler")
-        if self.use_amp:
-            required.add("scaler")
-        if self.model_ema is not None:
-            required.add("model_ema")
+        ckpt_version = int(checkpoint.get("checkpoint_version", 0))
+        is_legacy = ckpt_version < 2
+        if is_legacy:
+            if not getattr(self.opt, "allow_incomplete_resume", False):
+                raise RuntimeError(
+                    "Legacy checkpoint resume is approximate and requires "
+                    "--allow_incomplete_resume; otherwise use --fine-tune."
+                )
+            print("[RESUME] 检测到旧版本 checkpoint (version < 2)，启用兼容降级模式")
+
+        required = {"epoch", "optimizer"}
+        if not is_legacy:
+            required.update({
+                "training_config", "best_metrics", "rng_state",
+                "total_steps", "update_steps", "skipped_update_steps",
+            })
+            if self.scheduler is not None:
+                required.add("scheduler")
+            if self.use_amp:
+                required.add("scaler")
+            if self.model_ema is not None:
+                required.add("model_ema")
         missing = sorted(required - set(checkpoint))
         if missing:
             raise RuntimeError(
-                f"Incomplete resume checkpoint; missing={missing}. Use --fine-tune for weight-only loading."
+                f"Resume checkpoint 缺少必要字段: {missing}。请使用 --fine-tune 仅加载权重。"
             )
-        if int(checkpoint["checkpoint_version"]) < 2:
-            raise RuntimeError("Checkpoint predates complete resume format; use --fine-tune")
-        current_config = self._training_config()
-        mismatches = {
-            key: (checkpoint["training_config"].get(key), value)
-            for key, value in current_config.items()
-            if checkpoint["training_config"].get(key) != value
-        }
-        if mismatches:
-            raise RuntimeError(f"Resume configuration mismatch: {mismatches}")
+
+        if not is_legacy:
+            _PATH_KEYS = {"real_list_path", "fake_list_path"}
+            current_config = self._training_config()
+            if getattr(self.opt, "allow_data_path_mismatch", False):
+                saved_cfg = checkpoint["training_config"]
+                path_mismatches = {
+                    key: (saved_cfg.get(key), value)
+                    for key, value in current_config.items()
+                    if key in _PATH_KEYS and saved_cfg.get(key) != value
+                }
+                if path_mismatches:
+                    print("[WARN] 数据路径不匹配已放行（--allow_data_path_mismatch）：")
+                    for key, (saved, current) in path_mismatches.items():
+                        print(f"  {key}: 已保存={saved} | 当前={current}")
+                    print("[WARN] 请确认两边数据内容完全相同，否则训练结果不可复现")
+                mismatches = {
+                    key: (saved_cfg.get(key), value)
+                    for key, value in current_config.items()
+                    if key not in _PATH_KEYS and saved_cfg.get(key) != value
+                }
+            else:
+                mismatches = {
+                    key: (checkpoint["training_config"].get(key), value)
+                    for key, value in current_config.items()
+                    if checkpoint["training_config"].get(key) != value
+                }
+            if mismatches:
+                raise RuntimeError(f"Resume configuration mismatch: {mismatches}")
+
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+
         if self.scheduler is not None:
-            self.scheduler.load_state_dict(checkpoint["scheduler"])
+            sched_state = checkpoint.get("scheduler")
+            if sched_state is not None:
+                self.scheduler.load_state_dict(sched_state)
+            elif not is_legacy:
+                raise RuntimeError(
+                    "Resume checkpoint 缺少 scheduler 状态。"
+                    "请使用 --fine-tune 仅加载权重。"
+                )
+            else:
+                print("[RESUME] 调度器状态缺失，将从当前 epoch 的 LR 重新开始（学习率轨迹可能不连续）")
+
         if self.use_amp:
-            self.scaler.load_state_dict(checkpoint["scaler"])
+            scaler_state = checkpoint.get("scaler")
+            if scaler_state is not None:
+                self.scaler.load_state_dict(scaler_state)
+            elif not is_legacy:
+                raise RuntimeError(
+                    "Resume checkpoint 缺少 scaler 状态。"
+                    "请使用 --fine-tune 仅加载权重。"
+                )
+            else:
+                print("[RESUME] AMP scaler 状态缺失，将使用默认初始状态（scale 从默认值开始）")
+
         if self.model_ema is not None:
-            self.model_ema.module.load_state_dict(
-                _strip_wrapper_prefixes(checkpoint["model_ema"]), strict=True
-            )
-            self.model_ema.eval()
+            ema_state = checkpoint.get("model_ema")
+            if ema_state is not None:
+                self.model_ema.module.load_state_dict(
+                    _strip_wrapper_prefixes(ema_state), strict=True
+                )
+                self.model_ema.eval()
+            else:
+                print("[RESUME] EMA 权重缺失，将从当前模型权重重新初始化 EMA（需数个 epoch 收敛）")
+                self.model_ema = ModelEmaV2(self.model, decay=self.opt.ema_decay, device=None)
+                self.model_ema.eval()
+
         self.total_steps = int(checkpoint.get("total_steps", 0))
         self.update_steps = int(checkpoint.get("update_steps", 0))
         self.skipped_update_steps = int(checkpoint.get("skipped_update_steps", 0))
-        self.resume_best_metrics.update(checkpoint["best_metrics"])
-        _restore_rng_state(checkpoint["rng_state"])
+        self.consecutive_skip_count = int(checkpoint.get("consecutive_skip_count", 0))
+
+        if "best_metrics" in checkpoint:
+            self.resume_best_metrics.update(checkpoint["best_metrics"])
+        else:
+            print("[RESUME] 最佳指标缺失，将从零开始记录")
+
+        if "rng_state" in checkpoint:
+            _restore_rng_state(checkpoint["rng_state"])
+        else:
+            print("[RESUME] 随机数状态缺失，使用当前随机种子（可能影响复现性）")
+
         self.optimizer.zero_grad(set_to_none=True)
         print(
             f"[RESUME] start_epoch={self.start_epoch} | updates={self.update_steps} | "
@@ -395,15 +515,10 @@ class Trainer(nn.Module):
         self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
 
     def get_loss(self):
-        loss = self.loss.data.tolist()
-        return loss[0] if isinstance(loss, type(list())) else loss
+        return self.loss.item()
 
     def get_individual_losses(self):
-        loss_ral = self.loss_ral.data.tolist()
-        loss_ral = loss_ral[0] if isinstance(loss_ral, type(list())) else loss_ral
-        loss_ce = self.loss_ce.data.tolist()
-        loss_ce = loss_ce[0] if isinstance(loss_ce, type(list())) else loss_ce
-        return loss_ral, loss_ce
+        return self.loss_ral.item(), self.loss_ce.item()
 
     def _unwrapped_model(self):
         return getattr(self.model, "_orig_mod", self.model)
@@ -415,29 +530,69 @@ class Trainer(nn.Module):
             for param in self.trainable_params:
                 if param.grad is not None:
                     param.grad.mul_(gradient_multiplier)
-        torch.nn.utils.clip_grad_norm_(self.trainable_params, max_norm=1.0)
-        if not self.use_amp:
-            self.optimizer.step()
-            return True
-        scale_before = self.scaler.get_scale()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        return self.scaler.get_scale() >= scale_before
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            self.trainable_params, max_norm=1.0, error_if_nonfinite=False
+        )
+        self._last_grad_norm = total_norm.detach()
+        if self.use_amp:
+            # AMP 路径：始终调用 scaler.step() 和 scaler.update()。
+            # scaler.step() 内部检测到 Inf/NaN 时会自动跳过 optimizer.step()；
+            # scaler.update() 必须执行，否则 scale 不会降低，AMP 自动恢复能力失效。
+            scale_before = self.scaler.get_scale()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            scale_after = self.scaler.get_scale()
+            self._last_scale_before = scale_before
+            self._last_scale_after = scale_after
+            return scale_after >= scale_before
+        # 非 AMP 路径：手动检测非有限梯度
+        if not torch.isfinite(total_norm).item():
+            return False
+        self.optimizer.step()
+        return True
 
     def _finish_optimizer_step(self, stepped):
         if stepped:
+            self.consecutive_skip_count = 0
             if self.model_ema is not None:
                 self.model_ema.update(self._unwrapped_model())
             self.update_steps += 1
         else:
             self.skipped_update_steps += 1
+            self.consecutive_skip_count += 1
+            skip_limit = (
+                self.max_consecutive_amp_skips
+                if self.use_amp
+                else self.max_consecutive_nonamp_skips
+            )
+            grad_norm = (
+                self._last_grad_norm.item()
+                if self._last_grad_norm is not None
+                else float("nan")
+            )
+            scale_info = ""
+            if self.use_amp:
+                scale_info = (
+                    f" | scale={self._last_scale_before}->{self._last_scale_after}"
+                )
+            print(
+                f"[WARN] 梯度异常跳步 | grad_norm={grad_norm}{scale_info} | "
+                f"连续={self.consecutive_skip_count}/{skip_limit} | "
+                f"累计={self.skipped_update_steps}"
+            )
+            if self.consecutive_skip_count >= skip_limit:
+                self.accumulation_count = 0
+                self.optimizer.zero_grad(set_to_none=True)
+                raise RuntimeError(
+                    f"连续 {skip_limit} 次梯度异常跳步，训练已终止。"
+                    "请检查：1) 学习率是否过大 2) 数据是否存在异常样本 3) loss 是否发散"
+                )
         self.accumulation_count = 0
         self.optimizer.zero_grad(set_to_none=True)
 
     def optimize_parameters(self):
-        if self.accumulation_count == 0:
-            self.optimizer.zero_grad(set_to_none=True)
-            
+        # 梯度清零统一由 _finish_optimizer_step 负责，此处不再重复调用，
+        # 避免与 _finish_optimizer_step 中的 zero_grad 形成冗余。
         # -------------------------------------------------------
         # [AMP 修改 4] 反向传播 (Backward)
         # -------------------------------------------------------
@@ -474,20 +629,105 @@ class Trainer(nn.Module):
         with torch.no_grad():
             self.forward()
 
+    def _atomic_torch_save(self, payload, path):
+        """
+        原子保存：先写临时文件，成功后再原子替换，避免写入中断导致旧文件损坏。
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _get_inference_weights(self):
+        if self.model_ema is not None:
+            return "model_ema", self.model_ema.module.state_dict()
+        return "model", self._unwrapped_model().state_dict()
+
+    def save_inference_checkpoint(self, save_path, epoch, metrics):
+        """
+        保存轻量推理权重（仅单套 + 元数据）。
+        用于 best_model.pth。
+        """
+        weight_key, weights = self._get_inference_weights()
+        payload = {
+            "checkpoint_type": "inference",
+            "checkpoint_version": 3,
+            "weight_source": "ema" if weight_key == "model_ema" else "raw",
+            "epoch": epoch,
+            "metrics": dict(metrics),
+            weight_key: weights,
+        }
+        self._atomic_torch_save(payload, save_path)
+
+    def save_resume_checkpoint(
+        self, save_path, training_epoch, checkpoint_index, best_metrics
+    ):
+        """
+        保存完整断点续训状态（raw+EMA权重、optimizer、scheduler、scaler、RNG）。
+        仅用于 latest_checkpoint.pth。
+        """
+        if self.accumulation_count != 0:
+            raise RuntimeError("不能在未完成梯度累积时保存完整Resume状态")
+
+        payload = {
+            "checkpoint_type": "resume",
+            "checkpoint_version": 3,
+            "model": self._unwrapped_model().state_dict(),
+            "epoch": training_epoch,
+            "checkpoint_index": checkpoint_index,
+            "total_steps": self.total_steps,
+            "update_steps": self.update_steps,
+            "skipped_update_steps": self.skipped_update_steps,
+            "consecutive_skip_count": self.consecutive_skip_count,
+            "training_config": self._training_config(),
+            "best_metrics": dict(best_metrics),
+            "optimizer": self.optimizer.state_dict(),
+            "rng_state": _rng_state(),
+        }
+        if hasattr(self, 'model_ema') and self.model_ema is not None:
+            payload["model_ema"] = self.model_ema.module.state_dict()
+        if self.scheduler is not None:
+            payload["scheduler"] = self.scheduler.state_dict()
+        if self.use_amp:
+            payload["scaler"] = self.scaler.state_dict()
+        self._atomic_torch_save(payload, save_path)
+
+    def cleanup_milestone_checkpoints(self, directory, keep=2):
+        """
+        清理过期的里程碑快照，只保留最近 keep 个。
+        """
+        import glob as _glob
+        pattern = os.path.join(directory, "model_epoch_*.pth")
+        files = sorted(
+            _glob.glob(pattern),
+            key=lambda path: int(re.search(r"model_epoch_(\d+)\.pth$", path).group(1)),
+        )
+        while len(files) > keep:
+            removed = files.pop(0)
+            try:
+                os.remove(removed)
+                print(f"[Cleanup] 已删除过期里程碑: {os.path.basename(removed)}")
+            except OSError as e:
+                print(f"[Warning] 删除里程碑失败: {e}")
+
+    # ==================== 旧接口兼容层 ====================
     def save_networks(
         self, save_filename, save_optimizer=False, training_epoch=None,
         checkpoint_index=None, best_metrics=None,
     ):
         """
-        保存模型权重。
-        Args:
-            save_filename: 文件名
-            save_optimizer: 是否保存优化器状态（默认False，以节省空间）
+        兼容旧调用接口。新代码请使用 save_inference_checkpoint / save_resume_checkpoint。
         """
         save_path = os.path.join(self.save_dir, save_filename)
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # 1. 基础部分：始终保存模型参数
         state_dict = {
             "checkpoint_version": 2,
             "model": self._unwrapped_model().state_dict(),
@@ -496,28 +736,27 @@ class Trainer(nn.Module):
             "total_steps": self.total_steps,
             "update_steps": self.update_steps,
             "skipped_update_steps": self.skipped_update_steps,
+            "consecutive_skip_count": self.consecutive_skip_count,
             "training_config": self._training_config(),
         }
-        
-        # 2. EMA 部分：这是最宝贵的推理权重，必须保存
+
         if hasattr(self, 'model_ema') and self.model_ema is not None:
             state_dict["model_ema"] = self.model_ema.module.state_dict()
 
-        # 3. 优化器部分：体积巨大(3GB+)，仅在需要断点续训时才保存
         if save_optimizer:
             if training_epoch is None or checkpoint_index is None or best_metrics is None:
                 raise ValueError("Complete resume checkpoint requires epoch/index/best_metrics")
             if self.accumulation_count != 0:
                 raise RuntimeError("Cannot save full resume state with incomplete gradients")
             state_dict["optimizer"] = self.optimizer.state_dict()
-            state_dict["scheduler"] = self.scheduler.state_dict() if self.scheduler is not None else None
+            if self.scheduler is not None:
+                state_dict["scheduler"] = self.scheduler.state_dict()
             if self.use_amp:
                 state_dict["scaler"] = self.scaler.state_dict()
             state_dict["best_metrics"] = dict(best_metrics)
             state_dict["rng_state"] = _rng_state()
 
-        torch.save(state_dict, save_path)
-        # print(f"[Info] Saved model to {save_path} (Optimizer: {'Yes' if save_optimizer else 'No'})")
+        self._atomic_torch_save(state_dict, save_path)
 
     def step_remainder_gradients(self):
         """处理 Epoch 结束时未满足累积步数的剩余梯度"""
@@ -525,5 +764,3 @@ class Trainer(nn.Module):
             scale_factor = self.accumulation_steps / self.accumulation_count
             stepped = self._step_optimizer(gradient_multiplier=scale_factor)
             self._finish_optimizer_step(stepped)
-            if not stepped:
-                print("[WARN] Remainder optimizer step skipped due to non-finite gradients")

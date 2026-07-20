@@ -37,7 +37,10 @@ class TrainOptions(BaseOptions):
         # 3. 检查点与日志 (Checkpoints and Logging)
         # ===================================================================
         parser.add_argument('--loss_freq', type=int, default=100, help='Frequency of logging loss (in steps).')
-        parser.add_argument('--save_epoch_freq', type=int, default=1, help='Frequency of saving checkpoints (in epochs).')
+        parser.add_argument('--save_epoch_freq', type=int, default=1, help='[已废弃] 请使用 --milestone_save_freq 替代。')
+        parser.add_argument('--resume_save_freq', type=int, default=10, help='断点续训文件保存频率（epoch）。每N轮保存一次完整Resume状态。')
+        parser.add_argument('--milestone_save_freq', type=int, default=20, help='里程碑快照保存频率（epoch）。每N轮保存一次轻量推理权重。')
+        parser.add_argument('--keep_milestone_checkpoints', type=int, default=2, help='磁盘上最多保留的里程碑快照数量。')
         
         # ===================================================================
         # 4. 梯度累积参数 (Gradient Accumulation Parameters)
@@ -54,6 +57,8 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--fine-tune', action='store_true', help='If specified, enables finetuning from a pretrained model.')
         parser.add_argument('--pretrained_model', type=str, default='./checkpoints/experiment_name/model_epoch_29.pth', help='Path to the pretrained model for finetuning.')
         parser.add_argument('--resume', action='store_true', help='Resume full training state from --pretrained_model.')
+        parser.add_argument('--allow_data_path_mismatch', action='store_true', help='Allow resume when only dataset root paths differ; use only after confirming the data is identical.')
+        parser.add_argument('--allow_incomplete_resume', action='store_true', help='Allow approximate resume from a legacy checkpoint missing full training state.')
         parser.add_argument('--allow_partial_load', action='store_true', help='Explicitly allow partial model loading for intentional cross-structure fine-tuning.')
         
         # ===================================================================
@@ -62,6 +67,8 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision (AMP) training')
         parser.add_argument('--use_ema', action='store_true', help='If specified, use EMA (Exponential Moving Average) for model weights.')
         parser.add_argument('--ema_decay', type=float, default=0.995, help='Decay rate for EMA.')
+        parser.add_argument('--max_consecutive_amp_skips', type=int, default=8, help='Abort after this many consecutive AMP overflow skips.')
+        parser.add_argument('--max_consecutive_nonamp_skips', type=int, default=3, help='Abort after this many consecutive non-AMP non-finite-gradient skips.')
         
         # ===================================================================
         # 7. 性能分析 (Profiling)

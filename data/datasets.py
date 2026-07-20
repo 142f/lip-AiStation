@@ -87,8 +87,15 @@ class AVLip(Dataset):
         # 同样先 resize numpy 再转 tensor
         img_global = cv2.resize(img_cv, (1120, 1120), interpolation=cv2.INTER_LINEAR)
         
-        # [优化] 将归一化移到GPU进行，提高效率
-        # 先转换为tensor，归一化将在GPU上进行
-        img = self.to_tensor(img_global)
+        # 全局图保持 uint8，减少 CPU→GPU 传输量（约 115 MiB → 29 MiB/batch）
+        # 归一化在 prepare_model_inputs 中移到 GPU 执行
+        img = torch.from_numpy(np.ascontiguousarray(img_global)).permute(2, 0, 1)
 
-        return img, crops, label
+        # 将 15 个 crop 打包成单一 Tensor (S=3, R=5, C, H, W)
+        # 消除 collate 中 120 次 Python .copy_() 调用
+        crops_tensor = torch.stack(
+            [torch.stack(scale_crops, dim=0) for scale_crops in crops],
+            dim=0,
+        )
+
+        return img, crops_tensor, label
