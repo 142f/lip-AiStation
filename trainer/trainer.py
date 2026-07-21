@@ -1,6 +1,10 @@
 import os
 import random
 import re
+import hashlib
+import platform
+import subprocess
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -37,11 +41,117 @@ def _load_checkpoint(path):
         return torch.load(path, map_location="cpu")
 
 
+def _sha256_file(path, chunk_bytes=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_bytes)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _checkpoint_epoch(checkpoint, path):
     if isinstance(checkpoint, dict) and checkpoint.get("epoch") is not None:
         return int(checkpoint["epoch"])
     match = re.search(r"model_epoch_(\d+)\.pth$", os.path.basename(path))
     return int(match.group(1)) if match else None
+
+
+def _run_git(repo_root, *args):
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.stdout
+    except (OSError, subprocess.CalledProcessError):
+        return b""
+
+
+def _git_state(repo_root):
+    commit = _run_git(repo_root, "rev-parse", "HEAD").decode().strip() or "unknown"
+    branch = _run_git(repo_root, "branch", "--show-current").decode().strip() or "detached"
+    status = _run_git(repo_root, "status", "--porcelain=v1", "--untracked-files=all")
+    tracked_diff = _run_git(repo_root, "diff", "--binary", "HEAD")
+    untracked = _run_git(repo_root, "ls-files", "--others", "--exclude-standard")
+    untracked_digest = hashlib.sha256()
+    for relative in sorted(untracked.decode("utf-8", errors="surrogateescape").splitlines()):
+        candidate = os.path.join(repo_root, relative)
+        untracked_digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        untracked_digest.update(b"\0")
+        if os.path.isfile(candidate):
+            with open(candidate, "rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    untracked_digest.update(chunk)
+    return {
+        "commit": commit,
+        "branch": branch,
+        "dirty": bool(status.strip()),
+        "dirty_status_sha256": hashlib.sha256(status).hexdigest(),
+        "tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
+        "untracked_content_sha256": untracked_digest.hexdigest(),
+    }
+
+
+def _dataset_membership_manifest(path):
+    """Hash dataset membership and file metadata without rereading all images."""
+    absolute = os.path.abspath(path)
+    digest = hashlib.sha256()
+    file_count = 0
+    total_bytes = 0
+    if os.path.isfile(absolute):
+        candidates = [absolute]
+        base = os.path.dirname(absolute)
+    elif os.path.isdir(absolute):
+        candidates = []
+        base = absolute
+        for root, _, files in os.walk(absolute):
+            for name in files:
+                candidates.append(os.path.join(root, name))
+        candidates.sort(key=lambda item: os.path.relpath(item, base).replace("\\", "/"))
+    else:
+        return {"path": absolute, "exists": False, "membership_sha256": None}
+
+    for candidate in candidates:
+        stat = os.stat(candidate)
+        relative = os.path.relpath(candidate, base).replace("\\", "/")
+        record = f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8")
+        digest.update(record)
+        file_count += 1
+        total_bytes += stat.st_size
+    manifest = {
+        "path": absolute,
+        "exists": True,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "membership_sha256": digest.hexdigest(),
+    }
+    if os.path.isfile(absolute):
+        manifest["content_sha256"] = _sha256_file(absolute)
+    return manifest
+
+
+def _environment_manifest():
+    cudnn_version = torch.backends.cudnn.version() if torch.cuda.is_available() else None
+    gpu_names = [
+        torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())
+    ]
+    return {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": cudnn_version,
+        "gpus": gpu_names,
+    }
 
 
 def _rng_state():
@@ -109,6 +219,19 @@ class Trainer(nn.Module):
                     "warmup_epochs must be smaller than epoch when cosine annealing is enabled"
                 )
         self.resume_mode = bool(getattr(opt, "resume", False))
+        self.loaded_checkpoint_metadata = None
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.git_state = _git_state(repo_root)
+        self.data_manifests = {
+            key: _dataset_membership_manifest(getattr(opt, key))
+            for key in (
+                "real_list_path",
+                "fake_list_path",
+                "val_real_list_path",
+                "val_fake_list_path",
+            )
+        }
+        self.environment_manifest = _environment_manifest()
         self.resume_best_metrics = {
             "best_acc": 0.0, "best_ap": 0.0, "best_auc": 0.0,
             "best_f1": 0.0, "best_epoch": 0,
@@ -122,12 +245,19 @@ class Trainer(nn.Module):
             else torch.device("cpu")
         )
         self.model = build_model(opt.arch)
-        requested_chunk = int(getattr(opt, "region_checkpoint_chunk_size", -1))
-        self.region_checkpoint_chunk_size = (
-            0 if requested_chunk < 0 else requested_chunk
-        )
+        self.region_checkpoint_chunk_size = int(opt.region_checkpoint_chunk_size)
+        self.region_local_forward_chunk_size = int(opt.region_local_forward_chunk_size)
+        self.region_weight_chunk_size = int(opt.region_weight_chunk_size)
+        if min(
+            self.region_checkpoint_chunk_size,
+            self.region_local_forward_chunk_size,
+            self.region_weight_chunk_size,
+        ) < 0:
+            raise ValueError("Region chunk sizes must be non-negative")
         if hasattr(self.model, "backbone"):
             self.model.backbone.checkpoint_chunk_size = self.region_checkpoint_chunk_size
+            self.model.backbone.local_forward_chunk_size = self.region_local_forward_chunk_size
+            self.model.backbone.weight_chunk_size = self.region_weight_chunk_size
         print(
             "[Info] Effective model switches: "
             f"LipFD.no_innov={getattr(self.model, 'no_innov', 'N/A')}, "
@@ -137,11 +267,18 @@ class Trainer(nn.Module):
             f"use_residual_cls={getattr(self.model, 'use_residual_cls', 'N/A')}, "
             f"Region.with_pe={getattr(getattr(self.model, 'backbone', None), 'with_pe', 'N/A')}, "
             f"Region.with_se={getattr(getattr(self.model, 'backbone', None), 'with_se', 'N/A')}, "
-            f"Region.checkpoint_chunk={self.region_checkpoint_chunk_size}"
+            f"Region.checkpoint_chunk={self.region_checkpoint_chunk_size}, "
+            f"Region.local_chunk={self.region_local_forward_chunk_size}, "
+            f"Region.weight_chunk={self.region_weight_chunk_size}, "
+            f"attn_mask_cache={getattr(self.model, 'attention_mask_cache_enabled', 'N/A')}"
         )
 
         self._resume_checkpoint = None
         if opt.fine_tune or self.resume_mode:
+            self.loaded_checkpoint_metadata = {
+                "path": os.path.abspath(opt.pretrained_model),
+                "sha256": _sha256_file(opt.pretrained_model),
+            }
             checkpoint = _load_checkpoint(opt.pretrained_model)
             ckpt_type = checkpoint.get("checkpoint_type", "legacy")
             if ckpt_type == "inference":
@@ -172,7 +309,8 @@ class Trainer(nn.Module):
                 self.step_bias = (saved_epoch if saved_index is None else int(saved_index)) + 1
             print(
                 f"[LOAD] mode={'resume' if self.resume_mode else 'fine-tune'} | "
-                f"file={os.path.basename(opt.pretrained_model)} | epoch={saved_epoch}"
+                f"file={os.path.basename(opt.pretrained_model)} | epoch={saved_epoch} | "
+                f"sha256={self.loaded_checkpoint_metadata['sha256']}"
             )
 
         if opt.fix_encoder:
@@ -192,14 +330,14 @@ class Trainer(nn.Module):
             self.optimizer = torch.optim.AdamW(
                 params,
                 lr=opt.lr,
-                betas=(opt.beta1, 0.999),
+                betas=(opt.beta1, opt.beta2),
                 weight_decay=opt.weight_decay,
             )
         elif opt.optim == "adam":
             self.optimizer = torch.optim.Adam(
                 params,
                 lr=opt.lr,
-                betas=(opt.beta1, 0.999),
+                betas=(opt.beta1, opt.beta2),
                 weight_decay=opt.weight_decay,
             )
         elif opt.optim == "sgd":
@@ -254,8 +392,8 @@ class Trainer(nn.Module):
         else:
             self.scheduler = None
 
-        self.criterion = get_loss().to(self.device)
-        self.criterion1 = nn.CrossEntropyLoss(label_smoothing=0.1)
+        self.criterion = get_loss(margin=opt.ra_margin).to(self.device)
+        self.criterion1 = nn.CrossEntropyLoss(label_smoothing=opt.label_smoothing)
 
         # 确保模型先移动到 GPU
         self.model.to(self.device)
@@ -286,6 +424,9 @@ class Trainer(nn.Module):
         # -------------------------------------------------------
         self.device_type = self.device.type
         self.use_amp = opt.use_amp and self.device_type == 'cuda'
+        self.amp_dtype = (
+            torch.bfloat16 if opt.amp_dtype == "bfloat16" else torch.float16
+        )
         self.compile_enabled = False
         self.compile_mode = None
         if self.use_amp:
@@ -333,10 +474,15 @@ class Trainer(nn.Module):
         return {
             "arch": self.opt.arch,
             "optim": self.opt.optim,
+            "lr": float(self.opt.lr),
+            "beta1": float(self.opt.beta1),
+            "beta2": float(self.opt.beta2),
+            "weight_decay": float(self.opt.weight_decay),
             "batch_size": int(self.opt.batch_size),
             "accumulation_steps": int(self.accumulation_steps),
             "fix_encoder": bool(self.opt.fix_encoder),
             "use_amp": bool(self.use_amp),
+            "amp_dtype": self.opt.amp_dtype,
             "use_ema": bool(self.model_ema is not None),
             "ema_decay": float(self.opt.ema_decay),
             "cosine_annealing": bool(self.opt.cosine_annealing),
@@ -344,8 +490,37 @@ class Trainer(nn.Module):
             "eta_min": float(self.opt.eta_min),
             "planned_epochs": int(self.opt.epoch),
             "region_checkpoint_chunk_size": int(self.region_checkpoint_chunk_size),
+            "region_local_forward_chunk_size": int(self.region_local_forward_chunk_size),
+            "region_weight_chunk_size": int(self.region_weight_chunk_size),
             "compile": bool(self.opt.compile and not self.opt.no_compile),
             "compile_mode": self.opt.compile_mode,
+            "allow_tf32": bool(self.opt.allow_tf32),
+            "seed": int(self.opt.seed),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "matmul_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+            "cudnn_tf32": bool(torch.backends.cudnn.allow_tf32),
+            "ra_margin": float(self.opt.ra_margin),
+            "ra_loss_weight": float(self.opt.ra_loss_weight),
+            "ce_loss_weight": float(self.opt.ce_loss_weight),
+            "label_smoothing": float(self.opt.label_smoothing),
+            "grad_clip_norm": float(self.opt.grad_clip_norm),
+            "no_innov": bool(self.opt.no_innov),
+            "no_modality_bias": bool(self.opt.no_modality_bias),
+            "no_attn_bias": bool(self.opt.no_attn_bias),
+            "no_se_fusion": bool(self.opt.no_se_fusion),
+            "no_residual_cls": bool(self.opt.no_residual_cls),
+            "no_region_innov": bool(self.opt.no_region_innov),
+            "no_region_pe": bool(self.opt.no_region_pe),
+            "no_region_se": bool(self.opt.no_region_se),
+            "disable_attn_mask_cache": bool(self.opt.disable_attn_mask_cache),
+            "git_state": self.git_state,
+            "data_manifests": {
+                name: {
+                    key: value for key, value in manifest.items() if key != "path"
+                }
+                for name, manifest in self.data_manifests.items()
+            },
             "real_list_path": os.path.abspath(self.opt.real_list_path),
             "fake_list_path": os.path.abspath(self.opt.fake_list_path),
         }
@@ -492,7 +667,11 @@ class Trainer(nn.Module):
             and hasattr(torch.compiler, "cudagraph_mark_step_begin")
         ):
             torch.compiler.cudagraph_mark_step_begin()
-        with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+        with torch.amp.autocast(
+            self.device_type,
+            enabled=self.use_amp,
+            dtype=self.amp_dtype,
+        ):
             self._forward_impl()
 
     def _forward_impl(self):
@@ -512,7 +691,10 @@ class Trainer(nn.Module):
         
         self.loss_ral = self.criterion(self.weights_max, self.weights_org)
         self.loss_ce = self.criterion1(self.output, self.label)
-        self.loss = 0.01 * self.loss_ral + 1.0 * self.loss_ce
+        self.loss = (
+            self.opt.ra_loss_weight * self.loss_ral
+            + self.opt.ce_loss_weight * self.loss_ce
+        )
 
     def get_loss(self):
         return self.loss.item()
@@ -531,7 +713,9 @@ class Trainer(nn.Module):
                 if param.grad is not None:
                     param.grad.mul_(gradient_multiplier)
         total_norm = torch.nn.utils.clip_grad_norm_(
-            self.trainable_params, max_norm=1.0, error_if_nonfinite=False
+            self.trainable_params,
+            max_norm=self.opt.grad_clip_norm,
+            error_if_nonfinite=False,
         )
         self._last_grad_norm = total_norm.detach()
         if self.use_amp:
@@ -626,7 +810,7 @@ class Trainer(nn.Module):
         # 注意：EMA模型不需要手动eval，它始终处于评估模式
 
     def test(self):
-        with torch.no_grad():
+        with torch.inference_mode():
             self.forward()
 
     def _atomic_torch_save(self, payload, path):
@@ -662,6 +846,9 @@ class Trainer(nn.Module):
             "weight_source": "ema" if weight_key == "model_ema" else "raw",
             "epoch": epoch,
             "metrics": dict(metrics),
+            "training_config": self._training_config(),
+            "environment_manifest": self.environment_manifest,
+            "source_checkpoint": self.loaded_checkpoint_metadata,
             weight_key: weights,
         }
         self._atomic_torch_save(payload, save_path)
@@ -687,6 +874,8 @@ class Trainer(nn.Module):
             "skipped_update_steps": self.skipped_update_steps,
             "consecutive_skip_count": self.consecutive_skip_count,
             "training_config": self._training_config(),
+            "environment_manifest": self.environment_manifest,
+            "source_checkpoint": self.loaded_checkpoint_metadata,
             "best_metrics": dict(best_metrics),
             "optimizer": self.optimizer.state_dict(),
             "rng_state": _rng_state(),
@@ -738,6 +927,8 @@ class Trainer(nn.Module):
             "skipped_update_steps": self.skipped_update_steps,
             "consecutive_skip_count": self.consecutive_skip_count,
             "training_config": self._training_config(),
+            "environment_manifest": self.environment_manifest,
+            "source_checkpoint": self.loaded_checkpoint_metadata,
         }
 
         if hasattr(self, 'model_ema') and self.model_ema is not None:

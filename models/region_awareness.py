@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 import os
-from typing import Type, Any, Callable, Union, List, Optional
+from typing import Type, Any, Callable, Union, List, Optional, Sequence, Tuple
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from .offline_paths import torch_checkpoint_dir
 
@@ -19,9 +19,15 @@ model_urls = {
     'resnet152': 'https://download.pytorch.org/models/resnet152-394f9c45.pth',
     'resnext50_32x4d': 'https://download.pytorch.org/models/resnext50_32x4d-7cdf4587.pth',
     'resnext101_32x8d': 'https://download.pytorch.org/models/resnext101_32x8d-8ba56ff5.pth',
-    'wideget_backbone50_2': 'https://download.pytorch.org/models/wideget_backbone50_2-95faca4d.pth',
-    'wideget_backbone101_2': 'https://download.pytorch.org/models/wideget_backbone101_2-32ee1156.pth',
+    'wide_resnet50_2': 'https://download.pytorch.org/models/wide_resnet50_2-95faca4d.pth',
+    'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
 }
+
+
+def _group_norm_32(channels: int) -> nn.GroupNorm:
+    if channels % 32 != 0:
+        raise ValueError(f"GroupNorm channels must be divisible by 32, got {channels}")
+    return nn.GroupNorm(32, channels)
 
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
@@ -227,8 +233,12 @@ class ResNet(nn.Module):
         # ---------------------------
         self.num_scales = 3
         self.num_regions = 5
-        # Runtime-only memory policy; it is deliberately absent from state_dict.
+        # Runtime-only memory policy. Trainer freezes these values in its
+        # training_config because they deliberately do not enter state_dict.
         self.checkpoint_chunk_size = 0
+        self.local_forward_chunk_size = 0
+        self.weight_chunk_size = 0
+        self._reported_chunk_paths = set()
         feat_dim = 512 * block.expansion + 768
         
         # [控制] 始终初始化位置编码与门控系数（保证模型结构一致，避免加载权重报错）
@@ -301,7 +311,125 @@ class ResNet(nn.Module):
         f = self.avgpool(f)
         return torch.flatten(f, 1)
 
-    def _forward_impl(self, x, feature, chunk_size: int = 65536):
+    def _pack_crops(self, x) -> Tuple[Tensor, int, int, int]:
+        if torch.is_tensor(x):
+            if x.ndim != 6:
+                raise ValueError(
+                    "Packed crops must have shape "
+                    "(scales, regions, batch, channels, height, width), "
+                    f"got {tuple(x.shape)}"
+                )
+            num_scales, num_regions, batch_size = map(int, x.shape[:3])
+            if min(num_scales, num_regions, batch_size) <= 0:
+                raise ValueError(f"Packed crop dimensions must be non-zero: {tuple(x.shape)}")
+            if x.shape[3] != 3:
+                raise ValueError(f"Crop channels must be 3, got {x.shape[3]}")
+            return x.reshape(-1, *x.shape[3:]), num_scales, num_regions, batch_size
+
+        if not isinstance(x, Sequence) or len(x) == 0:
+            raise TypeError("crops must be a 6D Tensor or a non-empty [scale][region] sequence")
+        num_scales = len(x)
+        if not isinstance(x[0], Sequence) or len(x[0]) == 0:
+            raise ValueError("Each crop scale must contain at least one region")
+        num_regions = len(x[0])
+        flat = []
+        reference_shape = None
+        reference_device = None
+        reference_dtype = None
+        for scale_index, scale in enumerate(x):
+            if not isinstance(scale, Sequence) or len(scale) != num_regions:
+                raise ValueError(
+                    f"Crop grid must be rectangular: scale 0 has {num_regions} regions, "
+                    f"scale {scale_index} has {len(scale) if isinstance(scale, Sequence) else 'invalid'}"
+                )
+            for region_index, crop in enumerate(scale):
+                if not torch.is_tensor(crop) or crop.ndim != 4:
+                    raise TypeError(
+                        f"crops[{scale_index}][{region_index}] must be a 4D Tensor"
+                    )
+                if crop.shape[1] != 3:
+                    raise ValueError(
+                        f"crops[{scale_index}][{region_index}] channels must be 3, "
+                        f"got {crop.shape[1]}"
+                    )
+                current_shape = tuple(crop.shape)
+                if reference_shape is None:
+                    reference_shape = current_shape
+                    reference_device = crop.device
+                    reference_dtype = crop.dtype
+                elif current_shape != reference_shape:
+                    raise ValueError(
+                        f"All crop batches must share shape {reference_shape}; "
+                        f"crops[{scale_index}][{region_index}] is {current_shape}"
+                    )
+                elif crop.device != reference_device or crop.dtype != reference_dtype:
+                    raise ValueError("All crop tensors must share device and dtype")
+                flat.append(crop)
+        batch_size = int(reference_shape[0])
+        if batch_size <= 0:
+            raise ValueError("Crop batch size must be positive")
+        return torch.cat(flat, dim=0), num_scales, num_regions, batch_size
+
+    def _validate_feature_input(self, feature, all_images, batch_size):
+        if not torch.is_tensor(feature) or feature.ndim != 2:
+            raise TypeError("feature must be a 2D Tensor shaped (batch, 768)")
+        if feature.shape != (batch_size, 768):
+            raise ValueError(
+                f"feature must have shape ({batch_size}, 768), got {tuple(feature.shape)}"
+            )
+        if feature.device != all_images.device:
+            raise ValueError(
+                f"feature and crops must share a device: {feature.device} != {all_images.device}"
+            )
+        if not feature.is_floating_point() or not all_images.is_floating_point():
+            raise TypeError("feature and crops must use floating-point dtypes")
+        # Do not require identical dtypes: torch.cat intentionally preserves
+        # the legacy promotion behavior (for example FP16 feature + FP32 crops).
+
+    def _run_local_backbone(self, all_images):
+        checkpoint_chunk = int(self.checkpoint_chunk_size)
+        use_checkpoint = (
+            checkpoint_chunk > 0
+            and self.training
+            and torch.is_grad_enabled()
+            and all_images.shape[0] > checkpoint_chunk
+        )
+        if use_checkpoint:
+            if "checkpoint" not in self._reported_chunk_paths:
+                print(
+                    "[RegionAwareness] activation checkpoint chunk triggered: "
+                    f"total={all_images.shape[0]}, chunk={checkpoint_chunk}"
+                )
+                self._reported_chunk_paths.add("checkpoint")
+            return torch.cat(
+                [
+                    activation_checkpoint(
+                        self._extract_local_features,
+                        image_chunk,
+                        use_reentrant=False,
+                    )
+                    for image_chunk in torch.split(all_images, checkpoint_chunk, dim=0)
+                ],
+                dim=0,
+            )
+        local_chunk = int(self.local_forward_chunk_size)
+        if local_chunk > 0 and all_images.shape[0] > local_chunk:
+            if "local_forward" not in self._reported_chunk_paths:
+                print(
+                    "[RegionAwareness] local forward chunk triggered: "
+                    f"total={all_images.shape[0]}, chunk={local_chunk}"
+                )
+                self._reported_chunk_paths.add("local_forward")
+            return torch.cat(
+                [
+                    self._extract_local_features(image_chunk)
+                    for image_chunk in torch.split(all_images, local_chunk, dim=0)
+                ],
+                dim=0,
+            )
+        return self._extract_local_features(all_images)
+
+    def _forward_impl(self, x, feature, chunk_size: Optional[int] = None):
         """
         高效版前向传播（可直接替换原 _forward_impl）：
           - 一次性批量处理所有尺度与区域，充分利用 GPU 并行；
@@ -312,7 +440,8 @@ class ResNet(nn.Module):
         参数:
             x: List[List[Tensor]]，形状为 [num_scales][num_regions][B, 3, H, W]
             feature: Tensor，全局特征 (B, feat_g)
-            chunk_size: int，可选参数，用于限制一次 get_weight 处理的样本数量，防止 OOM。
+            chunk_size: 可选的 get_weight 分块覆盖值；None 使用显式配置的
+                weight_chunk_size（严格基线默认 0，即关闭）。
 
         返回:
             pred_score: Tensor，分类得分 (B, num_classes)
@@ -323,49 +452,13 @@ class ResNet(nn.Module):
         # ---------------------------
         # 基础维度信息
         # ---------------------------
-        if torch.is_tensor(x):
-            if x.ndim != 6:
-                raise ValueError(
-                    "Packed crops must have shape (scales, regions, batch, channels, height, width)"
-                )
-            num_scales, num_regions, batch_size = x.shape[:3]
-            all_images = x.reshape(-1, *x.shape[3:])
-        else:
-            # Backward-compatible path for external callers using [S][R][B,C,H,W].
-            num_scales = len(x)
-            num_regions = len(x[0])
-            batch_size = x[0][0].shape[0]
-            all_images = torch.cat(
-                [x[s][r] for s in range(num_scales) for r in range(num_regions)],
-                dim=0,
-            )
+        all_images, num_scales, num_regions, batch_size = self._pack_crops(x)
+        self._validate_feature_input(feature, all_images, batch_size)
 
         # ---------------------------
         # Step 2: 一次性通过 backbone 提取局部特征
         # ---------------------------
-        checkpoint_chunk = int(getattr(self, "checkpoint_chunk_size", 0))
-        use_checkpoint = (
-            checkpoint_chunk > 0
-            and self.training
-            and torch.is_grad_enabled()
-            and all_images.shape[0] > checkpoint_chunk
-        )
-        if use_checkpoint:
-            f = torch.cat(
-                [
-                    activation_checkpoint(
-                        self._extract_local_features,
-                        image_chunk,
-                        use_reentrant=False,
-                    )
-                    for image_chunk in torch.split(
-                        all_images, checkpoint_chunk, dim=0
-                    )
-                ],
-                dim=0,
-            )
-        else:
-            f = self._extract_local_features(all_images)
+        f = self._run_local_backbone(all_images)
 
         # ---------------------------
         # Step 3: reshape 回原结构，方便后续处理
@@ -383,6 +476,13 @@ class ResNet(nn.Module):
         # [修改] Step 4.5 — 条件性添加位置编码
         # ---------------------------
         if self.with_pe and self.positional_encoding is not None:
+            capacity = int(self.positional_encoding.shape[0])
+            requested = int(num_scales * num_regions)
+            if requested > capacity:
+                raise ValueError(
+                    "Positional encoding capacity exceeded while PE is enabled: "
+                    f"{num_scales}x{num_regions}={requested}>{capacity}"
+                )
             # 只有开启且参数存在时才执行
             pos_enc = self.positional_encoding[:num_scales * num_regions]
             pos_enc = pos_enc.view(num_scales, num_regions, 1, feat_dim).expand(-1, -1, batch_size, -1)
@@ -403,10 +503,19 @@ class ResNet(nn.Module):
         # Step 5: 批量计算权重（支持分块防止显存溢出）
         # ---------------------------
         feat_cat_flat = feat_cat.contiguous().view(-1, feat_cat.shape[-1])  # (S*R*B, feat_cat)
-        if chunk_size and feat_cat_flat.shape[0] > chunk_size:
+        effective_chunk_size = (
+            int(self.weight_chunk_size) if chunk_size is None else int(chunk_size)
+        )
+        if effective_chunk_size > 0 and feat_cat_flat.shape[0] > effective_chunk_size:
+            if "weight" not in self._reported_chunk_paths:
+                print(
+                    "[RegionAwareness] weight-head chunk triggered: "
+                    f"total={feat_cat_flat.shape[0]}, chunk={effective_chunk_size}"
+                )
+                self._reported_chunk_paths.add("weight")
             # 分块计算
             weights_list = []
-            for chunk in torch.split(feat_cat_flat, chunk_size, dim=0):
+            for chunk in torch.split(feat_cat_flat, effective_chunk_size, dim=0):
                 w_chunk = self.get_weight(chunk)
                 weights_list.append(w_chunk)
             weights_all = torch.cat(weights_list, dim=0)
@@ -512,16 +621,13 @@ def get_backbone(pretrained: bool = False, progress: bool = True, **kwargs: Any)
         progress (bool): If True, displays a progress bar of the download to stderr
     """
     # 使用 GroupNorm 替代 BatchNorm，解决小 Batch Size 问题
-    norm_layer = lambda channels: nn.GroupNorm(32, channels)
-    return _get_backbone('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress, norm_layer=norm_layer, **kwargs)
+    return _get_backbone('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress, norm_layer=_group_norm_32, **kwargs)
 
 
 if __name__ == '__main__':
-    model = get_backbone()
-    data = [[] for i in range(3)]
-    for i in range(3):
-        for j in range(5):
-            data[i].append(torch.rand((10, 3, 224, 224)))
-    feature = torch.rand((10, 768))
-    pred_score, weights_max, weights_org = model(data, feature)
-    pass
+    model = get_backbone(pretrained=False).eval()
+    data = [[torch.rand((1, 3, 32, 32)) for _ in range(5)] for _ in range(3)]
+    feature = torch.rand((1, 768))
+    with torch.inference_mode():
+        pred_score, weights_max, weights_org = model(data, feature)
+    print(pred_score.shape, weights_max.shape, weights_org.shape)

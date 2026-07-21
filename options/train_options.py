@@ -24,6 +24,7 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--optim', type=str, default='adamw', help='Optimizer to use [sgd, adam, adamw].')
         parser.add_argument('--lr', type=float, default=1e-4, help='Initial learning rate.')
         parser.add_argument('--beta1', type=float, default=0.9, help='Momentum term for the Adam optimizer.')
+        parser.add_argument('--beta2', type=float, default=0.999, help='Second-moment decay for Adam/AdamW.')
         parser.add_argument('--cosine_annealing', action='store_true', help='Use cosine annealing learning rate scheduler.')
         
         # [新增] 预热参数 Warmup
@@ -47,9 +48,13 @@ class TrainOptions(BaseOptions):
         # ===================================================================
         parser.add_argument('--accumulation_steps', type=int, default=4, help='Number of gradient accumulation steps. Simulates larger batch sizes.')
         parser.add_argument(
-            '--region_checkpoint_chunk_size', type=int, default=-1,
-            help='Region activation-checkpoint chunk: -1 auto, 0 off, positive explicit.'
+            '--region_checkpoint_chunk_size', type=int, default=0,
+            help='Region activation-checkpoint chunk: 0 off, positive explicit.'
         )
+        parser.add_argument('--region_local_forward_chunk_size', type=int, default=0,
+                            help='Region local-backbone forward chunk: 0 off.')
+        parser.add_argument('--region_weight_chunk_size', type=int, default=0,
+                            help='Region weight-head chunk: 0 keeps the strict baseline path.')
         
         # ===================================================================
         # 5. 微调与预训练 (Finetuning and Pretraining)
@@ -65,6 +70,8 @@ class TrainOptions(BaseOptions):
         # 6. 混合精度训练 (Mixed Precision Training)
         # ===================================================================
         parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision (AMP) training')
+        parser.add_argument('--amp_dtype', choices=['float16', 'bfloat16'], default='float16',
+                            help='Autocast dtype when AMP is enabled.')
         parser.add_argument('--use_ema', action='store_true', help='If specified, use EMA (Exponential Moving Average) for model weights.')
         parser.add_argument('--ema_decay', type=float, default=0.995, help='Decay rate for EMA.')
         parser.add_argument('--max_consecutive_amp_skips', type=int, default=8, help='Abort after this many consecutive AMP overflow skips.')
@@ -77,6 +84,15 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--compile', action='store_true', help='Explicitly enable torch.compile (default: eager).')
         parser.add_argument('--compile_mode', choices=['default', 'reduce-overhead'], default='default')
         parser.add_argument('--no_compile', action='store_true', help='Deprecated compatibility flag; eager is already the default.')
+        parser.add_argument('--allow_tf32', action='store_true',
+                            help='Allow CUDA TF32 matmul/cuDNN kernels (result-sensitive).')
+
+        # Loss/gradient values are explicit so resume can reject objective drift.
+        parser.add_argument('--ra_margin', type=float, default=0.15)
+        parser.add_argument('--ra_loss_weight', type=float, default=0.01)
+        parser.add_argument('--ce_loss_weight', type=float, default=1.0)
+        parser.add_argument('--label_smoothing', type=float, default=0.1)
+        parser.add_argument('--grad_clip_norm', type=float, default=1.0)
         
         self.isTrain = True
         return parser

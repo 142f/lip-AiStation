@@ -27,6 +27,6 @@ def build_model(transformer_name):
         assert False
 
 
-def get_loss():
+def get_loss(margin=0.15):
     from .LipFD import RALoss
-    return RALoss()
+    return RALoss(margin=margin)
