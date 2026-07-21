@@ -1,6 +1,7 @@
 import time
 import sys
 import os
+import json
 from copy import copy
 import torch  # 需要显式导入 torch，否则 clip_grad_norm_ 会报错
 from datetime import datetime, timezone, timedelta
@@ -101,6 +102,8 @@ if __name__ == "__main__":
             "--use_aug/--spec_aug were previously accepted but are not implemented by AVLip"
         )
     set_seed(opt.seed)
+    torch.backends.cuda.matmul.allow_tf32 = bool(opt.allow_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(opt.allow_tf32)
     # Keep the deterministic CuDNN policy selected by set_seed().
     val_opt = get_val_opt(opt) # [修改] 传入 opt
     model = Trainer(opt)
@@ -110,6 +113,11 @@ if __name__ == "__main__":
         if int(torch.__version__.split('.')[0]) < 2:
             raise RuntimeError("--compile requires PyTorch >= 2.0")
         print(f"Compiling model with torch.compile (mode={opt.compile_mode})...")
+        if getattr(model.model, "use_attn_bias", False):
+            print(
+                "[WARN] compile is being enabled with runtime attention-mask injection; "
+                "this combination requires the dedicated compile regression before full training."
+            )
         # reduce-overhead: 使用 CUDA Graph 固化训练图，避免 train()/eval() 切换导致 epoch 间重编译
         model.model = torch.compile(model.model, mode=opt.compile_mode)
         model.compile_enabled = True
@@ -129,6 +137,10 @@ if __name__ == "__main__":
 
     # 将训练选项写入日志文件
     print(format_options(opt, train_options.parser))
+    print("[Reproducibility] frozen training config:")
+    print(json.dumps(model._training_config(), ensure_ascii=False, sort_keys=True, indent=2))
+    print("[Environment] runtime manifest:")
+    print(json.dumps(model.environment_manifest, ensure_ascii=False, sort_keys=True, indent=2))
     print("\n")
 
     # 打印模型参数量

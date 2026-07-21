@@ -72,6 +72,11 @@ class BaseOptions:
         parser.add_argument("--no_attn_bias",     action="store_true", help="[Ablation] Disable Attention Bias")
         parser.add_argument("--no_se_fusion",     action="store_true", help="[Ablation] Disable SE Fusion")
         parser.add_argument("--no_residual_cls",  action="store_true", help="[Ablation] Disable Residual CLS")
+        parser.add_argument(
+            "--disable_attn_mask_cache",
+            action="store_true",
+            help="Disable the eager attention-mask identity cache (debug/compatibility only).",
+        )
 
         # =========================
         # [新增] Region Backbone 消融开关 (仅控制 region_awareness.py)
@@ -159,6 +164,7 @@ class BaseOptions:
         os.environ["LIPFD_NO_ATTN_BIAS"]     = "1" if opt.no_attn_bias else "0"
         os.environ["LIPFD_NO_SE_FUSION"]     = "1" if opt.no_se_fusion else "0"
         os.environ["LIPFD_NO_RESIDUAL_CLS"]  = "1" if opt.no_residual_cls else "0"
+        os.environ["LIPFD_ATTN_MASK_CACHE"] = "0" if opt.disable_attn_mask_cache else "1"
 
         os.environ["REGION_NO_PE"] = "1" if (opt.no_region_pe or opt.no_region_innov) else "0"
         os.environ["REGION_NO_SE"] = "1" if (opt.no_region_se or opt.no_region_innov) else "0"

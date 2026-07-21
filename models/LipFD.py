@@ -6,8 +6,8 @@ import sys
 from .region_awareness import get_backbone, SELayerVec
 from .offline_paths import dfn_pretrained
 
-# 设置 HuggingFace 镜像
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 设置默认 HuggingFace 镜像，但不覆盖调用方显式配置。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 
 def _get_open_clip():
@@ -20,10 +20,69 @@ def _get_open_clip():
         ) from exc
     return open_clip
 
+
+def _normalize_transformer_output(output, expected_lnd_shape):
+    """Extract a documented Transformer tensor and normalize it to LND.
+
+    Supported contracts are a Tensor, a tuple/list containing exactly one
+    top-level Tensor, or a mapping with ``last_hidden_state``/``x``.  Nested
+    recursive searches are deliberately rejected because they can silently
+    select attention maps or unrelated intermediate tensors.
+    """
+    if torch.is_tensor(output):
+        tensor = output
+    elif isinstance(output, (tuple, list)):
+        tensors = [item for item in output if torch.is_tensor(item)]
+        if len(tensors) != 1:
+            raise TypeError(
+                "Transformer tuple/list output must contain exactly one top-level Tensor; "
+                f"found {len(tensors)}"
+            )
+        tensor = tensors[0]
+    elif isinstance(output, dict):
+        keys = [key for key in ("last_hidden_state", "x") if key in output]
+        if len(keys) != 1 or not torch.is_tensor(output[keys[0]]):
+            raise TypeError(
+                "Transformer dict output must expose exactly one Tensor under "
+                "'last_hidden_state' or 'x'"
+            )
+        tensor = output[keys[0]]
+    else:
+        raise TypeError(f"Unsupported Transformer output type: {type(output)!r}")
+
+    if tensor.ndim != 3:
+        raise ValueError(
+            f"Transformer output must be 3D, got shape {tuple(tensor.shape)}"
+        )
+    expected_lnd_shape = tuple(expected_lnd_shape)
+    expected_nld_shape = (
+        expected_lnd_shape[1],
+        expected_lnd_shape[0],
+        expected_lnd_shape[2],
+    )
+    if tuple(tensor.shape) == expected_lnd_shape:
+        return tensor
+    if tuple(tensor.shape) == expected_nld_shape:
+        return tensor.permute(1, 0, 2)
+    raise ValueError(
+        "Transformer output layout/shape mismatch: "
+        f"expected LND={expected_lnd_shape} or NLD={expected_nld_shape}, "
+        f"got {tuple(tensor.shape)}"
+    )
+
 class LipFD(nn.Module):
-    def __init__(self, name, num_classes=1):
+    def __init__(self, name, num_classes=2):
         super(LipFD, self).__init__()
+        if num_classes != 2:
+            raise ValueError(
+                "LipFD currently supports binary classification only; "
+                f"num_classes must be 2, got {num_classes}"
+            )
         self.name = name
+        self.num_classes = num_classes
+        self.attention_mask_cache_enabled = (
+            os.getenv("LIPFD_ATTN_MASK_CACHE", "1") != "0"
+        )
 
         # =================================================================
         # [配置控制] 直接从命令行参数检测消融实验配置
@@ -104,9 +163,12 @@ class LipFD(nn.Module):
                 # 注意：不需要 build attention bias
 
     def _build_attention_bias(self, visual):
-        patch_size = visual.conv1.kernel_size[0]
-        grid_size = visual.input_resolution // patch_size
-        total_tokens = grid_size ** 2 + 1
+        positional = getattr(visual, "positional_embedding", None)
+        if positional is None or positional.ndim != 2:
+            raise AttributeError("visual.positional_embedding must be a 2D tensor")
+        total_tokens = int(positional.shape[0])
+        if total_tokens < 3:
+            raise ValueError(f"Unexpected visual token count: {total_tokens}")
         split_idx = (total_tokens - 1) // 2
 
         attn_bias = torch.zeros(total_tokens, total_tokens)
@@ -121,17 +183,41 @@ class LipFD(nn.Module):
         self.inject_layers = [0, 1, 2]
 
     def _apply_attention_bias(self, visual, device, dtype):
-        # 只有在非消融模式且开启 attention bias 时才应用
-        if not self.no_innov and self.use_attn_bias and hasattr(self, "attn_bias"):
-            bias = self.attn_bias.to(device=device, dtype=dtype)
-            for i in self.inject_layers:
-                if i < len(visual.transformer.resblocks):
-                    visual.transformer.resblocks[i].attn_mask = bias
-        else:
-            # 清理状态
-            for i in getattr(self, "inject_layers", []):
-                if i < len(visual.transformer.resblocks):
-                    visual.transformer.resblocks[i].attn_mask = None
+        transformer = getattr(visual, "transformer", None)
+        resblocks = getattr(transformer, "resblocks", None)
+        if resblocks is None:
+            if self.use_attn_bias and not self.no_innov:
+                raise AttributeError("visual.transformer.resblocks is required for attention bias")
+            return
+
+        should_attach = (
+            not self.no_innov
+            and self.use_attn_bias
+            and hasattr(self, "attn_bias")
+        )
+        target = None
+        if should_attach:
+            expected_tokens = int(visual.positional_embedding.shape[0])
+            if tuple(self.attn_bias.shape) != (expected_tokens, expected_tokens):
+                raise ValueError(
+                    "Attention mask shape mismatch: "
+                    f"mask={tuple(self.attn_bias.shape)}, tokens={expected_tokens}"
+                )
+            target = self.attn_bias
+            if target.device != device or target.dtype != dtype:
+                target = target.to(device=device, dtype=dtype)
+            if target.device != device or target.dtype != dtype:
+                raise RuntimeError("Attention mask device/dtype conversion failed")
+
+        for layer_index in getattr(self, "inject_layers", ()):
+            if layer_index >= len(resblocks):
+                continue
+            block = resblocks[layer_index]
+            if (
+                not self.attention_mask_cache_enabled
+                or getattr(block, "attn_mask", None) is not target
+            ):
+                block.attn_mask = target
 
     def forward(self, x, feature):
         return self.backbone(x, feature)
@@ -182,22 +268,9 @@ class LipFD(nn.Module):
 
             # Transformer 前向
             x = x.permute(1, 0, 2)
+            expected_lnd_shape = tuple(x.shape)
             out = visual.transformer(x)
-            
-            # 动态解包 Transformer 输出
-            if isinstance(out, torch.Tensor):
-                x = out
-            elif isinstance(out, tuple) or isinstance(out, list):
-                x = out[0] if isinstance(out[0], torch.Tensor) else out[1]
-            elif isinstance(out, dict):
-                if 'last_hidden_state' in out:
-                    x = out['last_hidden_state']
-                elif 'x' in out:
-                    x = out['x']
-                else:
-                    x = next(v for v in out.values() if isinstance(v, torch.Tensor))
-            else:
-                raise TypeError(f"无法处理的 Transformer 输出类型: {type(out)}")
+            x = _normalize_transformer_output(out, expected_lnd_shape)
 
             x = x.permute(1, 0, 2) # LND -> NLD
 
@@ -230,5 +303,10 @@ class RALoss(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, alphas_max, alphas_org):
+        if alphas_max.shape != alphas_org.shape:
+            raise ValueError(
+                "RALoss inputs must have the same shape: "
+                f"max={tuple(alphas_max.shape)}, org={tuple(alphas_org.shape)}"
+            )
         diff = (alphas_org + self.margin) - alphas_max
         return self.relu(diff).mean()
