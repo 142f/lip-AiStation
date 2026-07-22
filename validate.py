@@ -9,7 +9,7 @@ from tqdm import tqdm
 import os
 from utils import get_clip_normalization, prepare_model_inputs
 
-def validate(model, loader, gpu_id):
+def validate(model, loader, gpu_id, return_details=False):
     """
     验证模型性能
     
@@ -72,7 +72,8 @@ def validate(model, loader, gpu_id):
     # 1. 安全性检查：防止全0或全1导致报错
     if len(np.unique(y_true)) < 2:
         print("Warning: Only one class present in y_true. AUC/AP cannot be calculated correctly.")
-        return 0, 0, 0, 0, 0, 0
+        result = (0, 0, 0, 0, 0, 0)
+        return result + ({"frame_threshold": None},) if return_details else result
 
     # 2. 计算 AUC (最高优先级)
     try:
@@ -124,7 +125,13 @@ def validate(model, loader, gpu_id):
     print(f"Threshold   : {best_threshold:.4f} (Youden)")
     print(f"F1 Scores   : Youden: {f1_at_youden:.4f} | Best: {best_f1:.4f}")
 
-    return ap, fpr, fnr, acc, auc, f1
+    result = (ap, fpr, fnr, acc, auc, f1)
+    details = {
+        "frame_threshold": float(best_threshold),
+        "threshold_method": "youden",
+        "num_samples": int(len(y_true)),
+    }
+    return result + (details,) if return_details else result
 
 
 if __name__ == "__main__":
