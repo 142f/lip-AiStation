@@ -6,10 +6,10 @@ from copy import copy
 import torch  # 需要显式导入 torch，否则 clip_grad_norm_ 会报错
 from datetime import datetime, timezone, timedelta
 from validate import validate
-from data import create_dataloader
+from data import create_dataloader, set_dataloader_epoch, sampler_index_manifest
 from trainer.trainer import Trainer
 from options.train_options import TrainOptions
-from utils import set_seed
+from utils import set_seed, configure_strict_determinism, validate_strict_training_options
 from torch.profiler import record_function, ProfilerActivity, tensorboard_trace_handler
 
 # 定义分析器设置
@@ -69,6 +69,20 @@ def get_val_opt(opt): # [修改] 传入 opt 参数，避免依赖全局变量导
     val_opt.fake_list_path = opt.val_fake_list_path
     return val_opt
 
+
+def build_evaluation_protocol(frame_threshold, video_aggregation):
+    return {
+        "protocol_version": 1,
+        "selection_level": "frame",
+        "selection_metric": "auc",
+        "video_aggregation": video_aggregation,
+        "frame_threshold": None if frame_threshold is None else float(frame_threshold),
+        "video_threshold": None,
+        "threshold_source": "validation",
+        "threshold_method": "youden",
+        "video_level_model_selection": "not_implemented",
+    }
+
 def format_options(opt, parser):
     """格式化选项信息，与BaseOptions.print_options方法保持一致"""
     message = ""
@@ -101,10 +115,32 @@ if __name__ == "__main__":
         raise NotImplementedError(
             "--use_aug/--spec_aug were previously accepted but are not implemented by AVLip"
         )
-    set_seed(opt.seed)
+    if opt.max_performance:
+        if opt.strict_determinism:
+            raise ValueError("--max_performance cannot be combined with --strict_determinism")
+        if not opt.gpu_ids or not torch.cuda.is_available():
+            raise RuntimeError("--max_performance requires a CUDA GPU")
+        opt.use_amp = True
+        opt.compile = True
+        opt.no_compile = False
+        opt.compile_mode = "default"
+        opt.allow_tf32 = True
+        opt.cudnn_benchmark = True
+        print(
+            "[MAX-PERFORMANCE] AMP=ON | compile=default | "
+            "cudnn.benchmark=ON | TF32=ON | strict_determinism=OFF"
+        )
+    validate_strict_training_options(opt)
+    configure_strict_determinism(opt.seed, opt.strict_determinism)
+    set_seed(opt.seed, strict_determinism=opt.strict_determinism)
     torch.backends.cuda.matmul.allow_tf32 = bool(opt.allow_tf32)
     torch.backends.cudnn.allow_tf32 = bool(opt.allow_tf32)
-    # Keep the deterministic CuDNN policy selected by set_seed().
+    torch.backends.cudnn.benchmark = bool(opt.cudnn_benchmark)
+    if opt.max_performance:
+        torch.backends.cudnn.deterministic = False
+    if opt.allow_tf32 and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    # Performance mode may deliberately override set_seed()'s benchmark=False.
     val_opt = get_val_opt(opt) # [修改] 传入 opt
     model = Trainer(opt)
 
@@ -157,6 +193,25 @@ if __name__ == "__main__":
     data_loader = create_dataloader(opt)
     val_loader = create_dataloader(val_opt)
 
+    run_manifest_path = os.path.join(log_dir, "run_manifest.json")
+    epoch_audit_path = os.path.join(log_dir, "epoch_audit.jsonl")
+    run_manifest = {
+        "run_id": f"{opt.name}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "command": [sys.executable, *sys.argv],
+        "seed": int(opt.seed),
+        "git": model.git_state,
+        "environment": model.environment_manifest,
+        "dataset_manifests": model.data_manifests,
+        "pretrained_checkpoint": model.loaded_checkpoint_metadata,
+        "training_config": model._training_config(),
+        "sampler_protocol": {"version": 2, "base_seed": int(opt.seed), "epoch_reconstructable": True},
+        "evaluation_protocol": {"version": 1, "selection_level": "frame", "selection_metric": "auc", "video_aggregation": opt.video_aggregation},
+        "weight_policy": "ema" if model.model_ema is not None else "raw",
+    }
+    with open(run_manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(run_manifest, manifest_file, ensure_ascii=False, sort_keys=True, indent=2)
+
     print("Length of data loader: %d" % (len(data_loader)))
     print("Length of val  loader: %d" % (len(val_loader)))
 
@@ -201,6 +256,13 @@ if __name__ == "__main__":
 
     # 训练循环
     for epoch in range(model.start_epoch, opt.epoch):
+        # The sample order depends only on the experiment seed and epoch, not
+        # on how many random values model construction consumed. This also
+        # reconstructs the exact sampler stream after an epoch-boundary resume.
+        set_dataloader_epoch(data_loader, epoch)
+        sampler_audit = sampler_index_manifest(data_loader, epoch)
+        if opt.audit_sampler_order or opt.strict_determinism:
+            print("[SamplerAudit] " + json.dumps(sampler_audit, sort_keys=True))
         epoch_start_time = time.time()
         epoch_id = epoch + model.step_bias
         lr_now = model.optimizer.param_groups[0]['lr'] if model.optimizer is not None else 0.0
@@ -330,7 +392,10 @@ if __name__ == "__main__":
             val_model = model.model_ema.module if hasattr(model.model_ema, 'module') else model.model_ema
         
         current_epoch = epoch_id  # 修复：current_epoch 赋值提前
-        ap, fpr, fnr, acc, auc, f1 = validate(val_model, val_loader, opt.gpu_ids)
+        set_dataloader_epoch(val_loader, epoch)
+        ap, fpr, fnr, acc, auc, f1, val_details = validate(
+            val_model, val_loader, opt.gpu_ids, return_details=True
+        )
         rule_inner()
         print(f"(Val@E {current_epoch:>3}) {fmt_metric6(auc, ap, acc, f1, fpr, fnr)}")
         rule_inner()
@@ -368,6 +433,9 @@ if __name__ == "__main__":
             "val_acc": round(float(acc), 6),
             "val_f1": round(float(f1), 6),
         }
+        evaluation_protocol = build_evaluation_protocol(
+            val_details["frame_threshold"], opt.video_aggregation
+        )
 
         # ---- 保存最佳推理权重 ----
         if need_best:
@@ -382,6 +450,7 @@ if __name__ == "__main__":
                 os.path.join(model.save_dir, "best_model.pth"),
                 epoch=epoch_id,
                 metrics=val_metrics,
+                evaluation_protocol=evaluation_protocol,
             )
         else:
             print(f"[Status] 未破纪录 (最佳: {fmt_metric4(best_auc, best_ap, best_acc, best_f1)} @ Epoch {best_epoch})")
@@ -420,6 +489,7 @@ if __name__ == "__main__":
                     "best_f1": best_f1,
                     "best_epoch": best_epoch,
                 },
+                evaluation_protocol=evaluation_protocol,
             )
 
         # 获取中国时区（UTC+8）的时间，无论服务器位于哪里
@@ -427,6 +497,36 @@ if __name__ == "__main__":
         current_time = datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
 
         print(f"[LR-END] epoch {epoch+1}: {lr_this_epoch:.2e} | [LR-NEXT] epoch {epoch+2}: {lr_next_epoch:.2e} | 系统时间: {current_time}")
+        grad_norm = (
+            float(model._last_grad_norm.item())
+            if model._last_grad_norm is not None
+            else float("nan")
+        )
+        scaler_scale = model.scaler.get_scale() if model.use_amp else None
+        print(
+            "[REPRO-STATE] "
+            f"updates={model.update_steps} | skipped={model.skipped_update_steps} | "
+            f"ema_updates={model.ema_update_steps} | grad_norm={grad_norm:.8g} | "
+            f"scaler_scale={scaler_scale} | "
+            f"amp_dtype={opt.amp_dtype if model.use_amp else 'off'} | "
+            f"compile={model.compile_enabled} | tf32={bool(opt.allow_tf32)}"
+        )
+        epoch_record = {
+            "epoch": int(epoch),
+            "sampler": sampler_audit,
+            "lr": float(lr_this_epoch),
+            "next_lr": float(lr_next_epoch),
+            "update_steps": int(model.update_steps),
+            "skipped_update_steps": int(model.skipped_update_steps),
+            "ema_update_steps": int(model.ema_update_steps),
+            "scaler_scale": float(scaler_scale) if scaler_scale is not None else None,
+            "last_gradient_norm": grad_norm,
+            "validation_metrics": val_metrics,
+            "evaluation_protocol": evaluation_protocol,
+            "is_best": bool(need_best),
+        }
+        with open(epoch_audit_path, "a", encoding="utf-8") as audit_file:
+            audit_file.write(json.dumps(epoch_record, ensure_ascii=False, sort_keys=True) + "\n")
         
         # 计算并打印当前epoch的总时间
         epoch_time = time.time() - epoch_start_time
@@ -447,6 +547,19 @@ if __name__ == "__main__":
     print(f"   最佳模型文件: best_model.pth")
     print(f"   F1(f1): {best_f1:.4f}")
     print(f"   整个实验总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
+    run_manifest.update({
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "best_epoch": int(best_epoch),
+        "best_metrics": {
+            "auc": float(best_auc), "ap": float(best_ap),
+            "acc": float(best_acc), "f1": float(best_f1),
+        },
+        "update_steps": int(model.update_steps),
+        "skipped_update_steps": int(model.skipped_update_steps),
+        "ema_update_steps": int(model.ema_update_steps),
+    })
+    with open(run_manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(run_manifest, manifest_file, ensure_ascii=False, sort_keys=True, indent=2)
     
     # 关闭日志文件
     logger.close()

@@ -5,6 +5,7 @@ import hashlib
 import platform
 import subprocess
 import sys
+from importlib import metadata as importlib_metadata
 import numpy as np
 import torch
 import torch.nn as nn
@@ -144,6 +145,15 @@ def _environment_manifest():
     gpu_names = [
         torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())
     ]
+    dependencies = {}
+    for package in (
+        "torch", "torchvision", "numpy", "opencv-python-headless",
+        "transformers", "open-clip-torch", "timm", "scikit-learn", "scipy",
+    ):
+        try:
+            dependencies[package] = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError:
+            dependencies[package] = None
     return {
         "python": sys.version,
         "platform": platform.platform(),
@@ -151,6 +161,7 @@ def _environment_manifest():
         "cuda": torch.version.cuda,
         "cudnn": cudnn_version,
         "gpus": gpu_names,
+        "dependencies": dependencies,
     }
 
 
@@ -201,6 +212,7 @@ class Trainer(nn.Module):
         self.total_steps = 0
         self.update_steps = 0
         self.skipped_update_steps = 0
+        self.ema_update_steps = 0
         self.start_epoch = 0
         self.step_bias = 0
         self.max_consecutive_amp_skips = int(
@@ -495,6 +507,12 @@ class Trainer(nn.Module):
             "compile": bool(self.opt.compile and not self.opt.no_compile),
             "compile_mode": self.opt.compile_mode,
             "allow_tf32": bool(self.opt.allow_tf32),
+            "cudnn_benchmark_requested": bool(self.opt.cudnn_benchmark),
+            "max_performance": bool(self.opt.max_performance),
+            "strict_determinism": bool(self.opt.strict_determinism),
+            "audit_sampler_order": bool(self.opt.audit_sampler_order),
+            "sampler_protocol_version": 2,
+            "video_aggregation": self.opt.video_aggregation,
             "seed": int(self.opt.seed),
             "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
             "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
@@ -548,6 +566,12 @@ class Trainer(nn.Module):
                 required.add("scaler")
             if self.model_ema is not None:
                 required.add("model_ema")
+            if ckpt_version >= 4:
+                required.update({
+                    "ema_update_steps", "accumulation_count",
+                    "sampler_base_seed", "sampler_protocol_version",
+                    "resume_boundary", "evaluation_protocol",
+                })
         missing = sorted(required - set(checkpoint))
         if missing:
             raise RuntimeError(
@@ -557,8 +581,16 @@ class Trainer(nn.Module):
         if not is_legacy:
             _PATH_KEYS = {"real_list_path", "fake_list_path"}
             current_config = self._training_config()
+            saved_cfg = dict(checkpoint["training_config"])
+            # Checkpoint v3 predates this audit-only flag. Missing means the
+            # historical default (False), preserving resume compatibility.
+            saved_cfg.setdefault("strict_determinism", False)
+            saved_cfg.setdefault("audit_sampler_order", False)
+            saved_cfg.setdefault("sampler_protocol_version", 1)
+            saved_cfg.setdefault("video_aggregation", "top3_mean")
+            saved_cfg.setdefault("cudnn_benchmark_requested", False)
+            saved_cfg.setdefault("max_performance", False)
             if getattr(self.opt, "allow_data_path_mismatch", False):
-                saved_cfg = checkpoint["training_config"]
                 path_mismatches = {
                     key: (saved_cfg.get(key), value)
                     for key, value in current_config.items()
@@ -576,9 +608,9 @@ class Trainer(nn.Module):
                 }
             else:
                 mismatches = {
-                    key: (checkpoint["training_config"].get(key), value)
+                    key: (saved_cfg.get(key), value)
                     for key, value in current_config.items()
-                    if checkpoint["training_config"].get(key) != value
+                    if saved_cfg.get(key) != value
                 }
             if mismatches:
                 raise RuntimeError(f"Resume configuration mismatch: {mismatches}")
@@ -624,7 +656,18 @@ class Trainer(nn.Module):
         self.total_steps = int(checkpoint.get("total_steps", 0))
         self.update_steps = int(checkpoint.get("update_steps", 0))
         self.skipped_update_steps = int(checkpoint.get("skipped_update_steps", 0))
+        self.ema_update_steps = int(
+            checkpoint.get(
+                "ema_update_steps",
+                self.update_steps if self.model_ema is not None else 0,
+            )
+        )
         self.consecutive_skip_count = int(checkpoint.get("consecutive_skip_count", 0))
+        saved_accumulation = int(checkpoint.get("accumulation_count", 0))
+        if saved_accumulation != 0:
+            raise RuntimeError("Only epoch-boundary resume with accumulation_count=0 is supported")
+        if int(checkpoint.get("sampler_base_seed", self.opt.seed)) != int(self.opt.seed):
+            raise RuntimeError("Resume sampler base seed does not match --seed")
 
         if "best_metrics" in checkpoint:
             self.resume_best_metrics.update(checkpoint["best_metrics"])
@@ -740,6 +783,7 @@ class Trainer(nn.Module):
             self.consecutive_skip_count = 0
             if self.model_ema is not None:
                 self.model_ema.update(self._unwrapped_model())
+                self.ema_update_steps += 1
             self.update_steps += 1
         else:
             self.skipped_update_steps += 1
@@ -834,7 +878,7 @@ class Trainer(nn.Module):
             return "model_ema", self.model_ema.module.state_dict()
         return "model", self._unwrapped_model().state_dict()
 
-    def save_inference_checkpoint(self, save_path, epoch, metrics):
+    def save_inference_checkpoint(self, save_path, epoch, metrics, evaluation_protocol):
         """
         保存轻量推理权重（仅单套 + 元数据）。
         用于 best_model.pth。
@@ -842,10 +886,11 @@ class Trainer(nn.Module):
         weight_key, weights = self._get_inference_weights()
         payload = {
             "checkpoint_type": "inference",
-            "checkpoint_version": 3,
+            "checkpoint_version": 4,
             "weight_source": "ema" if weight_key == "model_ema" else "raw",
             "epoch": epoch,
             "metrics": dict(metrics),
+            "evaluation_protocol": dict(evaluation_protocol),
             "training_config": self._training_config(),
             "environment_manifest": self.environment_manifest,
             "source_checkpoint": self.loaded_checkpoint_metadata,
@@ -854,7 +899,8 @@ class Trainer(nn.Module):
         self._atomic_torch_save(payload, save_path)
 
     def save_resume_checkpoint(
-        self, save_path, training_epoch, checkpoint_index, best_metrics
+        self, save_path, training_epoch, checkpoint_index, best_metrics,
+        evaluation_protocol=None,
     ):
         """
         保存完整断点续训状态（raw+EMA权重、optimizer、scheduler、scaler、RNG）。
@@ -865,18 +911,24 @@ class Trainer(nn.Module):
 
         payload = {
             "checkpoint_type": "resume",
-            "checkpoint_version": 3,
+            "checkpoint_version": 4,
             "model": self._unwrapped_model().state_dict(),
             "epoch": training_epoch,
             "checkpoint_index": checkpoint_index,
             "total_steps": self.total_steps,
             "update_steps": self.update_steps,
             "skipped_update_steps": self.skipped_update_steps,
+            "ema_update_steps": self.ema_update_steps,
             "consecutive_skip_count": self.consecutive_skip_count,
+            "accumulation_count": self.accumulation_count,
+            "sampler_base_seed": int(self.opt.seed),
+            "sampler_protocol_version": 2,
+            "resume_boundary": "epoch",
             "training_config": self._training_config(),
             "environment_manifest": self.environment_manifest,
             "source_checkpoint": self.loaded_checkpoint_metadata,
             "best_metrics": dict(best_metrics),
+            "evaluation_protocol": dict(evaluation_protocol or {}),
             "optimizer": self.optimizer.state_dict(),
             "rng_state": _rng_state(),
         }
@@ -925,6 +977,7 @@ class Trainer(nn.Module):
             "total_steps": self.total_steps,
             "update_steps": self.update_steps,
             "skipped_update_steps": self.skipped_update_steps,
+            "ema_update_steps": self.ema_update_steps,
             "consecutive_skip_count": self.consecutive_skip_count,
             "training_config": self._training_config(),
             "environment_manifest": self.environment_manifest,

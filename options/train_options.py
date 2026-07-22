@@ -86,6 +86,20 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--no_compile', action='store_true', help='Deprecated compatibility flag; eager is already the default.')
         parser.add_argument('--allow_tf32', action='store_true',
                             help='Allow CUDA TF32 matmul/cuDNN kernels (result-sensitive).')
+        parser.add_argument(
+            '--cudnn_benchmark', action='store_true',
+            help='Let cuDNN select the fastest convolution algorithms for fixed input shapes.'
+        )
+        parser.add_argument(
+            '--max_performance', action='store_true',
+            help='Enable the explicit GPU performance profile: AMP, torch.compile(default), cuDNN benchmark and TF32.'
+        )
+        parser.add_argument(
+            '--video_aggregation',
+            choices=['mean', 'max', 'top3_mean', 'top5_mean', 'median'],
+            default='top3_mean',
+            help='Frozen video aggregation recorded in the evaluation protocol.',
+        )
 
         # Loss/gradient values are explicit so resume can reject objective drift.
         parser.add_argument('--ra_margin', type=float, default=0.15)
