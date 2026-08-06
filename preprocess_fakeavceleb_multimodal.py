@@ -290,6 +290,9 @@ def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
     df = pd.read_csv(metadata_csv)
     df = normalize_metadata(df)
 
+    # 仅优化查询路径：预分组后保持原过滤、排序和首条选择规则不变。
+    grouped_df = dict(tuple(df.groupby(["source", "race", "gender", "type"], sort=False)))
+
     records = []
     sample_idx = 1
 
@@ -300,18 +303,15 @@ def build_sample_plan(metadata_csv: str, dataset_root: str) -> pd.DataFrame:
                     if original_type not in INCLUDE_TYPES:
                         continue
 
-                    rows = df[
-                        (df["source"] == source_id)
-                        & (df["race"] == race)
-                        & (df["gender"] == gender)
-                        & (df["type"] == original_type)
-                    ].copy()
+                    rows = grouped_df.get((source_id, race, gender, original_type))
+                    if rows is not None:
+                        rows = rows.copy()
 
                     allowed_methods = METHOD_FILTERS.get(original_type)
-                    if allowed_methods:
+                    if rows is not None and allowed_methods:
                         rows = rows[rows["method"].isin(allowed_methods)].copy()
 
-                    if rows.empty:
+                    if rows is None or rows.empty:
                         if original_type == "FakeVideo-RealAudio":
                             continue
                         raise ValueError(
@@ -372,27 +372,34 @@ def process_one_video(video_path: str, save_dir: str):
         raise RuntimeError(f"Failed to open video: {video_path}")
 
     frame_count = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    _, frame_sequence = select_frame_sequence(frame_count, N_EXTRACT, WINDOW_LEN)
+    frame_starts, frame_sequence = select_frame_sequence(
+        frame_count, N_EXTRACT, WINDOW_LEN
+    )
 
-    frame_list = []
+    frame_map = {}
+    frame_sequence_set = set(frame_sequence)
     current_frame = 0
     last_needed = frame_sequence[-1] if frame_sequence else -1
 
+    # 热路径局部绑定；集合仅替代线性 membership 查找，输出语义不变。
+    capture_read = video_capture.read
+    cvt_color = cv2.cvtColor
+    resize = cv2.resize
     while current_frame <= last_needed:
-        ret, frame = video_capture.read()
+        ret, frame = capture_read()
         if not ret:
             break
 
-        if current_frame in frame_sequence:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-            frame = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
-            frame_list.append(frame)
+        if current_frame in frame_sequence_set:
+            frame = cvt_color(frame, cv2.COLOR_BGR2RGBA)
+            frame = resize(frame, (IMG_SIZE, IMG_SIZE))
+            frame_map[current_frame] = frame
 
         current_frame += 1
 
     video_capture.release()
 
-    if len(frame_list) < WINDOW_LEN:
+    if len(frame_map) < WINDOW_LEN:
         raise RuntimeError(f"Not enough frames extracted from {video_path}")
 
     # ===== 这里是真正的“mp4 -> 临时wav -> mel” =====
@@ -403,32 +410,42 @@ def process_one_video(video_path: str, save_dir: str):
     saved_files = []
     group = 0
 
-    for i in range(len(frame_list)):
-        idx = i % WINDOW_LEN
-        if idx != 0:
-            continue
+    resize = cv2.resize
+    concatenate = np.concatenate
+    color_convert = cv2.cvtColor
+    write_image = imwrite_unicode
+    output_join = os.path.join
+    append_saved = saved_files.append
 
+    for start_frame in frame_starts:
         try:
-            begin = int(np.round(frame_sequence[i] * mapping))
-            end = int(np.round((frame_sequence[i] + WINDOW_LEN) * mapping))
+            window_frames = [
+                frame_map[index]
+                for index in range(start_frame, start_frame + WINDOW_LEN)
+            ]
+            begin = int(np.round(start_frame * mapping))
+            end = int(np.round((start_frame + WINDOW_LEN) * mapping))
 
             begin = max(0, min(begin, mel.shape[1] - 1))
             end = max(begin + 1, min(end, mel.shape[1]))
 
-            sub_mel = cv2.resize(mel[:, begin:end], (IMG_SIZE * WINDOW_LEN, IMG_SIZE))
+            sub_mel = resize(mel[:, begin:end], (IMG_SIZE * WINDOW_LEN, IMG_SIZE))
 
-            x = np.concatenate(frame_list[i:i + WINDOW_LEN], axis=1)
-            x = np.concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
+            x = concatenate(window_frames, axis=1)
+            x = concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
 
-            out_path = os.path.join(save_dir, f"group_{group:03d}.png")
-            write_ok = imwrite_unicode(out_path, cv2.cvtColor(x, cv2.COLOR_RGB2BGR))
+            out_path = output_join(save_dir, f"group_{group:03d}.png")
+            write_ok = write_image(out_path, color_convert(x, cv2.COLOR_RGB2BGR))
             if not write_ok:
                 raise RuntimeError(f"Failed to save image: {out_path}")
-            saved_files.append(out_path)
+            append_saved(out_path)
             group += 1
 
-        except Exception as e:
-            print(f"[WARN] Failed to build window for {video_path}: {e}")
+        except (KeyError, ValueError) as e:
+            print(
+                f"[WARN] Failed to build window for {video_path} "
+                f"at frame {start_frame}: {e}"
+            )
             continue
 
     return saved_files
@@ -455,9 +472,12 @@ def run():
         save_dir = row["output_frame_dir"]
 
         if os.path.isdir(save_dir) and (not OVERWRITE):
-            existing_png = [f for f in os.listdir(save_dir) if f.lower().endswith(".png")]
-            if existing_png:
-                results.append({**row, "status": "skipped_existing", "num_png": len(existing_png)})
+            existing_png_count = sum(
+                1 for entry in os.scandir(save_dir)
+                if entry.is_file() and entry.name.lower().endswith(".png")
+            )
+            if existing_png_count:
+                results.append({**row, "status": "skipped_existing", "num_png": existing_png_count})
                 continue
 
         try:

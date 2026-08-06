@@ -1,4 +1,5 @@
 import os
+import argparse
 import json
 import cv2
 import numpy as np
@@ -290,8 +291,11 @@ def scan_output_state(save_dir: str, auto_clean_orphans: bool = True):
     不依赖 .done.json marker，直接计数 PNG 文件数量。
     """
     os.makedirs(save_dir, exist_ok=True)
-    all_pngs = len([f for f in glob.glob(os.path.join(save_dir, "*.png")) if os.path.isfile(f)])
-    
+    all_pngs = sum(
+        1 for entry in os.scandir(save_dir)
+        if entry.is_file() and entry.name.lower().endswith(".png")
+    )
+
     return {
         "valid_count": all_pngs,
         "broken_markers": 0,
@@ -369,9 +373,10 @@ def get_spectrogram(video_file: str):
             return None, "empty_audio"
 
         try:
-            # 这里改成 ref=np.max，是更常见、更稳定的 dB 参考系。
+            # 必须与训练集及 FakeAVCeleb 多模态预处理保持一致；
+            # ref 会改变渲染到拼接图中的像素分布，不能在不同数据集间混用。
             mel = audio.melspectrogram(y=data, sr=sr)
-            mel = librosa.power_to_db(mel, ref=np.max)
+            mel = librosa.power_to_db(mel, ref=np.min)
         except Exception:
             return None, "mel_build_failed"
 
@@ -738,8 +743,9 @@ def run_parallel_or_serial(tasks, worker_fn, worker_desc: str, max_workers: int)
         return
 
     if max_workers <= 1:
+        call_worker = worker_fn
         for task in tqdm(tasks, total=len(tasks), desc=worker_desc):
-            worker_fn(*task)
+            call_worker(*task)
         return
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -839,7 +845,23 @@ def run():
     print(f"[Info] 跳过/清理统计: {stats.dump()}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Preprocess LAV-DF videos into multimodal spectrogram-plus-frame images."
+    )
+    parser.add_argument("--dataset-root", default=dataset_root, help="LAV-DF root containing metadata.min.json and split folders.")
+    parser.add_argument("--output-root", default=output_root, help="Directory for generated split/0_real and split/1_fake images.")
+    parser.add_argument("--metadata-file", default=metadata_file, help="Optional explicit metadata.min.json path.")
+    parser.add_argument("--split", choices=("train", "dev", "test"), default=TARGET_SPLIT)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    dataset_root = args.dataset_root
+    output_root = args.output_root
+    metadata_file = args.metadata_file
+    TARGET_SPLIT = args.split
     os.makedirs(output_root, exist_ok=True)
     os.makedirs("./temp", exist_ok=True)
     try:

@@ -60,7 +60,7 @@ def safe_imwrite(file_path, img):
         is_success, im_buf_arr = cv2.imencode(ext, img)
         if is_success:
             with open(file_path, "wb") as f:
-                f.write(im_buf_arr.tobytes())
+                f.write(memoryview(im_buf_arr))
             return True
         else:
             if VERBOSE:
@@ -229,27 +229,37 @@ def process_single_video(task_args):
     frame_idx = 0
     saved_count = 0
 
+    # 热路径局部绑定：减少逐帧的全局/属性查找，不改变处理顺序与输出。
+    cap_read = cap.read
+    app_get = global_app.get
+    frames_append = metadata["frames"].append
+    frame_skip = FRAME_SKIP
+    max_frames_per_video = MAX_FRAMES_PER_VIDEO
+    face_det_threshold = FACE_DET_THRESHOLD
+    save_format = SAVE_FORMAT
+    safe_write = safe_imwrite
+
     while True:
-        ret, frame = cap.read()
+        ret, frame = cap_read()
         if not ret:
             break
 
         # [FIX-8] 单视频帧数上限
-        if saved_count >= MAX_FRAMES_PER_VIDEO:
+        if saved_count >= max_frames_per_video:
             break
 
         # [FIX-7] 帧采样间隔可配置
-        if frame_idx % FRAME_SKIP != 0:
+        if frame_idx % frame_skip != 0:
             frame_idx += 1
             continue
 
-        faces = global_app.get(frame)
+        faces = app_get(frame)
 
         if faces:
             # [FIX-5] 置信度过滤
             valid_faces = [
                 f for f in faces
-                if getattr(f, 'det_score', 0) >= FACE_DET_THRESHOLD
+                if getattr(f, 'det_score', 0) >= face_det_threshold
             ]
 
             if not valid_faces:
@@ -275,11 +285,11 @@ def process_single_video(task_args):
                 frame_idx += 1
                 continue
 
-            img_name = f"frame_{frame_idx:06d}{SAVE_FORMAT}"
+            img_name = f"frame_{frame_idx:06d}{save_format}"
             img_path = os.path.join(v_out_dir, img_name)
 
             # [FIX-4] 检查写入结果
-            if not safe_imwrite(img_path, frame):
+            if not safe_write(img_path, frame):
                 frame_idx += 1
                 continue
 
@@ -287,7 +297,7 @@ def process_single_video(task_args):
             bbox = best_face.bbox.tolist()
             det_score = float(best_face.det_score)
 
-            metadata["frames"].append({
+            frames_append({
                 "file_path": img_name,
                 "frame_idx": frame_idx,
                 "face": {
@@ -413,16 +423,16 @@ def run_fast_preprocessing():
         out_dir = os.path.join(OUTPUT_ROOT, label_dir)
         if os.path.exists(out_dir):
             video_dirs = [
-                d for d in os.listdir(out_dir)
-                if os.path.isdir(os.path.join(out_dir, d))
+                entry.name for entry in os.scandir(out_dir)
+                if entry.is_dir()
             ]
             total_frames = 0
             for vd in video_dirs:
                 vd_path = os.path.join(out_dir, vd)
-                jpg_count = len([
-                    f for f in os.listdir(vd_path)
-                    if f.endswith(SAVE_FORMAT)
-                ])
+                jpg_count = sum(
+                    1 for entry in os.scandir(vd_path)
+                    if entry.is_file() and entry.name.endswith(SAVE_FORMAT)
+                )
                 total_frames += jpg_count
             print(f"  {label_dir}: {len(video_dirs)} 个视频, {total_frames} 帧")
 

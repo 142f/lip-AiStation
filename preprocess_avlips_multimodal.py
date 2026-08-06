@@ -93,22 +93,28 @@ def process_video_file(video_path, audio_path, output_label_dir, args):
     frame_sequence = [
         i for num in frame_idx for i in range(num, num + args.window_len)
     ]
-    frame_list = []
+    frame_map = {}
+    frame_sequence_set = set(frame_sequence)
     current_frame = 0
+
+    # 热路径局部绑定；集合仅加速 membership，保留原有窗口语义与输出。
+    capture_read = video_capture.read
+    cvt_color = cv2.cvtColor
+    resize = cv2.resize
     while current_frame <= frame_sequence[-1]:
-        ret, frame = video_capture.read()
+        ret, frame = capture_read()
         if not ret:
             print(f"Error in reading frame {video_name}: {current_frame}")
             break
-        if current_frame in frame_sequence:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-            frame_list.append(cv2.resize(frame, (500, 500)))
+        if current_frame in frame_sequence_set:
+            frame = cvt_color(frame, cv2.COLOR_BGR2RGBA)
+            frame_map[current_frame] = resize(frame, (500, 500))
         current_frame += 1
     video_capture.release()
 
-    if len(frame_list) < args.window_len:
+    if len(frame_map) < args.window_len:
         print(
-            f"Skip {video_name}: only read {len(frame_list)} selected frame(s), "
+            f"Skip {video_name}: only read {len(frame_map)} selected frame(s), "
             f"need at least {args.window_len}."
         )
         return 0, video_output_dir
@@ -120,24 +126,32 @@ def process_video_file(video_path, audio_path, output_label_dir, args):
     mel = plt.imread(mel_path) * 255
     mel = mel.astype(np.uint8)
     mapping = mel.shape[1] / frame_count
-    for frame_pos in range(len(frame_list)):
-        idx = frame_pos % args.window_len
-        if idx == 0:
-            try:
-                begin = np.round(frame_sequence[frame_pos] * mapping)
-                end = np.round((frame_sequence[frame_pos] + args.window_len) * mapping)
-                sub_mel = cv2.resize(
-                    (mel[:, int(begin) : int(end)]), (500 * args.window_len, 500)
-                )
-                x = np.concatenate(frame_list[frame_pos : frame_pos + args.window_len], axis=1)
-                x = np.concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
-                plt.imsave(
-                    os.path.join(video_output_dir, f"{name}_{group}.png"), x
-                )
-                group = group + 1
-            except ValueError:
-                print(f"ValueError: {name}")
-                continue
+    window_len = args.window_len
+    resize = cv2.resize
+    concatenate = np.concatenate
+    save_image = plt.imsave
+    output_join = os.path.join
+
+    for start_frame in frame_idx:
+        try:
+            window_frames = [
+                frame_map[index]
+                for index in range(start_frame, start_frame + window_len)
+            ]
+            begin = np.round(start_frame * mapping)
+            end = np.round((start_frame + window_len) * mapping)
+            sub_mel = resize(
+                (mel[:, int(begin) : int(end)]), (500 * window_len, 500)
+            )
+            x = concatenate(window_frames, axis=1)
+            x = concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
+            save_image(
+                output_join(video_output_dir, f"{name}_{group}.png"), x
+            )
+            group = group + 1
+        except (KeyError, ValueError):
+            print(f"Invalid or incomplete window: {name}@{start_frame}")
+            continue
 
     return group, video_output_dir
 
@@ -221,8 +235,7 @@ def run(args):
             continue
         video_list = os.listdir(root)
         print(f"Handling {dataset_name}...")
-        for j in tqdm(range(len(video_list))):
-            v = video_list[j]
+        for v in tqdm(video_list):
             video_path = os.path.join(root, v)
             if not os.path.isfile(video_path):
                 continue
