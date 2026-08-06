@@ -233,7 +233,7 @@ def safe_imwrite(file_path, img):
         is_success, im_buf_arr = cv2.imencode(ext, img)
         if is_success:
             with open(file_path, "wb") as f:
-                f.write(im_buf_arr.tobytes())
+                f.write(memoryview(im_buf_arr))
             return True
         if VERBOSE:
             print(f"[WARN] cv2.imencode 失败: {file_path}")
@@ -456,26 +456,37 @@ def process_single_video(task_dict: dict):
 
         frame_idx, saved_count, face_hit_count = 0, 0, 0
 
+        # 热路径局部绑定：减少逐帧属性解析，不改变采样、检测或写盘逻辑。
+        cap_grab = cap.grab
+        cap_retrieve = cap.retrieve
+        app_get = global_app.get
+        safe_write = safe_imwrite
+        frames_append = metadata["frames"].append
+        frame_skip = FRAME_SKIP
+        max_frames_per_video = MAX_FRAMES_PER_VIDEO
+        face_det_threshold = FACE_DET_THRESHOLD
+        save_format = SAVE_FORMAT
+
         while True:
-            if MAX_FRAMES_PER_VIDEO is not None and saved_count >= MAX_FRAMES_PER_VIDEO:
+            if max_frames_per_video is not None and saved_count >= max_frames_per_video:
                 break
 
-            if not cap.grab():
+            if not cap_grab():
                 break
 
-            if frame_idx % FRAME_SKIP != 0:
+            if frame_idx % frame_skip != 0:
                 frame_idx += 1
                 continue
 
-            ret, frame = cap.retrieve()
+            ret, frame = cap_retrieve()
             if not ret or frame is None:
                 break
 
             face_payload = None
             try:
-                faces = global_app.get(frame)
+                faces = app_get(frame)
                 if faces:
-                    valid_faces = [f for f in faces if getattr(f, 'det_score', 0) >= FACE_DET_THRESHOLD]
+                    valid_faces = [f for f in faces if getattr(f, 'det_score', 0) >= face_det_threshold]
                     if valid_faces:
                         best_face = max(valid_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
                         face_payload = _build_face_payload(best_face)
@@ -483,11 +494,11 @@ def process_single_video(task_dict: dict):
                 if VERBOSE:
                     print(f"[WARN] 人脸检测异常 frame={frame_idx}: {e}")
 
-            img_name = f"frame_{frame_idx:06d}{SAVE_FORMAT}"
+            img_name = f"frame_{frame_idx:06d}{save_format}"
             img_path = os.path.join(v_out_dir, img_name)
 
-            if safe_imwrite(img_path, frame):
-                metadata["frames"].append({
+            if safe_write(img_path, frame):
+                frames_append({
                     "file_path": img_name,
                     "frame_idx": frame_idx,
                     "has_face": face_payload is not None,

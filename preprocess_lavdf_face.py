@@ -2,8 +2,8 @@ r"""
 LAV-DF file selection + InsightFace preprocessing.
 
 要求:
-1. 文件选择逻辑与 preprocess-LAV-DF.py 保持一致
-2. 预处理方法使用 preprocess-FakeAVCeleb-Insightface.py 的 InsightFace 流水线
+1. 文件选择逻辑与 preprocess_lavdf_multimodal.py 保持一致
+2. 预处理方法使用 preprocess_fakeavceleb_face.py 的 InsightFace 流水线
 
 输出结构:
 OUTPUT_ROOT/
@@ -90,7 +90,7 @@ setup_nvidia_dll_path()
 # =====================================================================
 # 参数配置
 # =====================================================================
-# 以下常量来自原始 preprocess-LAV-DF.py，当前版本改用 FRAME_SKIP/segment 来控制采样。
+# 以下常量来自多模态 LAV-DF 流程，当前版本改用 FRAME_SKIP/segment 来控制采样。
 # 保留仅供参考，但不再参与运行（避免误导维护者）。
 # N_EXTRACT = 10
 # WINDOW_LEN = 5
@@ -464,7 +464,7 @@ def _build_face_payload(face):
 
 
 # =====================================================================
-# 选择逻辑 (严格参考 preprocess-LAV-DF.py)
+# 选择逻辑（与 preprocess_lavdf_multimodal.py 保持一致）
 # =====================================================================
 def build_selection_tasks(meta, target_split):
     meta_dict = {item["file"]: item for item in meta}
@@ -614,10 +614,11 @@ def export_processed_clip_list(split_root):
         if not os.path.isdir(root_dir):
             continue
 
-        for sample_name in os.listdir(root_dir):
-            sample_dir = os.path.join(root_dir, sample_name)
-            if not os.path.isdir(sample_dir):
+        for entry in os.scandir(root_dir):
+            if not entry.is_dir():
                 continue
+            sample_name = entry.name
+            sample_dir = entry.path
 
             json_path = os.path.join(sample_dir, "metadata.json")
             if not os.path.isfile(json_path):
@@ -786,16 +787,21 @@ def _frame_reader_thread(cap, start_frame, end_frame, frame_skip, read_queue, st
 
 def _frame_writer_thread(write_queue, out_dir, metadata_frames):
     """Write frames to disk and append corresponding metadata entries."""
+    queue_get = write_queue.get
+    append_metadata = metadata_frames.append
+    join_path = os.path.join
+    write_image = safe_imwrite
+
     while True:
-        item = write_queue.get()
+        item = queue_get()
         if item is _QUEUE_SENTINEL:
             break
 
         try:
             img_name, frame_idx, frame, face_payload = item
-            img_path = os.path.join(out_dir, img_name)
-            if safe_imwrite(img_path, frame):
-                metadata_frames.append({
+            img_path = join_path(out_dir, img_name)
+            if write_image(img_path, frame):
+                append_metadata({
                     "file_path": img_name,
                     "frame_idx": frame_idx,
                     "face": face_payload,
