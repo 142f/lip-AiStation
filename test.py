@@ -221,24 +221,34 @@ def compute_binary_metrics(y_true, y_pred_prob):
     }
 
 
-def build_video_groups(y_true, y_pred_prob, sample_paths):
+def build_video_groups(y_true, y_pred_prob, sample_paths, video_keys=None):
     """
     将帧级预测按视频聚合成分组。
     """
     if sample_paths is None or len(sample_paths) != len(y_true):
         return None, 0
 
+    if video_keys is None:
+        video_keys = [extract_video_key(path) for path in sample_paths]
+    if len(video_keys) != len(y_true):
+        raise ValueError("video_keys must match prediction count")
+
     video_groups = {}
-    for frame_path, label, prob in zip(sample_paths, y_true, y_pred_prob):
-        video_key = extract_video_key(frame_path)
+    for frame_path, video_key, label, prob in zip(
+        sample_paths, video_keys, y_true, y_pred_prob
+    ):
         if video_key not in video_groups:
-            video_groups[video_key] = {"labels": [], "probs": []}
+            video_groups[video_key] = {"labels": [], "probs": [], "paths": []}
         video_groups[video_key]["labels"].append(int(label))
         video_groups[video_key]["probs"].append(float(prob))
+        video_groups[video_key]["paths"].append(frame_path)
 
     inconsistent_label_count = 0
     for group in video_groups.values():
         labels = np.asarray(group["labels"], dtype=np.int64)
+        group["_labels_array"] = labels
+        group["_probs_array"] = np.asarray(group["probs"], dtype=np.float64)
+        group["_video_label"] = int(np.argmax(np.bincount(labels, minlength=2)))
         if len(np.unique(labels)) > 1:
             inconsistent_label_count += 1
 
@@ -278,15 +288,23 @@ def build_video_level_arrays(video_groups, agg_method="mean"):
     video_pred_prob = []
 
     for group in video_groups.values():
-        labels = np.asarray(group["labels"], dtype=np.int64)
-        label_counts = np.bincount(labels, minlength=2)
-        video_true.append(int(np.argmax(label_counts)))
-        video_pred_prob.append(aggregate_video_score(group["probs"], agg_method))
+        if "_video_label" in group:
+            video_label = group["_video_label"]
+        else:
+            labels = np.asarray(group["labels"], dtype=np.int64)
+            video_label = int(np.argmax(np.bincount(labels, minlength=2)))
+        video_true.append(video_label)
+        video_pred_prob.append(
+            aggregate_video_score(group.get("_probs_array", group["probs"]), agg_method)
+        )
 
     return np.asarray(video_true), np.asarray(video_pred_prob)
 
 
-def save_score_csv(y_true, y_pred_prob, sample_paths, video_groups, opt, main_agg_method="top3_mean"):
+def save_score_csv(
+    y_true, y_pred_prob, sample_paths, video_groups, opt,
+    main_agg_method="top3_mean", video_keys=None,
+):
     """保存帧级和视频级预测分数，供定性案例图和分数分布图使用。"""
     vis_dir = getattr(opt, "vis_dir", "./vis_outputs/default")
     model_name = getattr(opt, "model_name", "") or getattr(opt, "name", "model")
@@ -298,23 +316,22 @@ def save_score_csv(y_true, y_pred_prob, sample_paths, video_groups, opt, main_ag
         print("[可视化] 样本路径数量与预测数量不一致，跳过 CSV 保存。")
         return
 
+    if video_keys is None:
+        video_keys = [extract_video_key(path) for path in sample_paths]
+
     frame_csv = os.path.join(vis_dir, "frame_scores.csv")
     with open(frame_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["sample_path", "video_key", "label", "frame_score", "model_name"])
-        for path, label, score in zip(sample_paths, y_true, y_pred_prob):
-            video_key = extract_video_key(path)
+        for path, video_key, label, score in zip(
+            sample_paths, video_keys, y_true, y_pred_prob
+        ):
             writer.writerow([path, video_key, int(label), float(score), model_name])
 
     if video_groups is None:
         print("[可视化] video_groups 为空，无法保存视频级分数。")
         print(f"[可视化] 已保存帧级分数: {frame_csv}")
         return
-
-    path_groups = {}
-    for path, label, score in zip(sample_paths, y_true, y_pred_prob):
-        video_key = extract_video_key(path)
-        path_groups.setdefault(video_key, []).append((path, int(label), float(score)))
 
     video_csv = os.path.join(vis_dir, f"video_scores_{agg_method}.csv")
     with open(video_csv, "w", newline="", encoding="utf-8-sig") as f:
@@ -331,13 +348,18 @@ def save_score_csv(y_true, y_pred_prob, sample_paths, video_groups, opt, main_ag
         ])
 
         for video_key, group in video_groups.items():
-            labels = np.asarray(group["labels"], dtype=np.int64)
-            probs = np.asarray(group["probs"], dtype=np.float64)
-            label_counts = np.bincount(labels, minlength=2)
-            video_label = int(np.argmax(label_counts))
+            probs = group.get(
+                "_probs_array", np.asarray(group["probs"], dtype=np.float64)
+            )
+            video_label = group.get("_video_label")
+            if video_label is None:
+                labels = np.asarray(group["labels"], dtype=np.int64)
+                video_label = int(np.argmax(np.bincount(labels, minlength=2)))
             video_score = aggregate_video_score(probs, agg_method)
 
-            candidates = path_groups.get(video_key, [])
+            candidates = list(
+                zip(group.get("paths", []), group["labels"], group["probs"])
+            )
             sorted_candidates = sorted(candidates, key=lambda item: item[2], reverse=True)[:3]
             top_paths = [item[0] for item in sorted_candidates]
             top_scores = [item[2] for item in sorted_candidates]
@@ -431,11 +453,11 @@ def test(model, loader, gpu_id, opt=None):
     device = torch.device(f"cuda:{gpu_id[0]}" if torch.cuda.is_available() else "cpu")
     model.eval()
     
-    y_true, y_pred = [], []
+    y_true, prediction_chunks = [], []
     
     print("\n" + "="*20 + " 开始测试循环 (Testing Loop) " + "="*20)
     
-    with torch.no_grad():
+    with torch.inference_mode():
         # --- [GPU 归一化准备] ---
         # 移到循环外，避免每个 batch 重复创建 tensor
         mean, std = utils.get_clip_normalization(device)
@@ -455,11 +477,11 @@ def test(model, loader, gpu_id, opt=None):
             probs = torch.softmax(logits, dim=1)
             pred_score = probs[:, 1]  # 取 Fake 类的概率作为风险得分
             
-            y_pred.extend(pred_score.flatten().tolist())
+            prediction_chunks.append(pred_score.flatten().detach())
             y_true.extend(label.flatten().tolist())
 
     y_true = np.array(y_true)
-    y_pred_prob = np.array(y_pred)
+    y_pred_prob = utils.prediction_chunks_to_numpy(prediction_chunks)
 
     # --- 指标计算与边界防护 ---
     if len(np.unique(y_true)) < 2:
@@ -519,7 +541,14 @@ def test(model, loader, gpu_id, opt=None):
     print("#"*60 + "\n")
 
     sample_paths = getattr(getattr(loader, "dataset", None), "total_list", None)
-    video_groups, inconsistent_label_count = build_video_groups(y_true, y_pred_prob, sample_paths)
+    video_keys = (
+        [extract_video_key(path) for path in sample_paths]
+        if sample_paths is not None and len(sample_paths) == len(y_true)
+        else None
+    )
+    video_groups, inconsistent_label_count = build_video_groups(
+        y_true, y_pred_prob, sample_paths, video_keys=video_keys
+    )
     main_agg_method = (
         (getattr(opt, "video_agg", None) or getattr(opt, "main_agg_method", "top3_mean"))
         if opt is not None
@@ -538,6 +567,7 @@ def test(model, loader, gpu_id, opt=None):
                 video_groups,
                 opt,
                 main_agg_method=main_agg_method,
+                video_keys=video_keys,
             )
 
     # 返回所有核心指标以便外部监控或日志使用

@@ -686,6 +686,14 @@ class Trainer(nn.Module):
         )
 
     def set_input(self, input):
+        # Release the previous batch before allocating/transferring the next.
+        # Loss scalars stay available for the training logger.
+        for name in (
+            "input", "input_raw", "crops", "features", "output",
+            "weights_max", "weights_org",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
         self.label = input[2].to(self.device, non_blocking=True).long()
 
         if not hasattr(self, 'mean_tensor'):

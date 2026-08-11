@@ -7,7 +7,7 @@ from models import build_model
 from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score, roc_curve, roc_auc_score, precision_recall_curve
 from tqdm import tqdm
 import os
-from utils import get_clip_normalization, prepare_model_inputs
+from utils import get_clip_normalization, prepare_model_inputs, prediction_chunks_to_numpy
 
 def validate(model, loader, gpu_id, return_details=False):
     """
@@ -29,9 +29,9 @@ def validate(model, loader, gpu_id, return_details=False):
     device = torch.device(f"cuda:{gpu_id[0]}" if torch.cuda.is_available() else "cpu")
     model.eval() # 确保模型处于验证模式
 
-    y_true, y_pred = [], []
+    y_true, prediction_chunks = [], []
     
-    with torch.no_grad():
+    with torch.inference_mode():
         # --- [GPU 归一化准备] ---
         # 移到循环外，避免每个 batch 重复创建 tensor，减少 GPU 开销
         mean, std = get_clip_normalization(device)
@@ -61,11 +61,11 @@ def validate(model, loader, gpu_id, return_details=False):
             pred_score = pred_score.flatten()
             # --- 修改结束 ---
             
-            y_pred.extend(pred_score.tolist())
+            prediction_chunks.append(pred_score.detach())
             y_true.extend(label.flatten().tolist())
 
     y_true = np.array(y_true)
-    y_pred_prob = np.array(y_pred)
+    y_pred_prob = prediction_chunks_to_numpy(prediction_chunks)
 
     # --- 核心优化：指标计算 ---
     

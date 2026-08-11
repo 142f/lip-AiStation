@@ -34,14 +34,27 @@ class EpochSeededRandomSampler(Sampler):
     def __init__(self, data_source, base_seed):
         self.data_source, self.base_seed, self.epoch = data_source, int(base_seed), 0
         self.stream_name = "sampler"
+        self._cached_epoch = None
+        self._cached_indices = None
 
-    def set_epoch(self, epoch): self.epoch = int(epoch)
+    def set_epoch(self, epoch):
+        epoch = int(epoch)
+        if epoch != self.epoch:
+            self._cached_epoch = None
+            self._cached_indices = None
+        self.epoch = epoch
 
     @property
     def derived_seed(self): return derive_seed(self.base_seed, self.epoch, self.stream_name)
 
     def materialize_indices(self):
-        return torch.randperm(len(self.data_source), generator=create_data_generator(self.derived_seed)).tolist()
+        if self._cached_epoch != self.epoch or self._cached_indices is None:
+            self._cached_indices = torch.randperm(
+                len(self.data_source),
+                generator=create_data_generator(self.derived_seed),
+            ).tolist()
+            self._cached_epoch = self.epoch
+        return self._cached_indices
 
     def __iter__(self): return iter(self.materialize_indices())
     def __len__(self): return len(self.data_source)
@@ -53,17 +66,27 @@ class EpochSeededWeightedRandomSampler(Sampler):
         self.num_samples, self.base_seed = int(num_samples), int(base_seed)
         self.replacement, self.epoch = bool(replacement), 0
         self.stream_name = "weighted_sampler"
+        self._cached_epoch = None
+        self._cached_indices = None
 
-    def set_epoch(self, epoch): self.epoch = int(epoch)
+    def set_epoch(self, epoch):
+        epoch = int(epoch)
+        if epoch != self.epoch:
+            self._cached_epoch = None
+            self._cached_indices = None
+        self.epoch = epoch
 
     @property
     def derived_seed(self): return derive_seed(self.base_seed, self.epoch, self.stream_name)
 
     def materialize_indices(self):
-        return torch.multinomial(
-            self.weights, self.num_samples, self.replacement,
-            generator=create_data_generator(self.derived_seed),
-        ).tolist()
+        if self._cached_epoch != self.epoch or self._cached_indices is None:
+            self._cached_indices = torch.multinomial(
+                self.weights, self.num_samples, self.replacement,
+                generator=create_data_generator(self.derived_seed),
+            ).tolist()
+            self._cached_epoch = self.epoch
+        return self._cached_indices
 
     def __iter__(self): return iter(self.materialize_indices())
     def __len__(self): return self.num_samples

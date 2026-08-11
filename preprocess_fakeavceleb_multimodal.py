@@ -1,4 +1,5 @@
 import os
+import io
 import cv2
 import tempfile
 import numpy as np
@@ -8,7 +9,6 @@ from tqdm import tqdm
 from librosa import feature as audio_feature
 from moviepy import VideoFileClip
 import matplotlib.pyplot as plt
-import tempfile
 
 r"""
 FakeAVCeleb preprocessing script
@@ -228,23 +228,17 @@ def get_mel_image_from_wav(wav_path: str, sr: int = AUDIO_SR) -> np.ndarray:
         ref=np.min
     )
 
-    fd, temp_png = tempfile.mkstemp(suffix=".png", dir=TEMP_AUDIO_DIR)
-    os.close(fd)
+    buffer = io.BytesIO()
+    plt.imsave(buffer, mel, format="png")
+    buffer.seek(0)
+    mel_img = (plt.imread(buffer) * 255).astype(np.uint8)
 
-    try:
-        plt.imsave(temp_png, mel)
-        mel_img = plt.imread(temp_png) * 255
-        mel_img = mel_img.astype(np.uint8)
-
-        # 有些情况下读出来是 RGBA，这里保留前3通道
-        if mel_img.ndim == 3 and mel_img.shape[2] >= 3:
-            mel_img = mel_img[:, :, :3]
-        else:
-            # 防御性处理：如果是灰度，就补成3通道
-            mel_img = np.stack([mel_img] * 3, axis=-1)
-
-    finally:
-        safe_remove(temp_png)
+    # 有些情况下读出来是 RGBA，这里保留前3通道
+    if mel_img.ndim == 3 and mel_img.shape[2] >= 3:
+        mel_img = mel_img[:, :, :3]
+    else:
+        # 防御性处理：如果是灰度，就补成3通道
+        mel_img = np.stack([mel_img] * 3, axis=-1)
 
     return mel_img
 
