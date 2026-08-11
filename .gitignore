@@ -56,3 +56,7 @@ AVLips长/
 AVLips/
 checkpoints/
 temp/
+
+# Local performance-audit artifacts
+.tmp/
+.pytest_tmp_audit/

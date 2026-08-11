@@ -1,4 +1,5 @@
 import os
+import io
 import argparse
 import cv2
 import numpy as np
@@ -30,9 +31,14 @@ output_root = "./datasets/AVLips"
 
 labels = [(0, "0_real"), (1, "1_fake")]
 
-def get_spectrogram(audio_file, temp_dir):
+def get_spectrogram(audio_file, temp_dir, in_memory=False):
     data, sr = librosa.load(audio_file)
     mel = librosa.power_to_db(audio.melspectrogram(y=data, sr=sr), ref=np.min)
+    if in_memory:
+        buffer = io.BytesIO()
+        plt.imsave(buffer, mel, format="png")
+        buffer.seek(0)
+        return plt.imread(buffer)
     mel_path = os.path.join(temp_dir, "mel.png")
     plt.imsave(mel_path, mel)
     return mel_path
@@ -122,8 +128,7 @@ def process_video_file(video_path, audio_path, output_label_dir, args):
     os.makedirs(video_output_dir, exist_ok=True)
 
     group = 0
-    mel_path = get_spectrogram(audio_path, args.temp_dir)
-    mel = plt.imread(mel_path) * 255
+    mel = get_spectrogram(audio_path, args.temp_dir, in_memory=True) * 255
     mel = mel.astype(np.uint8)
     mapping = mel.shape[1] / frame_count
     window_len = args.window_len

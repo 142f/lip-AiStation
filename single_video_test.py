@@ -125,8 +125,8 @@ def build_dataset_options(work_root, dataset_name, video_output_dir):
 def run_inference(model, loader, device, agg_method):
     mean, std = utils.get_clip_normalization(device)
 
-    frame_probs = []
-    with torch.no_grad():
+    prediction_chunks = []
+    with torch.inference_mode():
         for img, raw_crops, _label in loader:
             img_tens, crops_tens = utils.prepare_model_inputs(
                 img, raw_crops, device, mean, std
@@ -135,7 +135,9 @@ def run_inference(model, loader, device, agg_method):
             features = model.get_features(img_tens)
             logits = model(crops_tens, features)[0]
             probs = torch.softmax(logits, dim=1)[:, 1]
-            frame_probs.extend(probs.flatten().cpu().tolist())
+            prediction_chunks.append(probs.flatten().detach())
+
+    frame_probs = utils.prediction_chunks_to_numpy(prediction_chunks).tolist()
 
     if not frame_probs:
         raise RuntimeError("No preprocessed image windows were found for inference.")
@@ -167,7 +169,7 @@ def main():
     os.makedirs(output_label_dir, exist_ok=True)
 
     if not os.path.isdir(video_output_dir) or not os.listdir(video_output_dir):
-        from preprocess import process_video_file
+        from preprocess_avlips_multimodal import process_video_file
 
         preprocess_args = SimpleNamespace(
             n_extract=10,

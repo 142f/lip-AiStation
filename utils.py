@@ -42,6 +42,18 @@ def prepare_model_inputs(img, raw_crops, device, mean, std):
         ]
     return img, crops
 
+
+def prediction_chunks_to_numpy(prediction_chunks):
+    """Convert deferred predictions with one device-to-host transfer."""
+    if not prediction_chunks:
+        return np.empty(0, dtype=np.float64)
+    return (
+        torch.cat(prediction_chunks, dim=0)
+        .cpu()
+        .numpy()
+        .astype(np.float64, copy=False)
+    )
+
 def set_seed(seed=42, strict_determinism=False):
     # 1. Python random
     random.seed(seed)
